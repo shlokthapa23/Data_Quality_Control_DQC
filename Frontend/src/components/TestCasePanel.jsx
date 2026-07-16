@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import {
   Sparkles, Code2, Plus, Trash2, Loader2, AlertCircle, Rocket, GitCompareArrows,
-  Pencil, Play, X,
+  Pencil, Play, X, FileCode2,
 } from 'lucide-react';
 import {
   fetchS2DTestCases, createS2DTestCase, updateS2DTestCase, deleteS2DTestCase,
@@ -9,12 +9,134 @@ import {
 } from '../api';
 
 const VALIDATION_TYPES = [
-  'Record Volume Integrity',
   'Null Value Constraint',
-  'Regex Pattern Check',
   'Boundary Range Constraint',
+  'Regex Pattern Check',
+  'Uniqueness Constraint',
+  'Length Constraint',
+  'Categorical Constraint',
+  'Referential Integrity',
+  'Data Freshness',
+  'Record Volume Integrity',
   'Custom',
 ];
+
+// One dialect for everything now: Local runs on DuckDB directly, and
+// Fabric connects through DuckDB's mssql extension (attached to the same
+// SQL Analytics Endpoint the old pyodbc path used, just via an access
+// token) - verified end-to-end against a real Fabric workspace, including
+// GROUP BY/HAVING, LENGTH(), regexp_matches(), and duckdb_tables()/
+// duckdb_columns() schema introspection all translating correctly.
+// Every template leaves <table_name>/<column_name>/etc as literal
+// placeholders for the user to fill in by hand - the table name should be
+// copied exactly from the dropdown (already correctly quoted for Fabric's
+// dotted/reserved-word table names), not retyped from memory.
+const PREBUILT_TEMPLATES = {
+  null_check: {
+    label: 'Null Check',
+    validationType: 'Null Value Constraint',
+    sql: `SELECT
+  CASE WHEN COUNT(*) = 0 THEN 1 ELSE 0 END AS passed,
+  CAST(COUNT(*) AS VARCHAR) || ' null values found in <column_name>' AS details
+FROM <table_name>
+WHERE <column_name> IS NULL`,
+  },
+  range_check: {
+    label: 'Range Check',
+    validationType: 'Boundary Range Constraint',
+    sql: `SELECT
+  CASE WHEN COUNT(*) = 0 THEN 1 ELSE 0 END AS passed,
+  CAST(COUNT(*) AS VARCHAR) || ' rows outside expected range' AS details
+FROM <table_name>
+WHERE <column_name> < <min_value> OR <column_name> > <max_value>`,
+  },
+  format_check: {
+    label: 'Format Check',
+    validationType: 'Regex Pattern Check',
+    sql: `SELECT
+  CASE WHEN COUNT(*) = 0 THEN 1 ELSE 0 END AS passed,
+  CAST(COUNT(*) AS VARCHAR) || ' rows with malformed <column_name>' AS details
+FROM <table_name>
+WHERE NOT regexp_matches(<column_name>, '<regex_pattern>')`,
+  },
+  uniqueness_check: {
+    label: 'Uniqueness Check',
+    validationType: 'Uniqueness Constraint',
+    sql: `SELECT
+  CASE WHEN COUNT(*) = 0 THEN 1 ELSE 0 END AS passed,
+  CAST(COUNT(*) AS VARCHAR) || ' duplicate <column_name> values found' AS details
+FROM (
+  SELECT <column_name>
+  FROM <table_name>
+  GROUP BY <column_name>
+  HAVING COUNT(*) > 1
+) dupes`,
+  },
+  length_check: {
+    label: 'Length Check',
+    validationType: 'Length Constraint',
+    sql: `SELECT
+  CASE WHEN COUNT(*) = 0 THEN 1 ELSE 0 END AS passed,
+  CAST(COUNT(*) AS VARCHAR) || ' rows with <column_name> length outside <min_length>-<max_length>' AS details
+FROM <table_name>
+WHERE LENGTH(<column_name>) < <min_length> OR LENGTH(<column_name>) > <max_length>`,
+  },
+  categorical_check: {
+    label: 'Categorical Check',
+    validationType: 'Categorical Constraint',
+    sql: `SELECT
+  CASE WHEN COUNT(*) = 0 THEN 1 ELSE 0 END AS passed,
+  CAST(COUNT(*) AS VARCHAR) || ' rows with <column_name> outside allowed values' AS details
+FROM <table_name>
+WHERE <column_name> NOT IN ('<value1>', '<value2>', '<value3>')`,
+  },
+  referential_check: {
+    label: 'Referential Check',
+    validationType: 'Referential Integrity',
+    sql: `-- Both tables must live in the SAME container/connector - one query
+-- can't reach across two separate databases.
+SELECT
+  CASE WHEN COUNT(*) = 0 THEN 1 ELSE 0 END AS passed,
+  CAST(COUNT(*) AS VARCHAR) || ' <child_table> rows with no matching <parent_table> record' AS details
+FROM <child_table> c
+WHERE c.<child_column> IS NOT NULL
+  AND NOT EXISTS (
+    SELECT 1 FROM <parent_table> p WHERE p.<parent_column> = c.<child_column>
+  )`,
+  },
+  recency_check: {
+    label: 'Recency Check',
+    validationType: 'Data Freshness',
+    sql: `SELECT
+  CASE WHEN MAX(<date_column>) >= CURRENT_DATE - INTERVAL '<days>' DAY THEN 1 ELSE 0 END AS passed,
+  'most recent <date_column>: ' || CAST(MAX(<date_column>) AS VARCHAR) AS details
+FROM <table_name>`,
+  },
+  row_count_check: {
+    label: 'Row Count Check',
+    validationType: 'Record Volume Integrity',
+    sql: `SELECT
+  CASE WHEN COUNT(*) > 0 THEN 1 ELSE 0 END AS passed,
+  CAST(COUNT(*) AS VARCHAR) || ' rows found' AS details
+FROM <table_name>`,
+  },
+  custom_sql: {
+    label: 'Custom SQL',
+    validationType: null,
+    sql: '',
+  },
+  custom_expression: {
+    label: 'Custom Expression',
+    validationType: null,
+    sql: `-- Just fill in the WHERE condition that identifies BAD rows -
+-- everything else is already wired up to the passed/details contract.
+SELECT
+  CASE WHEN COUNT(*) = 0 THEN 1 ELSE 0 END AS passed,
+  CAST(COUNT(*) AS VARCHAR) || ' rows matched the failing condition' AS details
+FROM <table_name>
+WHERE <your_condition_identifying_bad_rows>`,
+  },
+};
 
 const SQL_PLACEHOLDER = `-- Must return exactly one row with a "passed" column (0/1)
 -- and optionally a "details" column shown in the error trace.
@@ -50,13 +172,14 @@ function TableCheckboxList({ tables, selected, onToggle }) {
 }
 
 export default function TestCasePanel({ mapping, onRunComplete }) {
-  const [tab, setTab] = useState('ai'); // 'ai' | 'manual'
+const [tab, setTab] = useState('ai'); // 'ai' | 'manual'
 
   const [testCases, setTestCases] = useState([]);
   const [isLoading, setIsLoading] = useState(false);
 
   const [editingId, setEditingId] = useState(null); // null = creating new
   const [form, setForm] = useState(EMPTY_FORM);
+  const [prebuiltKey, setPrebuiltKey] = useState('custom_sql');
   const [isSaving, setIsSaving] = useState(false);
   const [saveError, setSaveError] = useState(null);
 
@@ -66,6 +189,8 @@ export default function TestCasePanel({ mapping, onRunComplete }) {
 
   const loadTestCases = () => {
     if (!mapping) return;
+
+
     setIsLoading(true);
     fetchS2DTestCases(mapping.id).then((data) => {
       setTestCases(data);
@@ -74,11 +199,12 @@ export default function TestCasePanel({ mapping, onRunComplete }) {
   };
 
   useEffect(loadTestCases, [mapping]);
-  useEffect(() => { setEditingId(null); setForm(EMPTY_FORM); }, [mapping]);
+  useEffect(() => { setEditingId(null); setForm(EMPTY_FORM); setPrebuiltKey('custom_sql'); }, [mapping]);
 
   const startEdit = (tc) => {
     setTab('manual');
     setEditingId(tc.id);
+    setPrebuiltKey('custom_sql'); // editing shows the raw saved script, not a template
     setForm({
       name: tc.name, validationType: tc.validation_type, checkType: tc.check_type,
       target: tc.target || 'source', targetTable: tc.target_table || '',
@@ -91,6 +217,7 @@ export default function TestCasePanel({ mapping, onRunComplete }) {
   const cancelEdit = () => {
     setEditingId(null);
     setForm(EMPTY_FORM);
+    setPrebuiltKey('custom_sql');
   };
 
   const canSave = form.checkType === 'row_count_match'
@@ -180,6 +307,16 @@ export default function TestCasePanel({ mapping, onRunComplete }) {
 
   const targetTableOptions = form.target === 'source' ? mapping.source_tables : mapping.destination_tables;
 
+  const handlePrebuiltChange = (key) => {
+    setPrebuiltKey(key);
+    const template = PREBUILT_TEMPLATES[key];
+    setForm((f) => ({
+      ...f,
+      scriptType: 'sql',
+      scriptText: template.sql,
+      validationType: template.validationType || f.validationType,
+    }));
+  };
   return (
     <main className="flex-1 bg-slate-50 p-6 flex flex-col gap-4 overflow-y-auto">
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-slate-200 pb-4">
@@ -318,6 +455,27 @@ export default function TestCasePanel({ mapping, onRunComplete }) {
                   {targetTableOptions.map((t) => <option key={t} value={t}>{t}</option>)}
                 </select>
               </div>
+
+              <div className="flex items-center gap-2">
+                <FileCode2 className="w-3.5 h-3.5 text-mastek-highlight shrink-0" />
+                <select
+                  value={prebuiltKey}
+                  onChange={(e) => handlePrebuiltChange(e.target.value)}
+                  className="flex-1 px-2.5 py-1.5 text-sm border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-mastek-accent"
+                >
+                  {Object.entries(PREBUILT_TEMPLATES).map(([key, t]) => (
+                    <option key={key} value={key}>{t.label}</option>
+                  ))}
+                </select>
+              </div>
+              {prebuiltKey !== 'custom_sql' && (
+                <p className="text-xs text-slate-400 -mt-2">
+                  Fill in <code className="font-mono">&lt;table_name&gt;</code> and any other{' '}
+                  <code className="font-mono">&lt;...&gt;</code> placeholders below yourself - copy the table name
+                  exactly from the dropdown above rather than retyping it, since Fabric table names are sometimes
+                  quoted (e.g. dotted names from auto-loaded files).
+                </p>
+              )}
 
               <div className="flex flex-wrap items-center gap-x-4 gap-y-2 text-sm">
                 <label className="flex items-center gap-2 cursor-pointer">

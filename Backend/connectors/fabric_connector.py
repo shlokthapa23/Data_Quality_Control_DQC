@@ -1,5 +1,5 @@
 import requests
-import pyodbc
+import duckdb
 
 from azure.identity import ClientSecretCredential
 
@@ -7,9 +7,32 @@ from .base import BaseConnector, AssetItem, ColumnInfo
 from .sql_guard import validate_select_only
 
 FABRIC_API_BASE = "https://api.fabric.microsoft.com/v1"
+FABRIC_TOKEN_SCOPE = "https://api.fabric.microsoft.com/.default"
+SQL_TOKEN_SCOPE = "https://database.windows.net/.default"
+
+# Fixed alias used for every ATTACH - each run_query()/get_schema() call
+# opens its own short-lived DuckDB connection (mirroring how the old
+# pyodbc connections were opened per-call), so there's never more than
+# one attached catalog alive at a time and no name collision risk.
+ATTACHED_DB_ALIAS = "fabric_db"
 
 
 class FabricConnector(BaseConnector):
+    """
+    Talks to Fabric Lakehouses entirely through DuckDB's 'mssql' community
+    extension, attached to the same SQL Analytics Endpoint the old pyodbc
+    implementation used - just authenticated with a plain OAuth access
+    token instead of ODBC Driver 18.
+
+    This was validated end-to-end against a real Fabric workspace:
+    DuckDB-dialect SQL (||, LENGTH(), regexp_matches(), GROUP BY/HAVING)
+    all translate correctly through the attachment, and DuckDB's own
+    duckdb_tables()/duckdb_columns() introspection functions correctly
+    list the attached Lakehouse's real tables/columns. That means Local
+    and Fabric connectors now share exactly one SQL dialect - test-case
+    scripts no longer need a T-SQL variant at all.
+    """
+
     connector_type = "fabric"
 
     def __init__(self, tenant_id, client_id, client_secret, workspace_id, allowed_containers=None):
@@ -17,25 +40,28 @@ class FabricConnector(BaseConnector):
         self.client_id = client_id
         self.client_secret = client_secret
         self.workspace_id = workspace_id
-        # The pinned pair of Lakehouses for S2D, e.g. [{"id":..,"name":..}, ...].
-        # None means "not pinned yet" - list_containers() falls back to
-        # showing every Lakehouse in the workspace in that case.
+        # The pinned set of Lakehouses for S2D/Harvest, e.g. [{"id":..,"name":..}, ...].
+        # None means "not pinned yet" - list_containers()/list_items() fall
+        # back to showing every Lakehouse in the workspace in that case.
         self.allowed_containers = allowed_containers
         self._lakehouse_conn_cache = {}
 
     # --- auth -----------------------------------------------------------
 
-    def _get_token(self):
-        credential = ClientSecretCredential(
-            tenant_id=self.tenant_id,
-            client_id=self.client_id,
-            client_secret=self.client_secret,
+    def _get_credential(self):
+        return ClientSecretCredential(
+            tenant_id=self.tenant_id, client_id=self.client_id, client_secret=self.client_secret,
         )
-        token = credential.get_token("https://api.fabric.microsoft.com/.default")
-        return token.token
+
+    def _get_fabric_token(self):
+        return self._get_credential().get_token(FABRIC_TOKEN_SCOPE).token
+
+    def _get_sql_token(self):
+        """Separate scope from the Fabric REST API token - this one authenticates to the SQL endpoint itself."""
+        return self._get_credential().get_token(SQL_TOKEN_SCOPE).token
 
     def _api_get(self, path):
-        token = self._get_token()
+        token = self._get_fabric_token()
         headers = {"Authorization": f"Bearer {token}"}
         url = f"{FABRIC_API_BASE}{path}"
 
@@ -65,19 +91,6 @@ class FabricConnector(BaseConnector):
 
         return all_items
 
-    def _get_db_connection(self, server, database):
-        conn_str = (
-            f"Driver={{ODBC Driver 18 for SQL Server}};"
-            f"Server={server},1433;"
-            f"Database={database};"
-            f"Authentication=ActiveDirectoryServicePrincipal;"
-            f"UID={self.client_id};"
-            f"PWD={self.client_secret};"
-            f"Encrypt=yes;"
-            f"TrustServerCertificate=no;"
-        )
-        return pyodbc.connect(conn_str)
-
     def _resolve_lakehouse_connection(self, lakehouse_id):
         if lakehouse_id in self._lakehouse_conn_cache:
             return self._lakehouse_conn_cache[lakehouse_id]
@@ -95,11 +108,30 @@ class FabricConnector(BaseConnector):
         self._lakehouse_conn_cache[lakehouse_id] = conn_info
         return conn_info
 
+    def _duckdb_attach(self, lakehouse_id):
+        """
+        Fresh DuckDB connection with the Lakehouse's SQL endpoint attached
+        as 'fabric_db'. A new access token is fetched every call since
+        these connections are short-lived and tokens expire in ~1hr -
+        simpler than trying to cache/refresh one across calls.
+        """
+        conn_info = self._resolve_lakehouse_connection(lakehouse_id)
+        sql_token = self._get_sql_token()
+
+        con = duckdb.connect()
+        con.execute("INSTALL mssql FROM community;")
+        con.execute("LOAD mssql;")
+        con.execute(f"""
+            ATTACH 'Server={conn_info["server"]};Database={conn_info["database"]}' AS {ATTACHED_DB_ALIAS}
+            (TYPE mssql, ACCESS_TOKEN '{sql_token}');
+        """)
+        return con
+
     # --- BaseConnector interface -----------------------------------------
 
     def test_connection(self):
         try:
-            self._get_token()
+            self._get_fabric_token()
             self._api_get(f"/workspaces/{self.workspace_id}")
             return True, "Connected successfully"
         except Exception as e:
@@ -107,17 +139,15 @@ class FabricConnector(BaseConnector):
 
     def list_items(self):
         """
-        Workspace inventory used by Harvest. Once a pair of Lakehouses is
-        pinned (for S2D), Harvest is scoped down to just those 2 Lakehouses
+        Full workspace inventory used by Harvest. Once a set of Lakehouses
+        is pinned (for S2D), this is scoped down to just those Lakehouses
         too - but Notebooks/Reports/Warehouses/SemanticModels are never
         part of the pinning concept, so they're always shown in full.
         """
         items = self._api_get(f"/workspaces/{self.workspace_id}/items")
         all_items = [
             AssetItem(
-                id=i.get("id"),
-                name=i.get("displayName"),
-                type=i.get("type", "Other"),
+                id=i.get("id"), name=i.get("displayName"), type=i.get("type", "Other"),
                 extra={"description": i.get("description", "")},
             )
             for i in items
@@ -129,21 +159,6 @@ class FabricConnector(BaseConnector):
 
         return all_items
 
-    def list_containers(self):
-        """
-        S2D-facing container list - only the pinned pair of Lakehouses,
-        once pinning has been configured via the Connect page. Falls back
-        to every Lakehouse in the workspace if nothing's pinned yet.
-        """
-        if self.allowed_containers:
-            return [
-                {"id": c["id"], "name": c["name"], "type": "Lakehouse"}
-                for c in self.allowed_containers
-            ]
-        return [
-            {"id": i.id, "name": i.name, "type": "Lakehouse"}
-            for i in self.list_items() if i.type == "Lakehouse"
-        ]
     def list_all_lakehouses(self):
         """
         Deliberately unfiltered - ignores any current pinning. This is
@@ -157,46 +172,68 @@ class FabricConnector(BaseConnector):
             AssetItem(id=i.get("id"), name=i.get("displayName"), type=i.get("type", "Other"))
             for i in items if i.get("type") == "Lakehouse"
         ]
+
+    def list_containers(self):
+        """
+        S2D-facing container list - only the pinned Lakehouses, once
+        pinning has been configured via the Connect page. Falls back to
+        every Lakehouse in the workspace if nothing's pinned yet.
+        """
+        if self.allowed_containers:
+            return [
+                {"id": c["id"], "name": c["name"], "type": "Lakehouse"}
+                for c in self.allowed_containers
+            ]
+        return [
+            {"id": i.id, "name": i.name, "type": "Lakehouse"}
+            for i in self.list_items() if i.type == "Lakehouse"
+        ]
+
+    def _build_table_entry(self, con, schema, name, kind):
+        cols = con.execute(
+            "SELECT column_name, data_type, is_nullable, column_default FROM duckdb_columns() "
+            f"WHERE database_name = '{ATTACHED_DB_ALIAS}' AND schema_name = ? AND table_name = ? "
+            "ORDER BY column_index",
+            [schema, name],
+        ).fetchall()
+        columns = [
+            ColumnInfo(name=c[0], data_type=c[1], nullable=bool(c[2]), default=c[3]).to_dict()
+            for c in cols
+        ]
+        # Double-quote each part individually - some tables get a literal
+        # ".csv"/".parquet" baked into their name when auto-loaded from a
+        # file, and an unquoted "schema.name.csv" would parse ambiguously.
+        # DuckDB uses double quotes for quoted identifiers (T-SQL's square
+        # brackets have no special meaning to DuckDB's own SQL parser,
+        # which is what actually parses every query now, before anything
+        # gets pushed down to the attached SQL Server endpoint).
+        return {
+            "table": f'"{schema}"."{name}"',
+            "kind": kind,
+            "columns": columns,
+        }
+
     def get_schema(self, item_id, item_type):
         if item_type != "Lakehouse":
             # Notebooks/Reports/etc have no tabular schema through this connector
             return []
 
-        conn_info = self._resolve_lakehouse_connection(item_id)
-        conn = self._get_db_connection(conn_info["server"], conn_info["database"])
-        cursor = conn.cursor()
+        con = self._duckdb_attach(item_id)
+        try:
+            tables = con.execute(
+                f"SELECT schema_name, table_name FROM duckdb_tables() "
+                f"WHERE database_name = '{ATTACHED_DB_ALIAS}' ORDER BY schema_name, table_name"
+            ).fetchall()
+            views = con.execute(
+                f"SELECT schema_name, view_name FROM duckdb_views() "
+                f"WHERE database_name = '{ATTACHED_DB_ALIAS}' ORDER BY schema_name, view_name"
+            ).fetchall()
 
-        cursor.execute("""
-            SELECT TABLE_SCHEMA, TABLE_NAME, TABLE_TYPE
-            FROM INFORMATION_SCHEMA.TABLES
-            ORDER BY TABLE_SCHEMA, TABLE_NAME
-        """)
-        tables = cursor.fetchall()
-
-        result = []
-        for schema, name, kind in tables:
-            cursor.execute("""
-                SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE, COLUMN_DEFAULT
-                FROM INFORMATION_SCHEMA.COLUMNS
-                WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
-                ORDER BY ORDINAL_POSITION
-            """, (schema, name))
-            columns = [
-                ColumnInfo(
-                    name=c[0], data_type=c[1],
-                    nullable=(c[2] == 'YES'), default=c[3],
-                ).to_dict()
-                for c in cursor.fetchall()
-            ]
-            result.append({
-                "table": f"[{schema}].[{name}]",
-                "kind": "VIEW" if kind == "VIEW" else "BASE TABLE",
-                "columns": columns,
-            })
-
-        cursor.close()
-        conn.close()
-        return result
+            result = [self._build_table_entry(con, schema, name, "BASE TABLE") for schema, name in tables]
+            result += [self._build_table_entry(con, schema, name, "VIEW") for schema, name in views]
+            return result
+        finally:
+            con.close()
 
     def list_tables_in_container(self, container_id):
         """container_id here is a Lakehouse id."""
@@ -205,25 +242,17 @@ class FabricConnector(BaseConnector):
     def run_query(self, container_id, sql):
         """
         Run one read-only SELECT against this Lakehouse's SQL analytics
-        endpoint and return the first row as a dict, or None if empty.
-        container_id is a Lakehouse id.
+        endpoint (via the DuckDB attachment) and return the first row as
+        a dict, or None if empty. container_id is a Lakehouse id.
         """
         normalized = validate_select_only(sql)
 
-        conn_info = self._resolve_lakehouse_connection(container_id)
-        conn = self._get_db_connection(conn_info["server"], conn_info["database"])
-        cursor = conn.cursor()
-        cursor.execute(normalized)
-
-        row = cursor.fetchone()
-        if row is None:
-            cursor.close()
-            conn.close()
-            return None
-
-        columns = [c[0] for c in cursor.description]
-        result = dict(zip(columns, row))
-
-        cursor.close()
-        conn.close()
-        return result
+        con = self._duckdb_attach(container_id)
+        try:
+            row = con.execute(normalized).fetchone()
+            if row is None:
+                return None
+            columns = [d[0] for d in con.description]
+            return dict(zip(columns, row))
+        finally:
+            con.close()
