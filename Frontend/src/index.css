@@ -1,0 +1,18 @@
+@import "tailwindcss";
+
+@theme {
+  --color-mastek-primary: #001689;
+  --color-mastek-secondary: #0099A8;
+  --color-mastek-accent: #0FBDFF;
+  --color-mastek-success: #5ECC62;
+  --color-mastek-warning: #EBAA01;
+  --color-mastek-highlight: #AE63E4;
+}
+
+body {
+  font-family: 'Poppins', 'Trebuchet MS', sans-serif;
+}
+
+h1, h2, h3, h4, button {
+  font-family: 'Titillium Web', 'Trebuchet MS', sans-serif;
+}
