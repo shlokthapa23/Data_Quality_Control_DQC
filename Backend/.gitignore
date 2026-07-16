@@ -1,4 +1,29 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+env/
+
+# Environment / secrets
 .env
-package.json
-vite.config.js
-package-lock.json
+
+# SQLite catalog (contains connector credentials in plaintext, and is
+# regenerated automatically on first run - never something to version)
+catalog.db
+catalog.db-journal
+catalog.db-wal
+catalog.db-shm
+
+# Local connector data (uploaded CSV/Parquet + the DuckDB files they're
+# ingested into - one per Local connector instance)
+local_uploads/
+local_data_*.duckdb
+
+# Logs
+*.log
+
+# OS cruft
+.DS_Store
+Thumbs.db
