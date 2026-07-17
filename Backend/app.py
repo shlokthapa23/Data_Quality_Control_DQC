@@ -8,6 +8,10 @@ from harvest import run_harvest
 from local_files import db as local_db
 from s2d import db as s2d_db
 from s2d.engine import run_pipeline
+from ai_service import generate_test_case_sql, generate_rules_from_sample
+from connectors.sql_guard import validate_select_only
+
+
 
 load_dotenv()
 catalog_db.init_db()
@@ -221,7 +225,7 @@ def get_container_tables_live(connector_id, container_id):
 
     try:
         schema = connector.list_tables_in_container(container_id)
-        tables = [{"name": t["table"], "kind": t["kind"]} for t in schema]
+        tables = [{"name": t["table"], "kind": t["kind"], "columns": t["columns"]} for t in schema]
         return jsonify({"tables": tables})
     except Exception as e:
         return jsonify({"error": "Failed to list tables", "details": str(e)}), 502
@@ -416,6 +420,7 @@ def create_s2d_test_case(mapping_id):
         script_type=body.get("script_type"), script_text=body.get("script_text"),
         row_count_source_tables=body.get("row_count_source_tables"),
         row_count_destination_tables=body.get("row_count_destination_tables"),
+        severity=body.get("severity", "error"), description=body.get("description"),
     )
     return jsonify({"id": test_case_id}), 201
 
@@ -481,6 +486,7 @@ def update_s2d_test_case(test_case_id):
         script_type=body.get("script_type"), script_text=body.get("script_text"),
         row_count_source_tables=body.get("row_count_source_tables"),
         row_count_destination_tables=body.get("row_count_destination_tables"),
+        severity=body.get("severity"), description=body.get("description"),
     )
     return jsonify({"updated": test_case_id})
 
@@ -489,6 +495,22 @@ def update_s2d_test_case(test_case_id):
 def delete_s2d_test_case(test_case_id):
     s2d_db.delete_test_case(test_case_id)
     return jsonify({"deleted": test_case_id})
+
+
+@app.route('/api/s2d/test-cases/<test_case_id>/active', methods=['PATCH'])
+def set_s2d_test_case_active(test_case_id):
+    """Body: { "active": true|false } - powers the rule-list's Active toggle."""
+    existing = s2d_db.get_test_case(test_case_id)
+    if not existing:
+        return jsonify({"error": "Test case not found"}), 404
+
+    body = request.get_json(force=True)
+    if "active" not in body:
+        return jsonify({"error": "active is required"}), 400
+
+    active = bool(body["active"])
+    s2d_db.set_test_case_active(test_case_id, active)
+    return jsonify({"updated": test_case_id, "active": active})
 
 
 @app.route('/api/s2d/test-cases/<test_case_id>/run', methods=['POST'])
@@ -512,6 +534,114 @@ def run_single_s2d_test_case(test_case_id):
 
     run_id = run_one(source_connector, destination_connector, mapping, test_case)
     return jsonify({"run_id": run_id})
+
+  # --- Genrative Ai test case route --- #
+
+@app.route('/api/s2d/ai/generate-test-case', methods=['POST'])
+def ai_generate_test_case():
+    """
+    Body: { "table_name": "...", "columns": [{"name":..., "data_type":...}, ...],
+            "description": "check that this column has no nulls" }
+
+    The real table name and real column list are supplied by the frontend
+    (pulled from the same live schema the table dropdowns already use) -
+    the model never has to guess anything about the schema, it only
+    translates the plain-English description into SQL using names we
+    already know are correct. Generated SQL still passes through the same
+    SELECT-only guard every other test case's SQL does before it's ever
+    shown to the user.
+    """
+    body = request.get_json(force=True)
+    table_name = body.get("table_name")
+    columns = body.get("columns")
+    description = body.get("description")
+
+    if not table_name or not columns or not description:
+        return jsonify({"error": "table_name, columns, and description are required"}), 400
+
+    try:
+        sql = generate_test_case_sql(table_name, columns, description)
+    except Exception as e:
+        print(f"AI generation error: {e}")
+        return jsonify({"error": "AI generation failed", "details": str(e)}), 502
+
+    try:
+        validate_select_only(sql)
+    except ValueError as e:
+        return jsonify({
+            "error": f"The generated SQL failed the safety check ({e}) - try rephrasing the description",
+            "generated_sql": sql,
+        }), 422
+
+    return jsonify({"sql": sql})
+
+
+@app.route('/api/s2d/mappings/<mapping_id>/ai/suggest-rules', methods=['POST'])
+def ai_suggest_rules(mapping_id):
+    """
+    Body: { "target": "source"|"destination", "table_name": "..." }
+
+    No user-typed description involved: a random sample of the table's
+    actual rows is pulled straight from the connector and handed to the
+    AI, which infers several rules on its own. Each surviving rule (after
+    the same SELECT-only safety check every other test case's SQL goes
+    through) is saved immediately as an 'ai'-origin test case - no manual
+    "Add Test Case" step required.
+    """
+    mapping = s2d_db.get_mapping(mapping_id)
+    if not mapping:
+        return jsonify({"error": "Mapping not found"}), 404
+
+    body = request.get_json(force=True)
+    target = body.get("target")
+    table_name = body.get("table_name")
+    if target not in ("source", "destination"):
+        return jsonify({"error": "target must be 'source' or 'destination'"}), 400
+    if not table_name:
+        return jsonify({"error": "table_name is required"}), 400
+
+    connector_id = mapping["source_connector_id"] if target == "source" else mapping["destination_connector_id"]
+    container_id = mapping["source_container_id"] if target == "source" else mapping["destination_container_id"]
+
+    try:
+        _, connector = get_connector_instance(connector_id)
+    except KeyError as e:
+        return jsonify({"error": str(e)}), 404
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+
+    try:
+        schema = connector.list_tables_in_container(container_id)
+        table_entry = next((t for t in schema if t["table"] == table_name), None)
+        if not table_entry:
+            return jsonify({"error": f"Table '{table_name}' not found in this container"}), 404
+
+        sample = connector.sample_rows(container_id, table_name, limit=20)
+        rules = generate_rules_from_sample(table_name, table_entry["columns"], sample)
+    except Exception as e:
+        print(f"AI rule suggestion error: {e}")
+        return jsonify({"error": "AI rule suggestion failed", "details": str(e)}), 502
+
+    created = []
+    skipped = []
+    for rule in rules:
+        script_text = rule.get("script_text", "")
+        try:
+            validate_select_only(script_text)
+        except ValueError as e:
+            skipped.append({"name": rule.get("name", "unnamed"), "reason": str(e)})
+            continue
+
+        test_case_id = s2d_db.create_test_case(
+            mapping_id=mapping_id, name=rule.get("name", "Untitled rule"),
+            validation_type=rule.get("validation_type", "Custom"), check_type="sql",
+            target=target, target_table=table_name, script_type="sql", script_text=script_text,
+            origin="ai", severity=rule.get("severity", "error"), description=rule.get("description"),
+        )
+        created.append(s2d_db.get_test_case(test_case_id))
+
+    return jsonify({"created": created, "skipped": skipped})
+
 
 @app.route('/api/s2d/mappings/<mapping_id>/run', methods=['POST'])
 def run_s2d_pipeline(mapping_id):

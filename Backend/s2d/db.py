@@ -30,6 +30,31 @@ def _migrate_stale_schema_if_needed():
             conn.execute(f"DROP TABLE IF EXISTS {table}")
 
 
+def _add_missing_test_case_columns():
+    """
+    Additive migration: s2d_test_cases gained origin/severity/active/
+    description columns for the AI sample-based rule generator. Existing
+    rows get the defaults (origin='manual', severity='error', active=1) so
+    they render correctly in the new rule-list UI without needing backfill.
+    """
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='s2d_test_cases'"
+        ).fetchone()
+        if not row:
+            return  # fresh install - CREATE TABLE below already includes the columns
+
+        existing = {r[1] for r in conn.execute("PRAGMA table_info(s2d_test_cases)").fetchall()}
+        if "origin" not in existing:
+            conn.execute("ALTER TABLE s2d_test_cases ADD COLUMN origin TEXT NOT NULL DEFAULT 'manual'")
+        if "severity" not in existing:
+            conn.execute("ALTER TABLE s2d_test_cases ADD COLUMN severity TEXT NOT NULL DEFAULT 'error'")
+        if "active" not in existing:
+            conn.execute("ALTER TABLE s2d_test_cases ADD COLUMN active INTEGER NOT NULL DEFAULT 1")
+        if "description" not in existing:
+            conn.execute("ALTER TABLE s2d_test_cases ADD COLUMN description TEXT")
+
+
 def init_s2d_tables():
     _migrate_stale_schema_if_needed()
 
@@ -72,6 +97,11 @@ def init_s2d_tables():
                 row_count_source_tables TEXT,       -- JSON array (subset of mapping.source_tables)
                 row_count_destination_tables TEXT,  -- JSON array (subset of mapping.destination_tables)
 
+                origin TEXT NOT NULL DEFAULT 'manual',  -- 'manual' | 'ai'
+                severity TEXT NOT NULL DEFAULT 'error',  -- 'critical' | 'error' | 'warning'
+                active INTEGER NOT NULL DEFAULT 1,
+                description TEXT,
+
                 created_at TEXT NOT NULL,
                 FOREIGN KEY (mapping_id) REFERENCES s2d_mappings(id)
             )
@@ -106,6 +136,8 @@ def init_s2d_tables():
                 FOREIGN KEY (run_id) REFERENCES s2d_test_runs(id)
             )
         """)
+
+    _add_missing_test_case_columns()
 
 
 # --- Mappings ---------------------------------------------------------
@@ -166,25 +198,29 @@ def _test_case_row_to_dict(row):
     tc = dict(row)
     tc["row_count_source_tables"] = json.loads(tc["row_count_source_tables"]) if tc["row_count_source_tables"] else None
     tc["row_count_destination_tables"] = json.loads(tc["row_count_destination_tables"]) if tc["row_count_destination_tables"] else None
+    tc["active"] = bool(tc["active"])
     return tc
 
 
 def create_test_case(mapping_id, name, validation_type, check_type,
                       target=None, target_table=None, script_type=None, script_text=None,
-                      row_count_source_tables=None, row_count_destination_tables=None):
+                      row_count_source_tables=None, row_count_destination_tables=None,
+                      origin='manual', severity='error', active=True, description=None):
     test_case_id = str(uuid.uuid4())
     now = datetime.now(timezone.utc).isoformat()
     with get_conn() as conn:
         conn.execute("""
             INSERT INTO s2d_test_cases
                 (id, mapping_id, name, validation_type, check_type, target, target_table,
-                 script_type, script_text, row_count_source_tables, row_count_destination_tables, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 script_type, script_text, row_count_source_tables, row_count_destination_tables,
+                 origin, severity, active, description, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             test_case_id, mapping_id, name, validation_type, check_type, target, target_table,
             script_type, script_text,
             json.dumps(row_count_source_tables) if row_count_source_tables is not None else None,
             json.dumps(row_count_destination_tables) if row_count_destination_tables is not None else None,
+            origin, severity, 1 if active else 0, description,
             now,
         ))
     return test_case_id
@@ -192,19 +228,33 @@ def create_test_case(mapping_id, name, validation_type, check_type,
 
 def update_test_case(test_case_id, name, validation_type, check_type,
                       target=None, target_table=None, script_type=None, script_text=None,
-                      row_count_source_tables=None, row_count_destination_tables=None):
+                      row_count_source_tables=None, row_count_destination_tables=None,
+                      severity=None, description=None):
     with get_conn() as conn:
+        if severity is None:
+            existing = conn.execute("SELECT severity FROM s2d_test_cases WHERE id = ?", (test_case_id,)).fetchone()
+            severity = existing["severity"] if existing else 'error'
         conn.execute("""
             UPDATE s2d_test_cases SET
                 name = ?, validation_type = ?, check_type = ?, target = ?, target_table = ?,
-                script_type = ?, script_text = ?, row_count_source_tables = ?, row_count_destination_tables = ?
+                script_type = ?, script_text = ?, row_count_source_tables = ?, row_count_destination_tables = ?,
+                severity = ?, description = ?
             WHERE id = ?
         """, (
             name, validation_type, check_type, target, target_table, script_type, script_text,
             json.dumps(row_count_source_tables) if row_count_source_tables is not None else None,
             json.dumps(row_count_destination_tables) if row_count_destination_tables is not None else None,
+            severity, description,
             test_case_id,
         ))
+
+
+def set_test_case_active(test_case_id, active):
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE s2d_test_cases SET active = ? WHERE id = ?",
+            (1 if active else 0, test_case_id),
+        )
 
 
 def list_test_cases(mapping_id):

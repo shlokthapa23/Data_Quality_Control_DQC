@@ -79,6 +79,16 @@ class BaseConnector(ABC):
         raise NotImplementedError
 
     @abstractmethod
+    def sample_rows(self, container_id, table, limit=20):
+        """
+        Return up to `limit` random rows from `table` (inside the given
+        container) as a list of dicts (column_name -> value). Used to feed
+        real sample data to the AI rule-suggestion flow, as opposed to
+        run_query()'s single-row pass/fail contract.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
     def list_containers(self):
         """
         Return the containers this connector exposes for S2D mapping

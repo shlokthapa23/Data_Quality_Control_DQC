@@ -125,6 +125,15 @@ class FabricConnector(BaseConnector):
             ATTACH 'Server={conn_info["server"]};Database={conn_info["database"]}' AS {ATTACHED_DB_ALIAS}
             (TYPE mssql, ACCESS_TOKEN '{sql_token}');
         """)
+        # Without this, unqualified two-part "schema"."table" references (what
+        # every test-case script and the table dropdown both use) fail to
+        # resolve - the newly attached catalog isn't the connection's default
+        # until explicitly selected, so DuckDB looks for "dbo" in the empty
+        # in-memory catalog instead and errors with "schema does not exist".
+        # A bare `USE fabric_db` doesn't work either - DuckDB reads a single
+        # identifier there as a schema-set, not a catalog switch - so the
+        # catalog.schema form is required to land on fabric_db.dbo.
+        con.execute(f"USE {ATTACHED_DB_ALIAS}.dbo;")
         return con
 
     # --- BaseConnector interface -----------------------------------------
@@ -254,5 +263,15 @@ class FabricConnector(BaseConnector):
                 return None
             columns = [d[0] for d in con.description]
             return dict(zip(columns, row))
+        finally:
+            con.close()
+
+    def sample_rows(self, container_id, table, limit=20):
+        """Random sample of rows for the AI rule-suggestion flow. container_id is a Lakehouse id."""
+        con = self._duckdb_attach(container_id)
+        try:
+            result = con.execute(f"SELECT * FROM {table} ORDER BY RANDOM() LIMIT {limit}").fetchall()
+            columns = [d[0] for d in con.description]
+            return [dict(zip(columns, row)) for row in result]
         finally:
             con.close()

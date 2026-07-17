@@ -155,6 +155,21 @@ def get_table_schema(connector_id, duckdb_table_name):
             con.close()
 
 
+def sample_rows(connector_id, table_name, limit=20):
+    """Random sample of rows for the AI rule-suggestion flow. table_name comes
+    from our own catalog (list_local_tables), not user-typed text."""
+    db_path = _duckdb_path(connector_id)
+    con = None
+    try:
+        con = duckdb.connect(db_path, read_only=True)
+        result = con.execute(f"SELECT * FROM {table_name} ORDER BY RANDOM() LIMIT {limit}").fetchall()
+        columns = [d[0] for d in con.description]
+        return [dict(zip(columns, row)) for row in result]
+    finally:
+        if con is not None:
+            con.close()
+
+
 def run_query(connector_id, sql):
     from connectors.sql_guard import validate_select_only
     normalized = validate_select_only(sql)
