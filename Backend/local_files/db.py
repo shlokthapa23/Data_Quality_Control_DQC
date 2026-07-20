@@ -186,3 +186,22 @@ def run_query(connector_id, sql):
     finally:
         if con is not None:
             con.close()
+
+
+def run_query_all(connector_id, sql):
+    """Like run_query, but returns every matching row (list of dicts) instead
+    of just the first - used by cross_table_parity's key-column existence
+    diff, which needs the full set of key values, not one row or a sample."""
+    from connectors.sql_guard import validate_select_only
+    normalized = validate_select_only(sql)
+
+    db_path = _duckdb_path(connector_id)
+    con = None
+    try:
+        con = duckdb.connect(db_path, read_only=True)
+        result = con.execute(normalized).fetchall()
+        columns = [d[0] for d in con.description]
+        return [dict(zip(columns, row)) for row in result]
+    finally:
+        if con is not None:
+            con.close()

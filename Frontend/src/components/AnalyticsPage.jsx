@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import {
   ArrowLeft, CheckCircle2, XCircle, AlertTriangle, Loader2, Search,
+  ListChecks, LineChart, Gauge, History as HistoryIcon,
 } from 'lucide-react';
 import { fetchS2DRun } from '../api';
 
@@ -10,7 +11,18 @@ const STATUS_BADGE = {
   ERROR: 'bg-mastek-warning/10 text-mastek-warning border border-mastek-warning/30',
 };
 
-export default function AnalyticsPage({ runId, onBackToS2D }) {
+// A result only has real violations/total_rows for check types that report
+// them (row_count_match, column_parity, and any custom SQL that opts in) -
+// falls back to a plain pass/fail-derived rate so older/unsupported rows
+// still render something sensible instead of blank.
+function rowPassRate(r) {
+  if (r.total_rows != null && r.total_rows > 0 && r.violations != null) {
+    return Math.max(0, Math.min(100, ((r.total_rows - r.violations) / r.total_rows) * 100));
+  }
+  return r.status === 'PASS' ? 100 : 0;
+}
+
+export default function AnalyticsPage({ runId, onBackToS2D, onGoToHistory }) {
   const [run, setRun] = useState(null);
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState(null);
@@ -47,7 +59,6 @@ export default function AnalyticsPage({ runId, onBackToS2D }) {
     ? ((run.pass_count / run.total_checkpoints) * 100).toFixed(1)
     : '0.0';
   const selectedResult = run.results.find((r) => r.id === selectedResultId);
-  const failCount = run.total_checkpoints - run.pass_count;
 
   return (
     <div className="-m-6 sm:-m-8 flex flex-col h-full">
@@ -69,19 +80,49 @@ export default function AnalyticsPage({ runId, onBackToS2D }) {
       </header>
 
       <div className="flex-1 overflow-y-auto p-6 space-y-6">
+        <div className="bg-white p-1 rounded-lg border border-slate-200 flex flex-wrap gap-1 text-sm font-medium w-fit">
+          <button
+            onClick={() => onBackToS2D(run.mapping_id)}
+            className="px-4 py-1.5 rounded-md flex items-center gap-1.5 text-slate-500 hover:text-slate-700"
+          >
+            <ListChecks className="w-3.5 h-3.5" /> Rules
+          </button>
+          <button className="px-4 py-1.5 rounded-md flex items-center gap-1.5 bg-mastek-primary text-white shadow">
+            <Gauge className="w-3.5 h-3.5" /> Results
+          </button>
+          <button
+            disabled
+            title="Coming soon: needs a historical time-series data model that doesn't exist yet"
+            className="px-4 py-1.5 rounded-md flex items-center gap-1.5 text-slate-300 cursor-not-allowed"
+          >
+            <LineChart className="w-3.5 h-3.5" /> Trends
+          </button>
+          <button
+            disabled
+            title="Coming soon: needs an aggregate scoring model that doesn't exist yet"
+            className="px-4 py-1.5 rounded-md flex items-center gap-1.5 text-slate-300 cursor-not-allowed"
+          >
+            <Gauge className="w-3.5 h-3.5" /> Scorecard
+          </button>
+          <button
+            onClick={onGoToHistory}
+            className="px-4 py-1.5 rounded-md flex items-center gap-1.5 text-slate-500 hover:text-slate-700"
+          >
+            <HistoryIcon className="w-3.5 h-3.5" /> History
+          </button>
+        </div>
+
         <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
           <div className="bg-white border border-slate-200 rounded-xl p-4 shadow-sm flex flex-col gap-1">
             <span className="text-xs font-medium text-slate-400 uppercase tracking-wider">Overall Status</span>
-            {run.status === 'passed' ? (
-              <span className="text-2xl font-bold text-mastek-success flex items-center gap-2">
-                <CheckCircle2 className="w-5 h-5" /> PASSED
+            <div className="flex items-center gap-4">
+              <span className="text-xl font-bold text-mastek-success flex items-center gap-1.5">
+                <CheckCircle2 className="w-4 h-4" /> {run.pass_count} Passed
               </span>
-            ) : (
-              <span className="text-2xl font-bold text-red-600 flex items-center gap-2">
-                <XCircle className="w-5 h-5" /> FAILED
-                <span className="text-xs font-normal text-slate-400">({failCount} alert{failCount !== 1 ? 's' : ''})</span>
+              <span className="text-xl font-bold text-red-600 flex items-center gap-1.5">
+                <XCircle className="w-4 h-4" /> {run.fail_count} Failed
               </span>
-            )}
+            </div>
           </div>
           <div className="bg-white border border-slate-200 rounded-xl p-4 shadow-sm flex flex-col gap-1">
             <span className="text-xs font-medium text-slate-400 uppercase tracking-wider">Total Checkpoints</span>
@@ -100,37 +141,61 @@ export default function AnalyticsPage({ runId, onBackToS2D }) {
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 items-start">
           <div className="lg:col-span-2 bg-white border border-slate-200 rounded-xl overflow-hidden shadow-sm">
             <div className="bg-slate-50 border-b border-slate-200 px-5 py-4">
-              <h3 className="font-bold text-sm text-slate-700">Detailed Gate Assertions</h3>
+              <h3 className="font-bold text-sm text-slate-700">Results</h3>
             </div>
-            <div className="overflow-x-auto font-mono text-xs">
+            <div className="overflow-x-auto text-xs">
               <table className="w-full text-left whitespace-nowrap">
-                <thead className="bg-slate-50 border-b border-slate-200 text-slate-400 uppercase tracking-wider">
+                <thead className="bg-slate-50 border-b border-slate-200 text-slate-400 uppercase tracking-wider font-mono">
                   <tr>
-                    <th className="px-5 py-3 font-semibold">Test ID</th>
-                    <th className="px-5 py-3 font-semibold">Rule Target</th>
-                    <th className="px-5 py-3 font-semibold">Validation Type</th>
-                    <th className="px-5 py-3 font-semibold">Result</th>
+                    <th className="px-5 py-3 font-semibold">Rule</th>
+                    <th className="px-3 py-3 font-semibold">Table</th>
+                    <th className="px-3 py-3 font-semibold">Result</th>
+                    <th className="px-3 py-3 font-semibold">Violations</th>
+                    <th className="px-3 py-3 font-semibold">Total Rows</th>
+                    <th className="px-3 py-3 font-semibold">Pass Rate</th>
+                    <th className="px-3 py-3 font-semibold">Rate</th>
+                    <th className="px-3 py-3 font-semibold">Duration</th>
+                    <th className="px-3 py-3 font-semibold">Executed</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100">
-                  {run.results.map((r) => (
-                    <tr
-                      key={r.id}
-                      onClick={() => setSelectedResultId(r.id)}
-                      className={`cursor-pointer hover:bg-slate-50 ${
-                        r.id === selectedResultId ? 'bg-slate-50' : ''
-                      } ${r.status !== 'PASS' ? 'border-l-2 border-l-red-400' : ''}`}
-                    >
-                      <td className="px-5 py-4 font-semibold text-slate-600">{r.test_label}</td>
-                      <td className="px-5 py-4 text-slate-600">{r.rule_target}</td>
-                      <td className="px-5 py-4 text-slate-400">{r.validation_type}</td>
-                      <td className="px-5 py-4">
-                        <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${STATUS_BADGE[r.status]}`}>
-                          {r.status}
-                        </span>
-                      </td>
-                    </tr>
-                  ))}
+                  {run.results.map((r) => {
+                    const rate = rowPassRate(r);
+                    return (
+                      <tr
+                        key={r.id}
+                        onClick={() => setSelectedResultId(r.id)}
+                        className={`cursor-pointer hover:bg-slate-50 ${
+                          r.id === selectedResultId ? 'bg-slate-50' : ''
+                        } ${r.status !== 'PASS' ? 'border-l-2 border-l-red-400' : ''}`}
+                      >
+                        <td className="px-5 py-3 font-medium text-slate-700">{r.test_name}</td>
+                        <td className="px-3 py-3 font-mono text-slate-500">{r.rule_target}</td>
+                        <td className="px-3 py-3">
+                          <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${STATUS_BADGE[r.status]}`}>
+                            {r.status}
+                          </span>
+                        </td>
+                        <td className="px-3 py-3 font-mono text-slate-500">{r.violations ?? '—'}</td>
+                        <td className="px-3 py-3 font-mono text-slate-500">{r.total_rows ?? '—'}</td>
+                        <td className="px-3 py-3 font-mono text-slate-500">{rate.toFixed(1)}%</td>
+                        <td className="px-3 py-3 w-28">
+                          <div className="h-1.5 w-full bg-slate-100 rounded-full overflow-hidden">
+                            <div
+                              className={`h-full rounded-full ${rate >= 100 ? 'bg-mastek-success' : rate > 0 ? 'bg-amber-400' : 'bg-red-400'}`}
+                              style={{ width: `${rate}%` }}
+                            />
+                          </div>
+                        </td>
+                        <td className="px-3 py-3 font-mono text-slate-400">
+                          {r.duration_seconds != null ? `${r.duration_seconds}s` : '—'}
+                        </td>
+                        <td className="px-3 py-3 text-slate-400">
+                          {r.executed_at ? new Date(r.executed_at).toLocaleString() : '—'}
+                        </td>
+                      </tr>
+                    );
+                  })}
                 </tbody>
               </table>
             </div>

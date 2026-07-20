@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { ArrowDown, Trash2, Loader2, Plus } from 'lucide-react';
+import { ArrowDown, Trash2, Loader2, Plus, ChevronDown, ChevronRight, ChevronLeft, PanelLeftOpen } from 'lucide-react';
 import {
   fetchConnectors, fetchConnectorContainers, fetchContainerTables,
   createS2DMapping, deleteS2DMapping,
@@ -134,6 +134,19 @@ export default function MappingPanel({ mappings, selectedMappingId, onSelectMapp
   const [destination, setDestination] = useState(EMPTY_ENDPOINT);
   const [isSaving, setIsSaving] = useState(false);
   const [error, setError] = useState(null);
+  // Collapsed by default once at least one mapping exists, so the form's
+  // two full table checklists don't push TestCasePanel below the fold -
+  // still open immediately for a brand-new workspace with nothing to pick yet.
+  const [showForm, setShowForm] = useState(false);
+  const isFormOpen = showForm || mappings.length === 0;
+  // The mapping list itself can also grow long enough to push TestCasePanel
+  // out of view - collapsible too, expanded by default since it's the main
+  // way to switch mappings.
+  const [showMappings, setShowMappings] = useState(true);
+  // Collapses the ENTIRE sidebar down to a slim rail, reclaiming all its
+  // width for TestCasePanel - independent of the two section-level toggles
+  // above, which only matter once the sidebar itself is open.
+  const [collapsed, setCollapsed] = useState(false);
 
   useEffect(() => {
     fetchConnectors().then(setConnectors);
@@ -159,6 +172,7 @@ export default function MappingPanel({ mappings, selectedMappingId, onSelectMapp
       setName('');
       setSource(EMPTY_ENDPOINT);
       setDestination(EMPTY_ENDPOINT);
+      setShowForm(false);
       onMappingsChanged();
     } catch (err) {
       setError(err.message);
@@ -173,11 +187,42 @@ export default function MappingPanel({ mappings, selectedMappingId, onSelectMapp
     onMappingsChanged();
   };
 
+  if (collapsed) {
+    return (
+      <aside className="w-12 border-r border-slate-200 bg-white flex flex-col items-center py-4 shrink-0">
+        <button
+          onClick={() => setCollapsed(false)}
+          title="Expand mappings"
+          className="p-2 text-slate-400 hover:text-mastek-primary hover:bg-mastek-primary/10 rounded-lg"
+        >
+          <PanelLeftOpen className="w-4 h-4" />
+        </button>
+      </aside>
+    );
+  }
+
   return (
     <aside className="w-full lg:w-80 max-h-[45vh] lg:max-h-none border-b lg:border-b-0 lg:border-r border-slate-200 bg-white p-4 flex flex-col gap-6 overflow-y-auto shrink-0">
+      <div className="flex items-center justify-end -mb-2">
+        <button
+          onClick={() => setCollapsed(true)}
+          title="Collapse"
+          className="p-1 text-slate-400 hover:text-mastek-primary hover:bg-mastek-primary/10 rounded"
+        >
+          <ChevronLeft className="w-4 h-4" />
+        </button>
+      </div>
+
       {mappings.length > 0 && (
         <div>
-          <h3 className="text-xs font-bold text-slate-400 uppercase tracking-wider mb-3">Mappings</h3>
+          <button
+            onClick={() => setShowMappings((v) => !v)}
+            className="w-full flex items-center justify-between text-xs font-bold text-slate-400 uppercase tracking-wider mb-3 hover:text-slate-600"
+          >
+            Mappings ({mappings.length})
+            {showMappings ? <ChevronDown className="w-3.5 h-3.5" /> : <ChevronRight className="w-3.5 h-3.5" />}
+          </button>
+          {showMappings && (
           <div className="space-y-1.5">
             {mappings.map((m) => (
               <div
@@ -206,52 +251,72 @@ export default function MappingPanel({ mappings, selectedMappingId, onSelectMapp
               </div>
             ))}
           </div>
+          )}
         </div>
       )}
 
       <div>
-        <h3 className="text-xs font-bold text-slate-400 uppercase tracking-wider mb-3">New Mapping</h3>
+        <button
+          onClick={() => setShowForm((v) => !v)}
+          className="w-full flex items-center justify-between text-xs font-bold text-slate-400 uppercase tracking-wider mb-3 hover:text-slate-600"
+        >
+          New Mapping
+          {isFormOpen ? <ChevronDown className="w-3.5 h-3.5" /> : <ChevronRight className="w-3.5 h-3.5" />}
+        </button>
 
-        <input
-          value={name}
-          onChange={(e) => setName(e.target.value)}
-          placeholder="Mapping name"
-          className="w-full mb-4 px-2.5 py-1.5 text-sm border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-mastek-accent"
-        />
-
-        <EndpointPicker label="1. Source" connectors={connectors} endpoint={source} onChange={setSource} />
-
-        <div className="flex justify-center my-3">
-          <ArrowDown className="w-4 h-4 text-slate-300" />
-        </div>
-
-        <EndpointPicker label="2. Destination" connectors={connectors} endpoint={destination} onChange={setDestination} />
-
-        {(source.tables.length > 0 || destination.tables.length > 0) && (
-          <div className="mt-4 p-3 rounded-lg bg-slate-50 border border-slate-200 text-xs space-y-2">
-            <span className="text-slate-400 block font-semibold">Active Mapping Rule:</span>
-            <div className="font-mono text-slate-600 bg-white p-2 rounded border border-slate-200 space-y-1">
-              <p className="text-mastek-highlight truncate">
-                {source.tables.length > 0 ? source.tables.join(', ') : '...'}
-              </p>
-              <p className="text-center text-slate-300">&#8595;</p>
-              <p className="text-mastek-accent truncate">
-                {destination.tables.length > 0 ? destination.tables.join(', ') : '...'}
-              </p>
-            </div>
-          </div>
+        {!isFormOpen && (
+          <button
+            onClick={() => setShowForm(true)}
+            className="w-full flex items-center justify-center gap-2 px-4 py-2 text-sm font-medium text-mastek-primary bg-mastek-primary/10 rounded-lg hover:bg-mastek-primary/20"
+          >
+            <Plus className="w-4 h-4" /> New Mapping
+          </button>
         )}
 
-        {error && <p className="text-xs text-red-600 mt-3">{error}</p>}
+        {isFormOpen && (
+          <>
+            <input
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              placeholder="Mapping name"
+              className="w-full mb-4 px-2.5 py-1.5 text-sm border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-mastek-accent"
+            />
 
-        <button
-          onClick={handleCreate}
-          disabled={isSaving || !isComplete}
-          className="w-full mt-4 flex items-center justify-center gap-2 px-4 py-2 text-sm font-medium text-white bg-mastek-primary rounded-lg hover:brightness-110 disabled:opacity-50 disabled:cursor-not-allowed"
-        >
-          {isSaving ? <Loader2 className="w-4 h-4 animate-spin" /> : <Plus className="w-4 h-4" />}
-          Create Mapping
-        </button>
+            <EndpointPicker label="1. Source" connectors={connectors} endpoint={source} onChange={setSource} />
+
+            <div className="flex justify-center my-3">
+              <ArrowDown className="w-4 h-4 text-slate-300" />
+            </div>
+
+            <EndpointPicker label="2. Destination" connectors={connectors} endpoint={destination} onChange={setDestination} />
+
+            {(source.tables.length > 0 || destination.tables.length > 0) && (
+              <div className="mt-4 p-3 rounded-lg bg-slate-50 border border-slate-200 text-xs space-y-2">
+                <span className="text-slate-400 block font-semibold">Active Mapping Rule:</span>
+                <div className="font-mono text-slate-600 bg-white p-2 rounded border border-slate-200 space-y-1">
+                  <p className="text-mastek-highlight truncate">
+                    {source.tables.length > 0 ? source.tables.join(', ') : '...'}
+                  </p>
+                  <p className="text-center text-slate-300">&#8595;</p>
+                  <p className="text-mastek-accent truncate">
+                    {destination.tables.length > 0 ? destination.tables.join(', ') : '...'}
+                  </p>
+                </div>
+              </div>
+            )}
+
+            {error && <p className="text-xs text-red-600 mt-3">{error}</p>}
+
+            <button
+              onClick={handleCreate}
+              disabled={isSaving || !isComplete}
+              className="w-full mt-4 flex items-center justify-center gap-2 px-4 py-2 text-sm font-medium text-white bg-mastek-primary rounded-lg hover:brightness-110 disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              {isSaving ? <Loader2 className="w-4 h-4 animate-spin" /> : <Plus className="w-4 h-4" />}
+              Create Mapping
+            </button>
+          </>
+        )}
       </div>
     </aside>
   );

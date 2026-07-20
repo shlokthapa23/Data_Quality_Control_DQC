@@ -44,7 +44,13 @@ function App() {
 
   let content;
   if (activePage === 'analytics' && activeRunId) {
-    content = <AnalyticsPage runId={activeRunId} onBackToS2D={handleBackFromAnalytics} />;
+    content = (
+      <AnalyticsPage
+        runId={activeRunId}
+        onBackToS2D={handleBackFromAnalytics}
+        onGoToHistory={() => goToPage('history')}
+      />
+    );
   } else if (activePage === 'connect') {
     content = <ConnectPage />;
   } else if (activePage === 'harvest') {

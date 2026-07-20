@@ -266,6 +266,18 @@ class FabricConnector(BaseConnector):
         finally:
             con.close()
 
+    def run_query_all(self, container_id, sql):
+        """Like run_query(), but returns every matching row. container_id is a Lakehouse id."""
+        normalized = validate_select_only(sql)
+
+        con = self._duckdb_attach(container_id)
+        try:
+            result = con.execute(normalized).fetchall()
+            columns = [d[0] for d in con.description]
+            return [dict(zip(columns, row)) for row in result]
+        finally:
+            con.close()
+
     def sample_rows(self, container_id, table, limit=20):
         """Random sample of rows for the AI rule-suggestion flow. container_id is a Lakehouse id."""
         con = self._duckdb_attach(container_id)

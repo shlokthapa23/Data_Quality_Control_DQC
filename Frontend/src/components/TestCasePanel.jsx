@@ -1,12 +1,20 @@
 import { useEffect, useState } from 'react';
 import {
   Sparkles, Code2, Plus, Trash2, Loader2, AlertCircle, Rocket, GitCompareArrows,
-  Pencil, Play, X, FileCode2,
+  Pencil, Play, X, FileCode2, Wand2, User,
 } from 'lucide-react';
 import {
   fetchS2DTestCases, createS2DTestCase, updateS2DTestCase, deleteS2DTestCase,
-  runS2DPipeline, runSingleS2DTestCase,
+  runS2DPipeline, runSingleS2DTestCase, fetchContainerTables, generateAITestCase,
+  generateAISuggestedRules, generateAISuggestedParityRules, generateKeyColumnSuggestion,
+  setS2DTestCaseActive,
 } from '../api';
+
+const SEVERITY_STYLES = {
+  critical: 'bg-red-100 text-red-700',
+  error: 'bg-red-50 text-red-600',
+  warning: 'bg-amber-100 text-amber-700',
+};
 
 const VALIDATION_TYPES = [
   'Null Value Constraint',
@@ -20,6 +28,10 @@ const VALIDATION_TYPES = [
   'Record Volume Integrity',
   'Custom',
 ];
+
+// column_parity only supports metrics that can be computed independently on
+// each side and compared - null count, distinct count, min/max range.
+const PARITY_VALIDATION_TYPES = ['Null Value Constraint', 'Uniqueness Constraint', 'Boundary Range Constraint'];
 
 // One dialect for everything now: Local runs on DuckDB directly, and
 // Fabric connects through DuckDB's mssql extension (attached to the same
@@ -147,10 +159,25 @@ FROM students_info
 WHERE student_id IS NULL`;
 
 const EMPTY_FORM = {
-  name: '', validationType: VALIDATION_TYPES[0], checkType: 'sql',
-  target: 'source', targetTable: '', scriptType: 'sql', scriptText: '',
+  name: '', validationType: VALIDATION_TYPES[0], checkType: 'sql', checkScope: 'single_side',
+  target: 'source', targetTable: '', targetTables: [], scriptType: 'sql', scriptText: '',
   rowCountSourceTables: [], rowCountDestinationTables: [],
+  sourceTables: [], sourceColumn: '', destinationTables: [], destinationColumn: '',
+  sourceTargetTables: [], destinationTargetTables: [], keyColumn: '',
 };
+
+// Columns present on every one of the given table names - so the picker
+// can never suggest a column that doesn't exist everywhere it'll be
+// UNION ALL'd together.
+function commonColumns(schema, tableNames) {
+  if (tableNames.length === 0) return [];
+  const columnLists = tableNames
+    .map((name) => schema.find((t) => t.name === name)?.columns)
+    .filter(Boolean);
+  if (columnLists.length === 0) return [];
+  const [first, ...rest] = columnLists;
+  return first.filter((c) => rest.every((cols) => cols.some((c2) => c2.name === c.name)));
+}
 
 function TableCheckboxList({ tables, selected, onToggle }) {
   return (
@@ -186,6 +213,39 @@ const [tab, setTab] = useState('ai'); // 'ai' | 'manual'
   const [runningId, setRunningId] = useState(null); // per-row running state
   const [isRunningAll, setIsRunningAll] = useState(false);
   const [runError, setRunError] = useState(null);
+  // AI tab state - separate from the Manual tab's form until generation succeeds
+  const [aiMode, setAiMode] = useState('single'); // 'single' | 'parity' | 'cross_parity'
+  const [aiTarget, setAiTarget] = useState('source'); // 'source' | 'destination'
+  const [aiTables, setAiTables] = useState([]);
+  const [isLoadingAiTables, setIsLoadingAiTables] = useState(false);
+  const [aiTableNames, setAiTableNames] = useState([]); // multi-select - Generate Test Case can UNION ALL several
+  const [aiDescription, setAiDescription] = useState('');
+  const [isGenerating, setIsGenerating] = useState(false);
+  const [aiError, setAiError] = useState(null);
+  // Sample-based "AI Suggest Rules" - no description, auto-saves straight away
+  const [isSuggesting, setIsSuggesting] = useState(false);
+  const [suggestError, setSuggestError] = useState(null);
+  const [suggestSummary, setSuggestSummary] = useState(null); // { createdCount, skipped }
+  const [togglingId, setTogglingId] = useState(null);
+  // Column Parity Check tables+columns - fetched once per mapping, shared by
+  // the Manual tab's column pickers AND the AI tab's "Source <-> Destination" mode.
+  const [sourceSchema, setSourceSchema] = useState([]);
+  const [destinationSchema, setDestinationSchema] = useState([]);
+  // AI tab "Source <-> Destination" mode - dual-table sample-based suggestion
+  const [aiParitySourceTables, setAiParitySourceTables] = useState([]);
+  const [aiParityDestinationTables, setAiParityDestinationTables] = useState([]);
+  const [isSuggestingParity, setIsSuggestingParity] = useState(false);
+  const [suggestParityError, setSuggestParityError] = useState(null);
+  const [suggestParitySummary, setSuggestParitySummary] = useState(null); // { createdCount, skipped }
+  // AI tab "Cross-Table Parity" mode - AI only suggests a key column + name,
+  // no SQL/sampling involved (cross_table_parity is engine-computed); hands
+  // off to the Manual tab for review/save, same as 'single' mode's Generate Test Case.
+  const [aiCrossSourceTables, setAiCrossSourceTables] = useState([]);
+  const [aiCrossDestinationTables, setAiCrossDestinationTables] = useState([]);
+  const [aiCrossDescription, setAiCrossDescription] = useState('');
+  const [isSuggestingKeyColumn, setIsSuggestingKeyColumn] = useState(false);
+  const [suggestKeyColumnError, setSuggestKeyColumnError] = useState(null);
+
 
   const loadTestCases = () => {
     if (!mapping) return;
@@ -199,7 +259,183 @@ const [tab, setTab] = useState('ai'); // 'ai' | 'manual'
   };
 
   useEffect(loadTestCases, [mapping]);
-  useEffect(() => { setEditingId(null); setForm(EMPTY_FORM); setPrebuiltKey('custom_sql'); }, [mapping]);
+  useEffect(() => {
+    setEditingId(null); setForm(EMPTY_FORM); setPrebuiltKey('custom_sql');
+    setAiTableNames([]); setAiDescription(''); setAiError(null);
+    setAiParitySourceTables([]); setAiParityDestinationTables([]);
+    setSuggestParityError(null); setSuggestParitySummary(null);
+    setAiCrossSourceTables([]); setAiCrossDestinationTables([]); setAiCrossDescription('');
+    setSuggestKeyColumnError(null);
+  }, [mapping]);
+
+  useEffect(() => {
+    if (!mapping) return;
+    let cancelled = false;
+    const connectorId = aiTarget === 'source' ? mapping.source_connector_id : mapping.destination_connector_id;
+    const containerId = aiTarget === 'source' ? mapping.source_container_id : mapping.destination_container_id;
+    setIsLoadingAiTables(true);
+    setAiTableNames([]);
+    fetchContainerTables(connectorId, containerId)
+      .then((data) => {
+        if (cancelled) return;
+        setAiTables(data.tables);
+        setIsLoadingAiTables(false);
+      })
+      .catch(() => { if (!cancelled) setIsLoadingAiTables(false); });
+    return () => { cancelled = true; };
+  }, [mapping, aiTarget]);
+
+  // Switching mappings quickly (especially away from a slow Fabric mapping)
+  // can let an old fetch resolve AFTER a newer one - the cancelled flag
+  // stops a stale response from ever overwriting the current mapping's schema.
+  useEffect(() => {
+    if (!mapping) { setSourceSchema([]); setDestinationSchema([]); return; }
+    let cancelled = false;
+    fetchContainerTables(mapping.source_connector_id, mapping.source_container_id)
+      .then((data) => { if (!cancelled) setSourceSchema(data.tables); })
+      .catch(() => { if (!cancelled) setSourceSchema([]); });
+    fetchContainerTables(mapping.destination_connector_id, mapping.destination_container_id)
+      .then((data) => { if (!cancelled) setDestinationSchema(data.tables); })
+      .catch(() => { if (!cancelled) setDestinationSchema([]); });
+    return () => { cancelled = true; };
+  }, [mapping]);
+
+  const selectedAiTables = aiTables.filter((t) => aiTableNames.includes(t.name));
+  const sourceParityColumns = commonColumns(sourceSchema, form.sourceTables);
+  const destinationParityColumns = commonColumns(destinationSchema, form.destinationTables);
+  const crossParityKeyColumns = commonColumns(sourceSchema, form.sourceTargetTables)
+    .filter((c) => commonColumns(destinationSchema, form.destinationTargetTables).some((c2) => c2.name === c.name));
+
+  const toggleAiTableName = (table) => {
+    setAiTableNames((prev) => (prev.includes(table) ? prev.filter((t) => t !== table) : [...prev, table]));
+  };
+
+  const handleGenerate = async () => {
+    if (aiTableNames.length === 0 || !aiDescription || selectedAiTables.length === 0) return;
+    setIsGenerating(true);
+    setAiError(null);
+    try {
+      const { sql } = await generateAITestCase({
+        checkScope: 'single_side',
+        tables: selectedAiTables.map((t) => ({ table_name: t.name, columns: t.columns })),
+        description: aiDescription,
+      });
+      // Hand off to the Manual tab, pre-filled and ready to review/edit -
+      // same landing spot prebuilt templates use, so saving works identically.
+      setForm((f) => ({
+        ...f,
+        checkType: 'sql',
+        checkScope: 'single_side',
+        target: aiTarget,
+        targetTables: [...aiTableNames],
+        scriptType: 'sql',
+        scriptText: sql,
+        name: f.name || aiDescription.slice(0, 60),
+      }));
+      setPrebuiltKey('custom_sql');
+      setTab('manual');
+    } catch (err) {
+      setAiError(err.message);
+    } finally {
+      setIsGenerating(false);
+    }
+  };
+
+  const handleSuggestRules = async () => {
+    if (aiTableNames.length !== 1) return;
+    setIsSuggesting(true);
+    setSuggestError(null);
+    setSuggestSummary(null);
+    try {
+      const { created, skipped } = await generateAISuggestedRules(mapping.id, {
+        target: aiTarget,
+        tableName: aiTableNames[0],
+      });
+      setSuggestSummary({ createdCount: created.length, skipped });
+      loadTestCases();
+    } catch (err) {
+      setSuggestError(err.message);
+    } finally {
+      setIsSuggesting(false);
+    }
+  };
+
+  const handleSuggestParityRules = async () => {
+    if (aiParitySourceTables.length === 0 || aiParityDestinationTables.length === 0) return;
+    setIsSuggestingParity(true);
+    setSuggestParityError(null);
+    setSuggestParitySummary(null);
+    try {
+      const { created, skipped } = await generateAISuggestedParityRules(mapping.id, {
+        sourceTables: aiParitySourceTables,
+        destinationTables: aiParityDestinationTables,
+      });
+      setSuggestParitySummary({ createdCount: created.length, skipped });
+      loadTestCases();
+    } catch (err) {
+      setSuggestParityError(err.message);
+    } finally {
+      setIsSuggestingParity(false);
+    }
+  };
+
+  const toggleAiParityTable = (side, table) => {
+    const setter = side === 'source' ? setAiParitySourceTables : setAiParityDestinationTables;
+    setter((prev) => (prev.includes(table) ? prev.filter((t) => t !== table) : [...prev, table]));
+  };
+
+  const toggleAiCrossTable = (side, table) => {
+    const setter = side === 'source' ? setAiCrossSourceTables : setAiCrossDestinationTables;
+    setter((prev) => (prev.includes(table) ? prev.filter((t) => t !== table) : [...prev, table]));
+  };
+
+  const handleSuggestKeyColumn = async () => {
+    if (aiCrossSourceTables.length === 0 || aiCrossDestinationTables.length === 0 || !aiCrossDescription) return;
+    setIsSuggestingKeyColumn(true);
+    setSuggestKeyColumnError(null);
+    try {
+      const toContext = (schema, name) => {
+        const t = schema.find((s) => s.name === name);
+        return { table_name: name, columns: t ? t.columns : [] };
+      };
+      const { key_column, name } = await generateKeyColumnSuggestion({
+        sourceTables: aiCrossSourceTables.map((n) => toContext(sourceSchema, n)),
+        destinationTables: aiCrossDestinationTables.map((n) => toContext(destinationSchema, n)),
+        description: aiCrossDescription,
+      });
+      // Hand off to the Manual tab, pre-filled and ready to review/save -
+      // same landing spot the 'single' mode's Generate Test Case uses.
+      setForm((f) => ({
+        ...f,
+        checkType: 'sql',
+        checkScope: 'cross_table_parity',
+        validationType: 'Custom',
+        name: name || f.name || aiCrossDescription.slice(0, 60),
+        sourceTargetTables: [...aiCrossSourceTables],
+        destinationTargetTables: [...aiCrossDestinationTables],
+        keyColumn: key_column,
+      }));
+      setTab('manual');
+    } catch (err) {
+      setSuggestKeyColumnError(err.message);
+    } finally {
+      setIsSuggestingKeyColumn(false);
+    }
+  };
+
+  const handleToggleActive = async (tc) => {
+    setTogglingId(tc.id);
+    const nextActive = !tc.active;
+    setTestCases((prev) => prev.map((t) => (t.id === tc.id ? { ...t, active: nextActive } : t)));
+    try {
+      await setS2DTestCaseActive(tc.id, nextActive);
+    } catch (err) {
+      setTestCases((prev) => prev.map((t) => (t.id === tc.id ? { ...t, active: tc.active } : t)));
+      setRunError(err.message);
+    } finally {
+      setTogglingId(null);
+    }
+  };
 
   const startEdit = (tc) => {
     setTab('manual');
@@ -207,10 +443,16 @@ const [tab, setTab] = useState('ai'); // 'ai' | 'manual'
     setPrebuiltKey('custom_sql'); // editing shows the raw saved script, not a template
     setForm({
       name: tc.name, validationType: tc.validation_type, checkType: tc.check_type,
+      checkScope: tc.check_scope || 'single_side',
       target: tc.target || 'source', targetTable: tc.target_table || '',
+      targetTables: tc.target_tables || (tc.target_table ? [tc.target_table] : []),
       scriptType: tc.script_type || 'sql', scriptText: tc.script_text || '',
       rowCountSourceTables: tc.row_count_source_tables || [],
       rowCountDestinationTables: tc.row_count_destination_tables || [],
+      sourceTables: tc.source_tables || [], sourceColumn: tc.source_column || '',
+      destinationTables: tc.destination_tables || [], destinationColumn: tc.destination_column || '',
+      sourceTargetTables: tc.source_target_tables || [], destinationTargetTables: tc.destination_target_tables || [],
+      keyColumn: tc.key_column || '',
     });
   };
 
@@ -220,23 +462,44 @@ const [tab, setTab] = useState('ai'); // 'ai' | 'manual'
     setPrebuiltKey('custom_sql');
   };
 
+  const isCrossTableParity = form.checkType === 'sql' && form.checkScope === 'cross_table_parity';
+
   const canSave = form.checkType === 'row_count_match'
     ? !!(form.name && form.rowCountSourceTables.length > 0 && form.rowCountDestinationTables.length > 0)
-    : !!(form.name && form.scriptText);
+    : form.checkType === 'column_parity'
+    ? !!(form.name && form.sourceTables.length > 0 && form.sourceColumn && form.destinationTables.length > 0 && form.destinationColumn)
+    : isCrossTableParity
+    ? !!(form.name && form.sourceTargetTables.length > 0 && form.destinationTargetTables.length > 0 && form.keyColumn)
+    : !!(form.name && form.targetTables.length > 0 && form.scriptText);
 
-  const buildPayload = () => (
-    form.checkType === 'row_count_match'
-      ? {
-          name: form.name, validation_type: form.validationType, check_type: 'row_count_match',
-          row_count_source_tables: form.rowCountSourceTables,
-          row_count_destination_tables: form.rowCountDestinationTables,
-        }
-      : {
-          name: form.name, validation_type: form.validationType, check_type: 'sql',
-          target: form.target, target_table: form.targetTable || null,
-          script_type: form.scriptType, script_text: form.scriptText,
-        }
-  );
+  const buildPayload = () => {
+    if (form.checkType === 'row_count_match') {
+      return {
+        name: form.name, validation_type: form.validationType, check_type: 'row_count_match',
+        row_count_source_tables: form.rowCountSourceTables,
+        row_count_destination_tables: form.rowCountDestinationTables,
+      };
+    }
+    if (form.checkType === 'column_parity') {
+      return {
+        name: form.name, validation_type: form.validationType, check_type: 'column_parity',
+        source_tables: form.sourceTables, source_column: form.sourceColumn,
+        destination_tables: form.destinationTables, destination_column: form.destinationColumn,
+      };
+    }
+    if (isCrossTableParity) {
+      return {
+        name: form.name, validation_type: form.validationType, check_type: 'sql',
+        check_scope: 'cross_table_parity', key_column: form.keyColumn,
+        source_target_tables: form.sourceTargetTables, destination_target_tables: form.destinationTargetTables,
+      };
+    }
+    return {
+      name: form.name, validation_type: form.validationType, check_type: 'sql', check_scope: 'single_side',
+      target: form.target, target_tables: form.targetTables,
+      script_type: form.scriptType, script_text: form.scriptText,
+    };
+  };
 
   const handleSave = async () => {
     if (!canSave) return;
@@ -297,6 +560,41 @@ const [tab, setTab] = useState('ai'); // 'ai' | 'manual'
     }));
   };
 
+  const toggleParityTable = (side, table) => {
+    const tablesField = side === 'source' ? 'sourceTables' : 'destinationTables';
+    const columnField = side === 'source' ? 'sourceColumn' : 'destinationColumn';
+    setForm((f) => {
+      const nextTables = f[tablesField].includes(table)
+        ? f[tablesField].filter((t) => t !== table)
+        : [...f[tablesField], table];
+      const schema = side === 'source' ? sourceSchema : destinationSchema;
+      // Clear the column choice if it's no longer common to every selected table
+      const stillValid = commonColumns(schema, nextTables).some((c) => c.name === f[columnField]);
+      return { ...f, [tablesField]: nextTables, [columnField]: stillValid ? f[columnField] : '' };
+    });
+  };
+
+  const toggleTargetTable = (table) => {
+    setForm((f) => ({
+      ...f,
+      targetTables: f.targetTables.includes(table) ? f.targetTables.filter((t) => t !== table) : [...f.targetTables, table],
+    }));
+  };
+
+  const toggleCrossParityTable = (side, table) => {
+    const tablesField = side === 'source' ? 'sourceTargetTables' : 'destinationTargetTables';
+    setForm((f) => {
+      const nextTables = f[tablesField].includes(table)
+        ? f[tablesField].filter((t) => t !== table)
+        : [...f[tablesField], table];
+      const sourceTables = side === 'source' ? nextTables : f.sourceTargetTables;
+      const destinationTables = side === 'destination' ? nextTables : f.destinationTargetTables;
+      const stillValid = commonColumns(sourceSchema, sourceTables).some((c) => c.name === f.keyColumn)
+        && commonColumns(destinationSchema, destinationTables).some((c) => c.name === f.keyColumn);
+      return { ...f, [tablesField]: nextTables, keyColumn: stillValid ? f.keyColumn : '' };
+    });
+  };
+
   if (!mapping) {
     return (
       <main className="flex-1 flex items-center justify-center text-slate-400 text-sm">
@@ -350,13 +648,262 @@ const [tab, setTab] = useState('ai'); // 'ai' | 'manual'
       </div>
 
       {tab === 'ai' && (
-        <div className="bg-white border border-slate-200 rounded-xl p-8 text-center text-slate-400">
-          <Sparkles className="w-8 h-8 mx-auto mb-3 text-mastek-highlight" />
-          <p className="font-medium text-slate-500">AI Prompt Generator - coming soon</p>
-          <p className="text-sm mt-1">
-            This will turn a plain-English description into a validation script automatically.
-            Use the Manual Notebook IDE tab for now.
-          </p>
+        <div className="bg-white border border-slate-200 rounded-xl p-5 space-y-4 shadow-sm">
+          <div className="bg-slate-100 p-1 rounded-lg flex gap-1 text-sm font-medium w-fit">
+            <button
+              onClick={() => setAiMode('single')}
+              className={`px-3 py-1 rounded-md transition-colors ${
+                aiMode === 'single' ? 'bg-white text-mastek-primary shadow' : 'text-slate-500 hover:text-slate-700'
+              }`}
+            >
+              Single table
+            </button>
+            <button
+              onClick={() => setAiMode('parity')}
+              className={`px-3 py-1 rounded-md flex items-center gap-1.5 transition-colors ${
+                aiMode === 'parity' ? 'bg-white text-mastek-primary shadow' : 'text-slate-500 hover:text-slate-700'
+              }`}
+            >
+              <GitCompareArrows className="w-3.5 h-3.5" /> Source ↔ Destination
+            </button>
+            <button
+              onClick={() => setAiMode('cross_parity')}
+              className={`px-3 py-1 rounded-md flex items-center gap-1.5 transition-colors ${
+                aiMode === 'cross_parity' ? 'bg-white text-mastek-primary shadow' : 'text-slate-500 hover:text-slate-700'
+              }`}
+            >
+              <GitCompareArrows className="w-3.5 h-3.5" /> Cross-Table Parity
+            </button>
+          </div>
+
+          {aiMode === 'single' && (
+            <>
+              <div className="flex items-center gap-2 text-sm text-slate-500">
+                <Sparkles className="w-4 h-4 text-mastek-highlight shrink-0" />
+                Pick a table, describe the check in plain English, and the AI writes the SQL using this
+                table's real columns - it never has to guess a name.
+              </div>
+
+              <div className="flex flex-wrap items-center gap-x-4 gap-y-2 text-sm">
+                <span className="text-xs font-medium text-slate-500">Table from:</span>
+                <label className="flex items-center gap-2 cursor-pointer">
+                  <input type="radio" checked={aiTarget === 'source'} onChange={() => setAiTarget('source')}
+                    className="text-mastek-primary focus:ring-mastek-accent" />
+                  Source
+                </label>
+                <label className="flex items-center gap-2 cursor-pointer">
+                  <input type="radio" checked={aiTarget === 'destination'} onChange={() => setAiTarget('destination')}
+                    className="text-mastek-primary focus:ring-mastek-accent" />
+                  Destination
+                </label>
+              </div>
+
+              {isLoadingAiTables ? (
+                <p className="text-sm text-slate-400 italic">Loading tables...</p>
+              ) : (
+                <TableCheckboxList
+                  tables={aiTables.map((t) => t.name)}
+                  selected={aiTableNames}
+                  onToggle={toggleAiTableName}
+                />
+              )}
+
+              {aiTableNames.length > 1 && (
+                <p className="text-xs text-mastek-primary">
+                  {aiTableNames.length} tables selected - will be combined (UNION ALL) for this check.
+                </p>
+              )}
+
+              {selectedAiTables.map((t) => (
+                <p key={t.name} className="text-xs text-slate-400">
+                  <span className="font-mono">{t.name}</span>: {t.columns.map((c) => `${c.name} (${c.data_type})`).join(', ')}
+                </p>
+              ))}
+
+              <textarea
+                value={aiDescription}
+                onChange={(e) => setAiDescription(e.target.value)}
+                placeholder="e.g. check that the Order ID column has no null values"
+                rows={3}
+                className="w-full px-3 py-2 text-sm border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-mastek-accent"
+              />
+
+              {aiError && (
+                <div className="flex items-center gap-2 text-sm text-red-600">
+                  <AlertCircle className="w-4 h-4 shrink-0" /> {aiError}
+                </div>
+              )}
+
+              <div className="flex flex-wrap items-center gap-3">
+                <button
+                  onClick={handleGenerate}
+                  disabled={isGenerating || aiTableNames.length === 0 || !aiDescription}
+                  className="flex items-center gap-2 px-4 py-2 text-sm font-medium text-white bg-mastek-primary rounded-lg hover:brightness-110 disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  {isGenerating ? <Loader2 className="w-4 h-4 animate-spin" /> : <Wand2 className="w-4 h-4" />}
+                  Generate Test Case
+                </button>
+
+                <button
+                  onClick={handleSuggestRules}
+                  disabled={isSuggesting || aiTableNames.length !== 1}
+                  title={aiTableNames.length > 1
+                    ? 'Select exactly one table - this flow samples that one table\'s rows'
+                    : 'Samples random rows from this table and lets the AI generate several rules on its own - no description needed'}
+                  className="flex items-center gap-2 px-4 py-2 text-sm font-medium text-mastek-primary bg-mastek-primary/10 rounded-lg hover:bg-mastek-primary/20 disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  {isSuggesting ? <Loader2 className="w-4 h-4 animate-spin" /> : <Sparkles className="w-4 h-4" />}
+                  AI Suggest Rules
+                </button>
+              </div>
+
+              {suggestError && (
+                <div className="flex items-center gap-2 text-sm text-red-600">
+                  <AlertCircle className="w-4 h-4 shrink-0" /> {suggestError}
+                </div>
+              )}
+
+              {suggestSummary && (
+                <div className="text-sm text-mastek-success">
+                  {suggestSummary.createdCount} rule{suggestSummary.createdCount === 1 ? '' : 's'} created from a random sample of {aiTableNames[0]}.
+                  {suggestSummary.skipped.length > 0 && (
+                    <span className="text-amber-600">
+                      {' '}{suggestSummary.skipped.length} skipped (failed the SQL safety check).
+                    </span>
+                  )}
+                </div>
+              )}
+
+              <p className="text-xs text-slate-400">
+                "Generate Test Case" turns your description into SQL for review in the Manual Notebook IDE tab.
+                "AI Suggest Rules" instead samples random rows straight from the table and saves several rules
+                automatically - no description, no manual save step. Both are checked against the same safety
+                guard every other test case's SQL passes through.
+              </p>
+            </>
+          )}
+
+          {aiMode === 'parity' && (
+            <>
+              <div className="flex items-center gap-2 text-sm text-slate-500">
+                <GitCompareArrows className="w-4 h-4 text-mastek-highlight shrink-0" />
+                Pick a source table and a destination table - the AI reads a random sample from both,
+                finds columns that are meant to hold the same data, and generates parity checks that
+                prove the transfer didn't lose or corrupt anything. This is the real point of S2D validation.
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div className="space-y-1">
+                  <p className="text-xs font-medium text-slate-500">Source tables</p>
+                  <TableCheckboxList
+                    tables={mapping.source_tables}
+                    selected={aiParitySourceTables}
+                    onToggle={(t) => toggleAiParityTable('source', t)}
+                  />
+                </div>
+                <div className="space-y-1">
+                  <p className="text-xs font-medium text-slate-500">Destination tables</p>
+                  <TableCheckboxList
+                    tables={mapping.destination_tables}
+                    selected={aiParityDestinationTables}
+                    onToggle={(t) => toggleAiParityTable('destination', t)}
+                  />
+                </div>
+              </div>
+
+              {suggestParityError && (
+                <div className="flex items-center gap-2 text-sm text-red-600">
+                  <AlertCircle className="w-4 h-4 shrink-0" /> {suggestParityError}
+                </div>
+              )}
+
+              <button
+                onClick={handleSuggestParityRules}
+                disabled={isSuggestingParity || aiParitySourceTables.length === 0 || aiParityDestinationTables.length === 0}
+                title="Samples random rows from both sides and lets the AI find matching column pairs to compare - no description needed"
+                className="flex items-center gap-2 px-4 py-2 text-sm font-medium text-white bg-mastek-primary rounded-lg hover:brightness-110 disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                {isSuggestingParity ? <Loader2 className="w-4 h-4 animate-spin" /> : <Sparkles className="w-4 h-4" />}
+                AI Suggest Parity Rules
+              </button>
+
+              {suggestParitySummary && (
+                <div className="text-sm text-mastek-success">
+                  {suggestParitySummary.createdCount} parity rule{suggestParitySummary.createdCount === 1 ? '' : 's'} created
+                  from {aiParitySourceTables.join(', ')} ↔ {aiParityDestinationTables.join(', ')}.
+                  {suggestParitySummary.skipped.length > 0 && (
+                    <span className="text-amber-600">
+                      {' '}{suggestParitySummary.skipped.length} skipped (invalid column/type suggestion).
+                    </span>
+                  )}
+                </div>
+              )}
+
+              <p className="text-xs text-slate-400">
+                Each saved rule compares a source column against a destination column it identified as
+                the same field - no free-form SQL involved, the same null/uniqueness/range comparison
+                logic used by the Manual tab's Column Parity Check runs it.
+              </p>
+            </>
+          )}
+
+          {aiMode === 'cross_parity' && (
+            <>
+              <div className="flex items-center gap-2 text-sm text-slate-500">
+                <GitCompareArrows className="w-4 h-4 text-mastek-highlight shrink-0" />
+                Pick tables on both sides, describe what you want verified, and the AI picks a shared
+                key/join column - the actual comparison then runs as a real row-by-row existence check
+                (does every source row's key actually arrive in the destination), not free-form SQL.
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div className="space-y-1">
+                  <p className="text-xs font-medium text-slate-500">Source tables</p>
+                  <TableCheckboxList
+                    tables={mapping.source_tables}
+                    selected={aiCrossSourceTables}
+                    onToggle={(t) => toggleAiCrossTable('source', t)}
+                  />
+                </div>
+                <div className="space-y-1">
+                  <p className="text-xs font-medium text-slate-500">Destination tables</p>
+                  <TableCheckboxList
+                    tables={mapping.destination_tables}
+                    selected={aiCrossDestinationTables}
+                    onToggle={(t) => toggleAiCrossTable('destination', t)}
+                  />
+                </div>
+              </div>
+
+              <textarea
+                value={aiCrossDescription}
+                onChange={(e) => setAiCrossDescription(e.target.value)}
+                placeholder="e.g. verify every order in the source table reached the destination"
+                rows={3}
+                className="w-full px-3 py-2 text-sm border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-mastek-accent"
+              />
+
+              {suggestKeyColumnError && (
+                <div className="flex items-center gap-2 text-sm text-red-600">
+                  <AlertCircle className="w-4 h-4 shrink-0" /> {suggestKeyColumnError}
+                </div>
+              )}
+
+              <button
+                onClick={handleSuggestKeyColumn}
+                disabled={isSuggestingKeyColumn || aiCrossSourceTables.length === 0 || aiCrossDestinationTables.length === 0 || !aiCrossDescription}
+                className="flex items-center gap-2 px-4 py-2 text-sm font-medium text-white bg-mastek-primary rounded-lg hover:brightness-110 disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                {isSuggestingKeyColumn ? <Loader2 className="w-4 h-4 animate-spin" /> : <Wand2 className="w-4 h-4" />}
+                Suggest Key Column
+              </button>
+
+              <p className="text-xs text-slate-400">
+                Hands off to the Manual Notebook IDE tab with the tables and suggested key column
+                pre-filled - review and save there, same as the Single Table generator.
+              </p>
+            </>
+          )}
         </div>
       )}
 
@@ -383,22 +930,42 @@ const [tab, setTab] = useState('ai'); // 'ai' | 'manual'
               onChange={(e) => setForm((f) => ({ ...f, validationType: e.target.value }))}
               className="px-3 py-2 text-sm border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-mastek-accent"
             >
-              {VALIDATION_TYPES.map((v) => <option key={v} value={v}>{v}</option>)}
+              {(form.checkType === 'column_parity' ? PARITY_VALIDATION_TYPES : VALIDATION_TYPES).map((v) => (
+                <option key={v} value={v}>{v}</option>
+              ))}
             </select>
           </div>
 
           <div className="flex flex-wrap items-center gap-x-4 gap-y-2 text-sm border-b border-slate-100 pb-3">
             <span className="text-xs font-medium text-slate-500">Check type:</span>
             <label className="flex items-center gap-2 cursor-pointer">
-              <input type="radio" checked={form.checkType === 'sql'} onChange={() => setForm((f) => ({ ...f, checkType: 'sql' }))}
+              <input type="radio" checked={form.checkType === 'sql' && form.checkScope === 'single_side'}
+                onChange={() => setForm((f) => ({ ...f, checkType: 'sql', checkScope: 'single_side' }))}
                 className="text-mastek-primary focus:ring-mastek-accent" />
               Custom SQL script
+            </label>
+            <label className="flex items-center gap-2 cursor-pointer">
+              <input type="radio" checked={form.checkType === 'sql' && form.checkScope === 'cross_table_parity'}
+                onChange={() => setForm((f) => ({ ...f, checkType: 'sql', checkScope: 'cross_table_parity', validationType: 'Custom' }))}
+                className="text-mastek-primary focus:ring-mastek-accent" />
+              <GitCompareArrows className="w-3.5 h-3.5 text-mastek-highlight" />
+              Cross-Table Parity (existence check)
             </label>
             <label className="flex items-center gap-2 cursor-pointer">
               <input type="radio" checked={form.checkType === 'row_count_match'} onChange={() => setForm((f) => ({ ...f, checkType: 'row_count_match' }))}
                 className="text-mastek-primary focus:ring-mastek-accent" />
               <GitCompareArrows className="w-3.5 h-3.5 text-mastek-highlight" />
               Row count match (built-in)
+            </label>
+            <label className="flex items-center gap-2 cursor-pointer">
+              <input type="radio" checked={form.checkType === 'column_parity'}
+                onChange={() => setForm((f) => ({
+                  ...f, checkType: 'column_parity',
+                  validationType: PARITY_VALIDATION_TYPES.includes(f.validationType) ? f.validationType : PARITY_VALIDATION_TYPES[0],
+                }))}
+                className="text-mastek-primary focus:ring-mastek-accent" />
+              <GitCompareArrows className="w-3.5 h-3.5 text-mastek-highlight" />
+              Column Parity Check (built-in)
             </label>
           </div>
 
@@ -429,31 +996,144 @@ const [tab, setTab] = useState('ai'); // 'ai' | 'manual'
             </div>
           )}
 
-          {form.checkType === 'sql' && (
+          {form.checkType === 'column_parity' && (
+            <div className="space-y-3">
+              <p className="text-sm text-slate-500">
+                Computes the same metric (null count, distinct count, or min/max range - based on the
+                validation type above) on a source column and a destination column separately, then
+                passes only if they match - proving the data reached the destination intact.
+              </p>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div className="space-y-2">
+                  <p className="text-xs font-medium text-slate-500">Source tables (unioned together)</p>
+                  <TableCheckboxList
+                    tables={mapping.source_tables}
+                    selected={form.sourceTables}
+                    onToggle={(t) => toggleParityTable('source', t)}
+                  />
+                  <select
+                    value={form.sourceColumn}
+                    onChange={(e) => setForm((f) => ({ ...f, sourceColumn: e.target.value }))}
+                    disabled={form.sourceTables.length === 0}
+                    className="w-full px-2.5 py-1.5 text-sm font-mono border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-mastek-accent disabled:opacity-50"
+                  >
+                    <option value="">
+                      {form.sourceTables.length === 0
+                        ? 'Select table(s) first'
+                        : sourceParityColumns.length === 0
+                        ? 'No column common to all selected tables'
+                        : 'Select column'}
+                    </option>
+                    {sourceParityColumns.map((c) => (
+                      <option key={c.name} value={c.name}>{c.name} ({c.data_type})</option>
+                    ))}
+                  </select>
+                </div>
+                <div className="space-y-2">
+                  <p className="text-xs font-medium text-slate-500">Destination tables (unioned together)</p>
+                  <TableCheckboxList
+                    tables={mapping.destination_tables}
+                    selected={form.destinationTables}
+                    onToggle={(t) => toggleParityTable('destination', t)}
+                  />
+                  <select
+                    value={form.destinationColumn}
+                    onChange={(e) => setForm((f) => ({ ...f, destinationColumn: e.target.value }))}
+                    disabled={form.destinationTables.length === 0}
+                    className="w-full px-2.5 py-1.5 text-sm font-mono border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-mastek-accent disabled:opacity-50"
+                  >
+                    <option value="">
+                      {form.destinationTables.length === 0
+                        ? 'Select table(s) first'
+                        : destinationParityColumns.length === 0
+                        ? 'No column common to all selected tables'
+                        : 'Select column'}
+                    </option>
+                    {destinationParityColumns.map((c) => (
+                      <option key={c.name} value={c.name}>{c.name} ({c.data_type})</option>
+                    ))}
+                  </select>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {isCrossTableParity && (
+            <div className="space-y-3">
+              <p className="text-sm text-slate-500">
+                Fetches every {form.keyColumn ? <code className="font-mono text-xs">{form.keyColumn}</code> : 'key column'} value
+                from the source table(s) and the destination table(s) separately, then verifies every source
+                row's key actually exists in the destination (and vice versa) - a real existence check, not
+                a free-form SQL script.
+              </p>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div className="space-y-1">
+                  <p className="text-xs font-medium text-slate-500">Source tables</p>
+                  <TableCheckboxList
+                    tables={mapping.source_tables}
+                    selected={form.sourceTargetTables}
+                    onToggle={(t) => toggleCrossParityTable('source', t)}
+                  />
+                </div>
+                <div className="space-y-1">
+                  <p className="text-xs font-medium text-slate-500">Destination tables</p>
+                  <TableCheckboxList
+                    tables={mapping.destination_tables}
+                    selected={form.destinationTargetTables}
+                    onToggle={(t) => toggleCrossParityTable('destination', t)}
+                  />
+                </div>
+              </div>
+              <select
+                value={form.keyColumn}
+                onChange={(e) => setForm((f) => ({ ...f, keyColumn: e.target.value }))}
+                disabled={form.sourceTargetTables.length === 0 || form.destinationTargetTables.length === 0}
+                className="w-full px-2.5 py-1.5 text-sm font-mono border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-mastek-accent disabled:opacity-50"
+              >
+                <option value="">
+                  {form.sourceTargetTables.length === 0 || form.destinationTargetTables.length === 0
+                    ? 'Select table(s) on both sides first'
+                    : crossParityKeyColumns.length === 0
+                    ? 'No column common to all selected tables'
+                    : 'Select key column'}
+                </option>
+                {crossParityKeyColumns.map((c) => (
+                  <option key={c.name} value={c.name}>{c.name} ({c.data_type})</option>
+                ))}
+              </select>
+            </div>
+          )}
+
+          {form.checkType === 'sql' && form.checkScope === 'single_side' && (
             <>
               <div className="flex flex-wrap items-center gap-x-4 gap-y-2 text-sm">
                 <span className="text-xs font-medium text-slate-500">Runs against:</span>
                 <label className="flex items-center gap-2 cursor-pointer">
                   <input type="radio" checked={form.target === 'source'}
-                    onChange={() => setForm((f) => ({ ...f, target: 'source', targetTable: '' }))}
+                    onChange={() => setForm((f) => ({ ...f, target: 'source', targetTables: [] }))}
                     className="text-mastek-primary focus:ring-mastek-accent" />
                   Source
                 </label>
                 <label className="flex items-center gap-2 cursor-pointer">
                   <input type="radio" checked={form.target === 'destination'}
-                    onChange={() => setForm((f) => ({ ...f, target: 'destination', targetTable: '' }))}
+                    onChange={() => setForm((f) => ({ ...f, target: 'destination', targetTables: [] }))}
                     className="text-mastek-primary focus:ring-mastek-accent" />
                   Destination
                 </label>
+              </div>
 
-                <select
-                  value={form.targetTable}
-                  onChange={(e) => setForm((f) => ({ ...f, targetTable: e.target.value }))}
-                  className="ml-auto px-2.5 py-1 text-xs font-mono border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-mastek-accent"
-                >
-                  <option value="">Label as (optional)</option>
-                  {targetTableOptions.map((t) => <option key={t} value={t}>{t}</option>)}
-                </select>
+              <div>
+                <p className="text-xs font-medium text-slate-500 mb-1">Target tables</p>
+                <TableCheckboxList
+                  tables={targetTableOptions}
+                  selected={form.targetTables}
+                  onToggle={toggleTargetTable}
+                />
+                {form.targetTables.length > 1 && (
+                  <p className="text-xs text-mastek-primary mt-1">
+                    {form.targetTables.length} tables selected - will be combined (UNION ALL) for this check.
+                  </p>
+                )}
               </div>
 
               <div className="flex items-center gap-2">
@@ -536,7 +1216,7 @@ const [tab, setTab] = useState('ai'); // 'ai' | 'manual'
           </div>
         )}
 
-        <div className="overflow-y-auto flex-1 divide-y divide-slate-100">
+        <div className="overflow-auto flex-1">
           {isLoading && (
             <div className="flex items-center gap-2 text-sm text-slate-500 p-5">
               <Loader2 className="w-4 h-4 animate-spin" /> Loading...
@@ -544,45 +1224,101 @@ const [tab, setTab] = useState('ai'); // 'ai' | 'manual'
           )}
           {!isLoading && testCases.length === 0 && (
             <p className="p-5 text-sm text-slate-400 italic">
-              No test cases yet - add one using the Manual Notebook IDE above.
+              No test cases yet - add one using the Manual Notebook IDE above, or click "AI Suggest Rules" on the AI tab.
             </p>
           )}
-          {testCases.map((tc, i) => (
-            <div key={tc.id} className="flex items-center gap-3 px-5 py-3">
-              <span className="text-xs font-mono text-slate-400 w-14 shrink-0">TC-{String(i + 1).padStart(3, '0')}</span>
-              <div className="min-w-0 flex-1">
-                <p className="text-sm font-medium text-slate-700 truncate">{tc.name}</p>
-                <p className="text-xs text-slate-400">
-                  {tc.validation_type} &middot;{' '}
-                  {tc.check_type === 'row_count_match'
-                    ? `row count: ${tc.row_count_source_tables.length} src / ${tc.row_count_destination_tables.length} dest table(s)`
-                    : `${tc.script_type} on ${tc.target}${tc.target_table ? ` (${tc.target_table})` : ''}`}
-                </p>
-              </div>
-              <button
-                onClick={() => handleRunOne(tc.id)}
-                disabled={runningId === tc.id}
-                className="p-1.5 text-slate-400 hover:text-mastek-success hover:bg-mastek-success/10 rounded-lg shrink-0"
-                title="Run just this test case"
-              >
-                {runningId === tc.id ? <Loader2 className="w-4 h-4 animate-spin" /> : <Play className="w-4 h-4" />}
-              </button>
-              <button
-                onClick={() => startEdit(tc)}
-                className="p-1.5 text-slate-400 hover:text-mastek-primary hover:bg-mastek-primary/10 rounded-lg shrink-0"
-                title="Edit"
-              >
-                <Pencil className="w-4 h-4" />
-              </button>
-              <button
-                onClick={() => handleDelete(tc.id)}
-                className="p-1.5 text-slate-400 hover:text-red-600 hover:bg-red-50 rounded-lg shrink-0"
-                title="Delete"
-              >
-                <Trash2 className="w-4 h-4" />
-              </button>
-            </div>
-          ))}
+          {!isLoading && testCases.length > 0 && (
+            <table className="w-full text-sm">
+              <thead className="text-left text-xs font-medium text-slate-400 border-b border-slate-100 sticky top-0 bg-white">
+                <tr>
+                  <th className="px-5 py-2 font-medium">Name</th>
+                  <th className="px-3 py-2 font-medium">Table</th>
+                  <th className="px-3 py-2 font-medium">Type</th>
+                  <th className="px-3 py-2 font-medium">Origin</th>
+                  <th className="px-3 py-2 font-medium">Severity</th>
+                  <th className="px-3 py-2 font-medium">Active</th>
+                  <th className="px-3 py-2 font-medium text-right">Actions</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-slate-100">
+                {testCases.map((tc) => (
+                  <tr key={tc.id} className={tc.active === false ? 'opacity-50' : ''}>
+                    <td className="px-5 py-3 min-w-0 max-w-xs">
+                      <p className="font-medium text-slate-700 truncate">{tc.name}</p>
+                      {tc.description && (
+                        <p className="text-xs text-slate-400 truncate">{tc.description}</p>
+                      )}
+                    </td>
+                    <td className="px-3 py-3 font-mono text-xs text-slate-500 whitespace-nowrap">
+                      {tc.check_type === 'row_count_match'
+                        ? `${tc.row_count_source_tables.length} src / ${tc.row_count_destination_tables.length} dest`
+                        : tc.check_type === 'column_parity'
+                        ? `${(tc.source_tables || []).join(', ')}.${tc.source_column} ↔ ${(tc.destination_tables || []).join(', ')}.${tc.destination_column}`
+                        : tc.check_scope === 'cross_table_parity'
+                        ? `${(tc.source_target_tables || []).join(', ')} ↔ ${(tc.destination_target_tables || []).join(', ')} (key: ${tc.key_column})`
+                        : ((tc.target_tables && tc.target_tables.join(', ')) || tc.target_table || tc.target || '—')}
+                    </td>
+                    <td className="px-3 py-3 text-xs text-slate-500 whitespace-nowrap">{tc.validation_type}</td>
+                    <td className="px-3 py-3 whitespace-nowrap">
+                      <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium ${
+                        tc.origin === 'ai' ? 'bg-mastek-primary/10 text-mastek-primary' : 'bg-slate-100 text-slate-600'
+                      }`}>
+                        {tc.origin === 'ai' ? <Sparkles className="w-3 h-3" /> : <User className="w-3 h-3" />}
+                        {tc.origin === 'ai' ? 'AI' : 'Manual'}
+                      </span>
+                    </td>
+                    <td className="px-3 py-3 whitespace-nowrap">
+                      <span className={`inline-block px-2 py-0.5 rounded-full text-xs font-medium capitalize ${SEVERITY_STYLES[tc.severity] || SEVERITY_STYLES.error}`}>
+                        {tc.severity || 'error'}
+                      </span>
+                    </td>
+                    <td className="px-3 py-3">
+                      <button
+                        onClick={() => handleToggleActive(tc)}
+                        disabled={togglingId === tc.id}
+                        role="switch"
+                        aria-checked={tc.active !== false}
+                        title={tc.active !== false ? 'Active - click to disable' : 'Disabled - click to enable'}
+                        className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors disabled:opacity-50 ${
+                          tc.active !== false ? 'bg-mastek-primary' : 'bg-slate-300'
+                        }`}
+                      >
+                        <span className={`inline-block h-3.5 w-3.5 transform rounded-full bg-white transition-transform ${
+                          tc.active !== false ? 'translate-x-4' : 'translate-x-1'
+                        }`} />
+                      </button>
+                    </td>
+                    <td className="px-3 py-3">
+                      <div className="flex items-center justify-end gap-1">
+                        <button
+                          onClick={() => handleRunOne(tc.id)}
+                          disabled={runningId === tc.id}
+                          className="p-1.5 text-slate-400 hover:text-mastek-success hover:bg-mastek-success/10 rounded-lg shrink-0"
+                          title="Run just this test case"
+                        >
+                          {runningId === tc.id ? <Loader2 className="w-4 h-4 animate-spin" /> : <Play className="w-4 h-4" />}
+                        </button>
+                        <button
+                          onClick={() => startEdit(tc)}
+                          className="p-1.5 text-slate-400 hover:text-mastek-primary hover:bg-mastek-primary/10 rounded-lg shrink-0"
+                          title="Edit"
+                        >
+                          <Pencil className="w-4 h-4" />
+                        </button>
+                        <button
+                          onClick={() => handleDelete(tc.id)}
+                          className="p-1.5 text-slate-400 hover:text-red-600 hover:bg-red-50 rounded-lg shrink-0"
+                          title="Delete"
+                        >
+                          <Trash2 className="w-4 h-4" />
+                        </button>
+                      </div>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
         </div>
       </div>
     </main>

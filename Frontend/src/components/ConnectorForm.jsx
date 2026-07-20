@@ -83,10 +83,10 @@ export default function ConnectorForm({ onCreated }) {
       {type === 'fabric' && (
         <div className="space-y-3">
           <Field label="Connector Name" value={fabricForm.name} onChange={update('name')} placeholder="My Fabric Workspace" />
-          <Field label="Tenant ID" value={fabricForm.tenant_id} onChange={update('tenant_id')} />
-          <Field label="Client ID" value={fabricForm.client_id} onChange={update('client_id')} />
+          <Field label="Tenant ID" value={fabricForm.tenant_id} onChange={update('tenant_id')} type="password" />
+          <Field label="Client ID" value={fabricForm.client_id} onChange={update('client_id')} type="password" />
           <Field label="Client Secret" value={fabricForm.client_secret} onChange={update('client_secret')} type="password" />
-          <Field label="Workspace ID" value={fabricForm.workspace_id} onChange={update('workspace_id')} />
+          <Field label="Workspace ID" value={fabricForm.workspace_id} onChange={update('workspace_id')} type="password" />
         </div>
       )}
 

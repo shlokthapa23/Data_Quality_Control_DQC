@@ -50,5 +50,8 @@ class LocalConnector(BaseConnector):
     def run_query(self, container_id, sql):
         return local_db.run_query(self.connector_id, sql)
 
+    def run_query_all(self, container_id, sql):
+        return local_db.run_query_all(self.connector_id, sql)
+
     def sample_rows(self, container_id, table, limit=20):
         return local_db.sample_rows(self.connector_id, table, limit)

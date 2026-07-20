@@ -7,7 +7,8 @@ async function request(path, options = {}) {
   });
   const body = await res.json().catch(() => ({}));
   if (!res.ok) {
-    throw new Error(body.error || `Request failed: ${res.status}`);
+    const message = body.details ? `${body.error}: ${body.details}` : (body.error || `Request failed: ${res.status}`);
+    throw new Error(message);
   }
   return body;
 }
@@ -44,6 +45,10 @@ export function fetchConnectorItems(id) {
   return request(`/api/connectors/${id}/items`);
 }
 
+export function fetchAllLakehouses(connectorId) {
+  return request(`/api/connectors/${connectorId}/lakehouses`);
+}
+
 export function fetchConnectorContainers(connectorId) {
   return request(`/api/connectors/${connectorId}/containers`);
 }
@@ -74,7 +79,8 @@ export async function uploadLocalFile(connectorId, file, displayName) {
   });
   const body = await res.json().catch(() => ({}));
   if (!res.ok) {
-    throw new Error(body.error || `Request failed: ${res.status}`);
+    const message = body.details ? `${body.error}: ${body.details}` : (body.error || `Request failed: ${res.status}`);
+    throw new Error(message);
   }
   return body;
 }
@@ -149,12 +155,11 @@ export function deleteS2DTestCase(id) {
 export function runSingleS2DTestCase(testCaseId) {
   return request(`/api/s2d/test-cases/${testCaseId}/run`, { method: 'POST' });
 }
+
 export function runS2DPipeline(mappingId) {
   return request(`/api/s2d/mappings/${mappingId}/run`, { method: 'POST' });
 }
-export function fetchAllLakehouses(connectorId) {
-  return request(`/api/connectors/${connectorId}/lakehouses`);
-}
+
 export function fetchS2DRun(runId) {
   return request(`/api/s2d/runs/${runId}`);
 }
@@ -162,4 +167,47 @@ export function fetchS2DRun(runId) {
 export function fetchS2DRuns(mappingId) {
   const qs = mappingId ? `?mapping_id=${mappingId}` : '';
   return request(`/api/s2d/runs${qs}`);
+}
+
+export function generateAITestCase({ tables, sourceTables, destinationTables, checkScope, description }) {
+  return request('/api/s2d/ai/generate-test-case', {
+    method: 'POST',
+    body: JSON.stringify({
+      check_scope: checkScope, tables,
+      source_tables: sourceTables, destination_tables: destinationTables,
+      description,
+    }),
+  });
+}
+
+export function generateKeyColumnSuggestion({ sourceTables, destinationTables, description }) {
+  return request('/api/s2d/ai/generate-test-case', {
+    method: 'POST',
+    body: JSON.stringify({
+      check_scope: 'cross_table_parity',
+      source_tables: sourceTables, destination_tables: destinationTables,
+      description,
+    }),
+  });
+}
+
+export function generateAISuggestedRules(mappingId, { target, tableName }) {
+  return request(`/api/s2d/mappings/${mappingId}/ai/suggest-rules`, {
+    method: 'POST',
+    body: JSON.stringify({ target, table_name: tableName }),
+  });
+}
+
+export function generateAISuggestedParityRules(mappingId, { sourceTables, destinationTables }) {
+  return request(`/api/s2d/mappings/${mappingId}/ai/suggest-parity-rules`, {
+    method: 'POST',
+    body: JSON.stringify({ source_tables: sourceTables, destination_tables: destinationTables }),
+  });
+}
+
+export function setS2DTestCaseActive(id, active) {
+  return request(`/api/s2d/test-cases/${id}/active`, {
+    method: 'PATCH',
+    body: JSON.stringify({ active }),
+  });
 }

@@ -79,6 +79,18 @@ class BaseConnector(ABC):
         raise NotImplementedError
 
     @abstractmethod
+    def run_query_all(self, container_id, sql):
+        """
+        Like run_query(), but returns EVERY matching row (list of dicts)
+        instead of just the first. Used by cross_table_parity checks to
+        fetch a full key-column result set from each side for an
+        application-level (Python set) existence diff - run_query()'s
+        one-row contract and sample_rows()'s random-sample contract don't
+        fit that need.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
     def sample_rows(self, container_id, table, limit=20):
         """
         Return up to `limit` random rows from `table` (inside the given
