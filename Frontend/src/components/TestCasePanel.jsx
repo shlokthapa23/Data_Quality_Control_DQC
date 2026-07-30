@@ -1,13 +1,14 @@
 import { useEffect, useState } from 'react';
 import {
   Sparkles, Code2, Plus, Trash2, Loader2, AlertCircle, Rocket, GitCompareArrows,
-  Pencil, Play, X, FileCode2, Wand2, User,
+  Pencil, Play, X, FileCode2, Wand2, User, ListChecks, CheckCircle2,
 } from 'lucide-react';
 import {
   fetchS2DTestCases, createS2DTestCase, updateS2DTestCase, deleteS2DTestCase,
   runS2DPipeline, runSingleS2DTestCase, fetchContainerTables, generateAITestCase,
   generateAISuggestedRules, generateAISuggestedParityRules, generateKeyColumnSuggestion,
-  setS2DTestCaseActive,
+  generateAISuggestedCrossTableParityRules, setS2DTestCaseActive,
+  createTestSuite,
 } from '../api';
 
 const SEVERITY_STYLES = {
@@ -227,6 +228,15 @@ const [tab, setTab] = useState('ai'); // 'ai' | 'manual'
   const [suggestError, setSuggestError] = useState(null);
   const [suggestSummary, setSuggestSummary] = useState(null); // { createdCount, skipped }
   const [togglingId, setTogglingId] = useState(null);
+
+  // Suite creation selection mode
+  const [isSelectingSuite, setIsSelectingSuite] = useState(false);
+  const [selectedTestCaseIds, setSelectedTestCaseIds] = useState(new Set());
+  const [suiteName, setSuiteName] = useState('');
+  const [suiteDescription, setSuiteDescription] = useState('');
+  const [isCreatingSuite, setIsCreatingSuite] = useState(false);
+  const [suiteError, setSuiteError] = useState(null);
+  const [suiteSuccess, setSuiteSuccess] = useState(null);
   // Column Parity Check tables+columns - fetched once per mapping, shared by
   // the Manual tab's column pickers AND the AI tab's "Source <-> Destination" mode.
   const [sourceSchema, setSourceSchema] = useState([]);
@@ -245,6 +255,11 @@ const [tab, setTab] = useState('ai'); // 'ai' | 'manual'
   const [aiCrossDescription, setAiCrossDescription] = useState('');
   const [isSuggestingKeyColumn, setIsSuggestingKeyColumn] = useState(false);
   const [suggestKeyColumnError, setSuggestKeyColumnError] = useState(null);
+  // "AI Suggested Parity Rules" for cross-table parity - sample-based, no
+  // description needed, auto-saves straight away (mirrors aiMode 'parity').
+  const [isSuggestingCrossParity, setIsSuggestingCrossParity] = useState(false);
+  const [suggestCrossParityError, setSuggestCrossParityError] = useState(null);
+  const [suggestCrossParitySummary, setSuggestCrossParitySummary] = useState(null); // { createdCount, skipped }
 
 
   const loadTestCases = () => {
@@ -266,6 +281,9 @@ const [tab, setTab] = useState('ai'); // 'ai' | 'manual'
     setSuggestParityError(null); setSuggestParitySummary(null);
     setAiCrossSourceTables([]); setAiCrossDestinationTables([]); setAiCrossDescription('');
     setSuggestKeyColumnError(null);
+    setSuggestCrossParityError(null); setSuggestCrossParitySummary(null);
+    setIsSelectingSuite(false); setSelectedTestCaseIds(new Set());
+    setSuiteName(''); setSuiteDescription(''); setSuiteError(null); setSuiteSuccess(null);
   }, [mapping]);
 
   useEffect(() => {
@@ -423,6 +441,25 @@ const [tab, setTab] = useState('ai'); // 'ai' | 'manual'
     }
   };
 
+  const handleSuggestCrossParityRules = async () => {
+    if (aiCrossSourceTables.length === 0 || aiCrossDestinationTables.length === 0) return;
+    setIsSuggestingCrossParity(true);
+    setSuggestCrossParityError(null);
+    setSuggestCrossParitySummary(null);
+    try {
+      const { created, skipped } = await generateAISuggestedCrossTableParityRules(mapping.id, {
+        sourceTables: aiCrossSourceTables,
+        destinationTables: aiCrossDestinationTables,
+      });
+      setSuggestCrossParitySummary({ createdCount: created.length, skipped });
+      loadTestCases();
+    } catch (err) {
+      setSuggestCrossParityError(err.message);
+    } finally {
+      setIsSuggestingCrossParity(false);
+    }
+  };
+
   const handleToggleActive = async (tc) => {
     setTogglingId(tc.id);
     const nextActive = !tc.active;
@@ -549,6 +586,54 @@ const [tab, setTab] = useState('ai'); // 'ai' | 'manual'
       setRunError(err.message);
     } finally {
       setIsRunningAll(false);
+    }
+  };
+
+  const enterSuiteSelection = () => {
+    setIsSelectingSuite(true);
+    setSelectedTestCaseIds(new Set());
+    setSuiteName(''); setSuiteDescription('');
+    setSuiteError(null); setSuiteSuccess(null);
+  };
+
+  const cancelSuiteSelection = () => {
+    setIsSelectingSuite(false);
+    setSelectedTestCaseIds(new Set());
+    setSuiteError(null);
+  };
+
+  const toggleSuiteSelect = (id) => {
+    setSelectedTestCaseIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id); else next.add(id);
+      return next;
+    });
+  };
+
+  const handleCreateSuite = async () => {
+    if (!mapping) return;
+    const name = suiteName.trim();
+    if (!name) { setSuiteError('Suite name is required'); return; }
+    if (selectedTestCaseIds.size === 0) { setSuiteError('Pick at least one test case'); return; }
+
+    setIsCreatingSuite(true);
+    setSuiteError(null);
+    try {
+      // Preserve on-screen order (order in testCases) rather than click-order
+      const orderedIds = testCases.filter((tc) => selectedTestCaseIds.has(tc.id)).map((tc) => tc.id);
+      await createTestSuite(mapping.id, {
+        name,
+        description: suiteDescription.trim() || null,
+        test_case_ids: orderedIds,
+      });
+      setSuiteSuccess(`Created suite "${name}" with ${orderedIds.length} test case${orderedIds.length === 1 ? '' : 's'}.`);
+      setIsSelectingSuite(false);
+      setSelectedTestCaseIds(new Set());
+      setSuiteName(''); setSuiteDescription('');
+    } catch (err) {
+      setSuiteError(err.message);
+    } finally {
+      setIsCreatingSuite(false);
     }
   };
 
@@ -902,6 +987,44 @@ const [tab, setTab] = useState('ai'); // 'ai' | 'manual'
                 Hands off to the Manual Notebook IDE tab with the tables and suggested key column
                 pre-filled - review and save there, same as the Single Table generator.
               </p>
+
+              <div className="border-t border-slate-200 pt-4 space-y-3">
+                <p className="text-xs font-medium text-slate-500">AI Suggested Parity Rules</p>
+                <div className="flex items-center gap-2 text-sm text-slate-500">
+                  <Sparkles className="w-4 h-4 text-mastek-highlight shrink-0" />
+                  No description needed - the AI samples random rows from both sides above and
+                  proposes candidate key columns on its own, saving each straight away as a
+                  cross-table parity check (same auto-save flow as Source ↔ Destination).
+                </div>
+
+                {suggestCrossParityError && (
+                  <div className="flex items-center gap-2 text-sm text-red-600">
+                    <AlertCircle className="w-4 h-4 shrink-0" /> {suggestCrossParityError}
+                  </div>
+                )}
+
+                <button
+                  onClick={handleSuggestCrossParityRules}
+                  disabled={isSuggestingCrossParity || aiCrossSourceTables.length === 0 || aiCrossDestinationTables.length === 0}
+                  title="Samples random rows from both sides and lets the AI propose join/key columns - no description needed"
+                  className="flex items-center gap-2 px-4 py-2 text-sm font-medium text-white bg-mastek-primary rounded-lg hover:brightness-110 disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  {isSuggestingCrossParity ? <Loader2 className="w-4 h-4 animate-spin" /> : <Sparkles className="w-4 h-4" />}
+                  AI Suggest Parity Rules
+                </button>
+
+                {suggestCrossParitySummary && (
+                  <div className="text-sm text-mastek-success">
+                    {suggestCrossParitySummary.createdCount} parity rule{suggestCrossParitySummary.createdCount === 1 ? '' : 's'} created
+                    from {aiCrossSourceTables.join(', ')} ↔ {aiCrossDestinationTables.join(', ')}.
+                    {suggestCrossParitySummary.skipped.length > 0 && (
+                      <span className="text-amber-600">
+                        {' '}{suggestCrossParitySummary.skipped.length} skipped (invalid key column suggestion).
+                      </span>
+                    )}
+                  </div>
+                )}
+              </div>
             </>
           )}
         </div>
@@ -1198,17 +1321,56 @@ const [tab, setTab] = useState('ai'); // 'ai' | 'manual'
 
       <div className="bg-white border border-slate-200 rounded-xl flex-1 overflow-hidden flex flex-col shadow-sm">
         <div className="px-5 py-3 border-b border-slate-200 flex flex-col sm:flex-row sm:items-center justify-between gap-2">
-          <h3 className="font-semibold text-sm text-slate-700">Test Cases ({testCases.length})</h3>
-          <button
-            onClick={handleRunAll}
-            disabled={isRunningAll || testCases.length === 0}
-            className="flex items-center justify-center gap-2 px-4 py-2 text-sm font-medium text-white bg-mastek-success rounded-lg hover:brightness-110 disabled:opacity-50 disabled:cursor-not-allowed"
-          >
-            {isRunningAll ? <Loader2 className="w-4 h-4 animate-spin" /> : <Rocket className="w-4 h-4" />}
-            <span className="hidden sm:inline">Run Integration Test Pipeline</span>
-            <span className="sm:hidden">Run All</span>
-          </button>
+          <h3 className="font-semibold text-sm text-slate-700">
+            Test Cases ({testCases.length})
+            {isSelectingSuite && (
+              <span className="ml-2 text-mastek-primary font-normal">
+                — {selectedTestCaseIds.size} selected
+              </span>
+            )}
+          </h3>
+          <div className="flex items-center gap-2">
+            {!isSelectingSuite && (
+              <>
+                <button
+                  onClick={enterSuiteSelection}
+                  disabled={testCases.length === 0}
+                  className="flex items-center justify-center gap-2 px-3 py-2 text-sm font-medium text-mastek-primary border border-mastek-primary/40 rounded-lg hover:bg-mastek-primary/10 disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  <ListChecks className="w-4 h-4" />
+                  Create Suite
+                </button>
+                <button
+                  onClick={handleRunAll}
+                  disabled={isRunningAll || testCases.length === 0}
+                  className="flex items-center justify-center gap-2 px-4 py-2 text-sm font-medium text-white bg-mastek-success rounded-lg hover:brightness-110 disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  {isRunningAll ? <Loader2 className="w-4 h-4 animate-spin" /> : <Rocket className="w-4 h-4" />}
+                  <span className="hidden sm:inline">Run Integration Test Pipeline</span>
+                  <span className="sm:hidden">Run All</span>
+                </button>
+              </>
+            )}
+            {isSelectingSuite && (
+              <button
+                onClick={cancelSuiteSelection}
+                className="flex items-center justify-center gap-2 px-3 py-2 text-sm font-medium text-slate-600 border border-slate-300 rounded-lg hover:bg-slate-50"
+              >
+                <X className="w-4 h-4" />
+                Cancel
+              </button>
+            )}
+          </div>
         </div>
+
+        {suiteSuccess && !isSelectingSuite && (
+          <div className="flex items-center gap-2 text-sm text-mastek-success px-5 py-2 bg-mastek-success/5 border-b border-mastek-success/20">
+            <CheckCircle2 className="w-4 h-4" /> {suiteSuccess}
+            <button onClick={() => setSuiteSuccess(null)} className="ml-auto text-slate-400 hover:text-slate-600">
+              <X className="w-3.5 h-3.5" />
+            </button>
+          </div>
+        )}
 
         {runError && (
           <div className="flex items-center gap-2 text-sm text-red-600 px-5 py-2">
@@ -1231,6 +1393,19 @@ const [tab, setTab] = useState('ai'); // 'ai' | 'manual'
             <table className="w-full text-sm">
               <thead className="text-left text-xs font-medium text-slate-400 border-b border-slate-100 sticky top-0 bg-white">
                 <tr>
+                  {isSelectingSuite && (
+                    <th className="px-3 py-2 w-8">
+                      <input
+                        type="checkbox"
+                        aria-label="Select all"
+                        checked={testCases.length > 0 && selectedTestCaseIds.size === testCases.length}
+                        onChange={(e) => setSelectedTestCaseIds(
+                          e.target.checked ? new Set(testCases.map((tc) => tc.id)) : new Set()
+                        )}
+                        className="accent-mastek-primary"
+                      />
+                    </th>
+                  )}
                   <th className="px-5 py-2 font-medium">Name</th>
                   <th className="px-3 py-2 font-medium">Table</th>
                   <th className="px-3 py-2 font-medium">Type</th>
@@ -1243,6 +1418,17 @@ const [tab, setTab] = useState('ai'); // 'ai' | 'manual'
               <tbody className="divide-y divide-slate-100">
                 {testCases.map((tc) => (
                   <tr key={tc.id} className={tc.active === false ? 'opacity-50' : ''}>
+                    {isSelectingSuite && (
+                      <td className="px-3 py-3 w-8">
+                        <input
+                          type="checkbox"
+                          aria-label={`Select ${tc.name}`}
+                          checked={selectedTestCaseIds.has(tc.id)}
+                          onChange={() => toggleSuiteSelect(tc.id)}
+                          className="accent-mastek-primary"
+                        />
+                      </td>
+                    )}
                     <td className="px-5 py-3 min-w-0 max-w-xs">
                       <p className="font-medium text-slate-700 truncate">{tc.name}</p>
                       {tc.description && (
@@ -1320,6 +1506,44 @@ const [tab, setTab] = useState('ai'); // 'ai' | 'manual'
             </table>
           )}
         </div>
+
+        {isSelectingSuite && (
+          <div className="border-t border-slate-200 bg-slate-50 px-5 py-3 flex flex-col sm:flex-row sm:items-end gap-3">
+            <div className="flex-1 min-w-0">
+              <label className="block text-xs font-medium text-slate-500 mb-1">Suite name</label>
+              <input
+                type="text"
+                value={suiteName}
+                onChange={(e) => setSuiteName(e.target.value)}
+                placeholder="e.g. Nightly critical checks"
+                className="w-full px-3 py-1.5 text-sm border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-mastek-primary/40"
+              />
+            </div>
+            <div className="flex-1 min-w-0">
+              <label className="block text-xs font-medium text-slate-500 mb-1">Description (optional)</label>
+              <input
+                type="text"
+                value={suiteDescription}
+                onChange={(e) => setSuiteDescription(e.target.value)}
+                placeholder="What this suite is for"
+                className="w-full px-3 py-1.5 text-sm border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-mastek-primary/40"
+              />
+            </div>
+            <button
+              onClick={handleCreateSuite}
+              disabled={isCreatingSuite || selectedTestCaseIds.size === 0 || !suiteName.trim()}
+              className="flex items-center justify-center gap-2 px-4 py-2 text-sm font-medium text-white bg-mastek-primary rounded-lg hover:bg-mastek-primary-dark disabled:opacity-50 disabled:cursor-not-allowed shrink-0"
+            >
+              {isCreatingSuite ? <Loader2 className="w-4 h-4 animate-spin" /> : <ListChecks className="w-4 h-4" />}
+              Save Suite
+            </button>
+          </div>
+        )}
+        {suiteError && (
+          <div className="flex items-center gap-2 text-sm text-red-600 px-5 py-2 bg-red-50 border-t border-red-100">
+            <AlertCircle className="w-4 h-4" /> {suiteError}
+          </div>
+        )}
       </div>
     </main>
   );

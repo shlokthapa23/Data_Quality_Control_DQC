@@ -169,6 +169,107 @@ export function fetchS2DRuns(mappingId) {
   return request(`/api/s2d/runs${qs}`);
 }
 
+// --- S2D: Test suites ---
+
+export function fetchTestSuites() {
+  return request('/api/s2d/suites');
+}
+
+export function fetchTestSuitesForMapping(mappingId) {
+  return request(`/api/s2d/mappings/${mappingId}/suites`);
+}
+
+export function fetchTestSuite(suiteId) {
+  return request(`/api/s2d/suites/${suiteId}`);
+}
+
+export function createTestSuite(mappingId, payload) {
+  return request(`/api/s2d/mappings/${mappingId}/suites`, {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  });
+}
+
+export function updateTestSuite(suiteId, payload) {
+  return request(`/api/s2d/suites/${suiteId}`, {
+    method: 'PATCH',
+    body: JSON.stringify(payload),
+  });
+}
+
+export function deleteTestSuite(suiteId) {
+  return request(`/api/s2d/suites/${suiteId}`, { method: 'DELETE' });
+}
+
+export function runTestSuite(suiteId) {
+  return request(`/api/s2d/suites/${suiteId}/run`, { method: 'POST' });
+}
+
+// --- Schedules ---
+
+export function fetchAllSchedules() {
+  return request('/api/schedules');
+}
+
+export function previewSchedule(payload) {
+  return request('/api/schedules/preview', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  });
+}
+
+export function fetchSuiteSchedules(suiteId) {
+  return request(`/api/s2d/suites/${suiteId}/schedules`);
+}
+
+export function createSuiteSchedule(suiteId, payload) {
+  return request(`/api/s2d/suites/${suiteId}/schedules`, {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  });
+}
+
+export function updateSuiteSchedule(scheduleId, payload) {
+  return request(`/api/s2d/schedules/${scheduleId}`, {
+    method: 'PATCH',
+    body: JSON.stringify(payload),
+  });
+}
+
+export function deleteSuiteSchedule(scheduleId) {
+  return request(`/api/s2d/schedules/${scheduleId}`, { method: 'DELETE' });
+}
+
+export function fetchSuiteScheduleEvents(scheduleId, limit = 20) {
+  return request(`/api/s2d/schedules/${scheduleId}/events?limit=${limit}`);
+}
+
+export function fetchHarvestSchedules(connectorId) {
+  return request(`/api/connectors/${connectorId}/schedules`);
+}
+
+export function createHarvestSchedule(connectorId, payload) {
+  return request(`/api/connectors/${connectorId}/schedules`, {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  });
+}
+
+export function updateHarvestSchedule(scheduleId, payload) {
+  return request(`/api/harvest/schedules/${scheduleId}`, {
+    method: 'PATCH',
+    body: JSON.stringify(payload),
+  });
+}
+
+export function deleteHarvestSchedule(scheduleId) {
+  return request(`/api/harvest/schedules/${scheduleId}`, { method: 'DELETE' });
+}
+
+export function fetchHarvestScheduleEvents(scheduleId, limit = 20) {
+  return request(`/api/harvest/schedules/${scheduleId}/events?limit=${limit}`);
+}
+
 export function generateAITestCase({ tables, sourceTables, destinationTables, checkScope, description }) {
   return request('/api/s2d/ai/generate-test-case', {
     method: 'POST',
@@ -200,6 +301,13 @@ export function generateAISuggestedRules(mappingId, { target, tableName }) {
 
 export function generateAISuggestedParityRules(mappingId, { sourceTables, destinationTables }) {
   return request(`/api/s2d/mappings/${mappingId}/ai/suggest-parity-rules`, {
+    method: 'POST',
+    body: JSON.stringify({ source_tables: sourceTables, destination_tables: destinationTables }),
+  });
+}
+
+export function generateAISuggestedCrossTableParityRules(mappingId, { sourceTables, destinationTables }) {
+  return request(`/api/s2d/mappings/${mappingId}/ai/suggest-cross-table-parity-rules`, {
     method: 'POST',
     body: JSON.stringify({ source_tables: sourceTables, destination_tables: destinationTables }),
   });

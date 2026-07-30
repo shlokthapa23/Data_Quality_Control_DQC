@@ -142,6 +142,38 @@ Random sample of {min(len(destination_sample), 15)} destination rows:
 Output only the JSON array, nothing else."""
 
 
+def _build_key_column_sample_prompt(source_table, source_columns, source_sample,
+                                     destination_table, destination_columns, destination_sample, max_rules):
+    source_columns_desc = ", ".join(f"{c['name']} ({c['data_type']})" for c in source_columns)
+    destination_columns_desc = ", ".join(f"{c['name']} ({c['data_type']})" for c in destination_columns)
+    source_json = json.dumps(source_sample[:15], default=str)
+    destination_json = json.dumps(destination_sample[:15], default=str)
+    severities_list = ", ".join(f'"{s}"' for s in SEVERITIES)
+    return f"""You are a data pipeline validation expert. A source table's rows are copied/transformed into a destination table, and your job is to find column(s) that can each serve as a join/match key to verify every source row's identity actually arrived in the destination (a row-existence check, not a metric comparison).
+
+You will be shown both tables' real schemas and a random sample of their actual rows. Identify up to {max_rules} DIVERSE candidate key columns - a primary key, natural key, or unique identifier present on both sides with the same meaning (possibly a different name, e.g. source "OrderID" and destination "Order_ID" with overlapping sample values are the same field). Prefer columns that look unique/identifying in the sample data.
+
+Output ONLY a JSON array (no markdown fences, no explanation before or after), where each element is an object with exactly these fields:
+- "name": short human-readable check name
+- "description": one sentence explaining why this key column proves the transfer is complete
+- "key_column": the exact column name to use as the join/match key - it MUST exist, spelled exactly the same, in BOTH the source and destination column lists below
+- "severity": exactly one of [{severities_list}]
+
+Do not invent column names that aren't in the lists below. Only suggest a key if it genuinely represents the same real-world identifier on both sides.
+
+Source table: {source_table}
+Source columns: {source_columns_desc}
+Random sample of {min(len(source_sample), 15)} source rows:
+{source_json}
+
+Destination table: {destination_table}
+Destination columns: {destination_columns_desc}
+Random sample of {min(len(destination_sample), 15)} destination rows:
+{destination_json}
+
+Output only the JSON array, nothing else."""
+
+
 def _strip_fences(text, lang=""):
     """Strip markdown code fences if the model adds them despite instructions not to."""
     cleaned = text.strip()
@@ -161,7 +193,7 @@ def _clean_json(text):
 def _call_gemini(prompt, max_output_tokens=600):
     """Shared Gemini REST call. Returns the raw text of the first candidate."""
     api_key = os.environ.get("GEMINI_API_KEY")
-    model = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash-lite")
+    model ="gemini-3.1-flash-lite"
     if not api_key:
         raise RuntimeError("GEMINI_API_KEY is not set in .env")
 
@@ -173,8 +205,25 @@ def _call_gemini(prompt, max_output_tokens=600):
     }
 
     resp = requests.post(url, headers=headers, json=body, timeout=30)
+    if not resp.ok:
+        print(f"Gemini API Error: {resp.text}") 
+        
     resp.raise_for_status()
     data = resp.json()
+
+    try:
+        candidate = data["candidates"][0]
+        text = candidate["content"]["parts"][0]["text"]
+    except (KeyError, IndexError):
+        raise RuntimeError(f"Unexpected Gemini response shape: {data}")
+
+    if candidate.get("finishReason") == "MAX_TOKENS":
+        raise RuntimeError(
+            "Gemini response was truncated (hit maxOutputTokens) - "
+            "try a shorter/simpler description or increase the token limit"
+        )
+
+    return text
 
     try:
         candidate = data["candidates"][0]
@@ -276,6 +325,37 @@ def generate_parity_rules_from_samples(source_table, source_columns, source_samp
         destination_table, destination_columns, destination_sample, max_rules,
     )
     text = _call_gemini(prompt, max_output_tokens=2000)
+    cleaned = _clean_json(text)
+
+    try:
+        rules = json.loads(cleaned)
+    except json.JSONDecodeError as e:
+        raise RuntimeError(f"AI response wasn't valid JSON: {e}")
+
+    if not isinstance(rules, list):
+        raise RuntimeError("AI response wasn't a JSON array of rules")
+
+    return rules
+
+
+def generate_key_column_suggestions_from_samples(source_table, source_columns, source_sample,
+                                                   destination_table, destination_columns, destination_sample,
+                                                   max_rules=3):
+    """
+    Sample-based counterpart to generate_key_column_suggestion - reads BOTH
+    tables' real schemas and random samples (no user-typed description) and
+    asks the model to propose one or more candidate join/key columns for a
+    cross_table_parity check on its own. Returns rule dicts:
+    {"name", "description", "key_column", "severity"}. cross_table_parity
+    checks are engine-computed (no SQL) - the caller is responsible for
+    validating each returned key_column actually exists in every selected
+    table's schema on both sides before saving.
+    """
+    prompt = _build_key_column_sample_prompt(
+        source_table, source_columns, source_sample,
+        destination_table, destination_columns, destination_sample, max_rules,
+    )
+    text = _call_gemini(prompt, max_output_tokens=1000)
     cleaned = _clean_json(text)
 
     try:

@@ -1,5 +1,7 @@
 import requests
 import duckdb
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 from azure.identity import ClientSecretCredential
 
@@ -70,7 +72,8 @@ class FabricConnector(BaseConnector):
         next_params = None
 
         while next_url:
-            resp = requests.get(next_url, headers=headers, params=next_params, timeout=30)
+            # Added verify=False to bypass the corporate proxy SSL issue
+            resp = requests.get(next_url, headers=headers, params=next_params, timeout=30, verify=False)
             resp.raise_for_status()
             payload = resp.json()
 
@@ -91,6 +94,7 @@ class FabricConnector(BaseConnector):
 
         return all_items
 
+    
     def _resolve_lakehouse_connection(self, lakehouse_id):
         if lakehouse_id in self._lakehouse_conn_cache:
             return self._lakehouse_conn_cache[lakehouse_id]

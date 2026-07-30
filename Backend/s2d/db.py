@@ -181,6 +181,7 @@ def init_s2d_tables():
             CREATE TABLE IF NOT EXISTS s2d_test_runs (
                 id TEXT PRIMARY KEY,
                 mapping_id TEXT NOT NULL,
+                suite_id TEXT,                       -- NULL for legacy "Run all" runs
                 status TEXT NOT NULL,               -- 'passed' | 'failed'
                 total_checkpoints INTEGER NOT NULL,
                 pass_count INTEGER NOT NULL,
@@ -188,7 +189,8 @@ def init_s2d_tables():
                 compute_time_seconds REAL NOT NULL,
                 started_at TEXT NOT NULL,
                 finished_at TEXT NOT NULL,
-                FOREIGN KEY (mapping_id) REFERENCES s2d_mappings(id)
+                FOREIGN KEY (mapping_id) REFERENCES s2d_mappings(id),
+                FOREIGN KEY (suite_id) REFERENCES s2d_test_suites(id)
             )
         """)
         conn.execute("""
@@ -212,8 +214,93 @@ def init_s2d_tables():
             )
         """)
 
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS s2d_test_suites (
+                id TEXT PRIMARY KEY,
+                mapping_id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                description TEXT,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (mapping_id) REFERENCES s2d_mappings(id)
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS s2d_test_suite_cases (
+                suite_id TEXT NOT NULL,
+                test_case_id TEXT NOT NULL,
+                position INTEGER NOT NULL,
+                PRIMARY KEY (suite_id, test_case_id),
+                FOREIGN KEY (suite_id) REFERENCES s2d_test_suites(id),
+                FOREIGN KEY (test_case_id) REFERENCES s2d_test_cases(id)
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS s2d_suite_schedules (
+                id TEXT PRIMARY KEY,
+                suite_id TEXT NOT NULL,
+                trigger_type TEXT NOT NULL,
+                trigger_config TEXT NOT NULL,
+                timezone TEXT NOT NULL DEFAULT 'UTC',
+                active INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL,
+                last_fired_at TEXT,
+                last_run_id TEXT,
+                last_status TEXT,
+                misfire_count INTEGER NOT NULL DEFAULT 0,
+                FOREIGN KEY (suite_id) REFERENCES s2d_test_suites(id)
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS harvest_schedules (
+                id TEXT PRIMARY KEY,
+                connector_id TEXT NOT NULL,
+                mode TEXT NOT NULL DEFAULT 'incremental',
+                trigger_type TEXT NOT NULL,
+                trigger_config TEXT NOT NULL,
+                timezone TEXT NOT NULL DEFAULT 'UTC',
+                active INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL,
+                last_fired_at TEXT,
+                last_status TEXT,
+                misfire_count INTEGER NOT NULL DEFAULT 0
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS schedule_events (
+                id TEXT PRIMARY KEY,
+                schedule_kind TEXT NOT NULL,
+                schedule_id TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                run_id TEXT,
+                fired_at TEXT NOT NULL,
+                message TEXT
+            )
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_schedule_events_lookup
+                ON schedule_events (schedule_kind, schedule_id, fired_at DESC)
+        """)
+
     _add_missing_test_case_columns()
     _add_missing_test_result_columns()
+    _add_missing_test_run_columns()
+
+
+def _add_missing_test_run_columns():
+    """
+    Additive migration: s2d_test_runs gained suite_id so a run row can
+    remember which test suite triggered it (NULL for legacy "Run all" runs).
+    """
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='s2d_test_runs'"
+        ).fetchone()
+        if not row:
+            return  # fresh install - CREATE TABLE above already includes the column
+
+        existing = {r[1] for r in conn.execute("PRAGMA table_info(s2d_test_runs)").fetchall()}
+        if "suite_id" not in existing:
+            conn.execute("ALTER TABLE s2d_test_runs ADD COLUMN suite_id TEXT")
 
 
 def _add_missing_test_result_columns():
@@ -407,15 +494,15 @@ def delete_test_case(test_case_id):
 # --- Runs + results ---------------------------------------------------------
 
 def create_run(mapping_id, status, total_checkpoints, pass_count, fail_count,
-               compute_time_seconds, started_at, finished_at):
+               compute_time_seconds, started_at, finished_at, suite_id=None):
     run_id = str(uuid.uuid4())
     with get_conn() as conn:
         conn.execute("""
             INSERT INTO s2d_test_runs
-                (id, mapping_id, status, total_checkpoints, pass_count, fail_count,
+                (id, mapping_id, suite_id, status, total_checkpoints, pass_count, fail_count,
                  compute_time_seconds, started_at, finished_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (run_id, mapping_id, status, total_checkpoints, pass_count, fail_count,
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (run_id, mapping_id, suite_id, status, total_checkpoints, pass_count, fail_count,
               compute_time_seconds, started_at, finished_at))
     return run_id
 
@@ -459,13 +546,14 @@ def get_run(run_id):
 
 def list_runs(mapping_id=None):
     """
-    Powers the History tab - joins in the mapping name so the list is
-    readable without a second round-trip per row.
+    Powers the History tab - joins in the mapping name and suite name so the
+    list is readable without a second round-trip per row.
     """
     query = """
-        SELECT r.*, m.name AS mapping_name
+        SELECT r.*, m.name AS mapping_name, s.name AS suite_name
         FROM s2d_test_runs r
         LEFT JOIN s2d_mappings m ON m.id = r.mapping_id
+        LEFT JOIN s2d_test_suites s ON s.id = r.suite_id
     """
     params = []
     if mapping_id:
@@ -474,4 +562,277 @@ def list_runs(mapping_id=None):
     query += " ORDER BY r.started_at DESC"
     with get_conn() as conn:
         rows = conn.execute(query, params).fetchall()
+        return [dict(r) for r in rows]
+
+
+# --- Test suites ---------------------------------------------------------
+
+def create_suite(mapping_id, name, description, test_case_ids):
+    suite_id = str(uuid.uuid4())
+    now = datetime.now(timezone.utc).isoformat()
+    with get_conn() as conn:
+        conn.execute(
+            "INSERT INTO s2d_test_suites (id, mapping_id, name, description, created_at) VALUES (?, ?, ?, ?, ?)",
+            (suite_id, mapping_id, name, description, now),
+        )
+        for position, tc_id in enumerate(test_case_ids):
+            conn.execute(
+                "INSERT INTO s2d_test_suite_cases (suite_id, test_case_id, position) VALUES (?, ?, ?)",
+                (suite_id, tc_id, position),
+            )
+    return suite_id
+
+
+def list_suites(mapping_id=None):
+    """
+    Powers the Test Suites page. Includes mapping_name and test_case_count
+    so the list is renderable without a round-trip per row.
+    """
+    query = """
+        SELECT s.*, m.name AS mapping_name,
+               (SELECT COUNT(*) FROM s2d_test_suite_cases sc WHERE sc.suite_id = s.id) AS test_case_count
+        FROM s2d_test_suites s
+        LEFT JOIN s2d_mappings m ON m.id = s.mapping_id
+    """
+    params = []
+    if mapping_id:
+        query += " WHERE s.mapping_id = ?"
+        params.append(mapping_id)
+    query += " ORDER BY s.created_at DESC"
+    with get_conn() as conn:
+        rows = conn.execute(query, params).fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_suite(suite_id):
+    with get_conn() as conn:
+        suite_row = conn.execute(
+            "SELECT * FROM s2d_test_suites WHERE id = ?", (suite_id,)
+        ).fetchone()
+        if not suite_row:
+            return None
+        suite = dict(suite_row)
+
+        mapping_row = conn.execute(
+            "SELECT * FROM s2d_mappings WHERE id = ?", (suite["mapping_id"],)
+        ).fetchone()
+        suite["mapping"] = _mapping_row_to_dict(mapping_row) if mapping_row else None
+
+        tc_rows = conn.execute("""
+            SELECT tc.*
+            FROM s2d_test_suite_cases sc
+            JOIN s2d_test_cases tc ON tc.id = sc.test_case_id
+            WHERE sc.suite_id = ?
+            ORDER BY sc.position ASC
+        """, (suite_id,)).fetchall()
+        suite["test_cases"] = [_test_case_row_to_dict(r) for r in tc_rows]
+
+        return suite
+
+
+def update_suite(suite_id, name=None, description=None, test_case_ids=None):
+    with get_conn() as conn:
+        if name is not None or description is not None:
+            existing = conn.execute(
+                "SELECT name, description FROM s2d_test_suites WHERE id = ?", (suite_id,)
+            ).fetchone()
+            if not existing:
+                return False
+            new_name = name if name is not None else existing["name"]
+            new_desc = description if description is not None else existing["description"]
+            conn.execute(
+                "UPDATE s2d_test_suites SET name = ?, description = ? WHERE id = ?",
+                (new_name, new_desc, suite_id),
+            )
+        if test_case_ids is not None:
+            conn.execute("DELETE FROM s2d_test_suite_cases WHERE suite_id = ?", (suite_id,))
+            for position, tc_id in enumerate(test_case_ids):
+                conn.execute(
+                    "INSERT INTO s2d_test_suite_cases (suite_id, test_case_id, position) VALUES (?, ?, ?)",
+                    (suite_id, tc_id, position),
+                )
+    return True
+
+
+def delete_suite(suite_id):
+    with get_conn() as conn:
+        conn.execute("DELETE FROM s2d_test_suite_cases WHERE suite_id = ?", (suite_id,))
+        conn.execute("DELETE FROM s2d_test_suites WHERE id = ?", (suite_id,))
+
+
+# --- Schedules --------------------------------------------------------------
+
+def _schedule_row_to_dict(row):
+    s = dict(row)
+    if s.get("trigger_config"):
+        s["trigger_config"] = json.loads(s["trigger_config"])
+    s["active"] = bool(s["active"])
+    return s
+
+
+def create_suite_schedule(suite_id, trigger_type, trigger_config, timezone_name):
+    schedule_id = str(uuid.uuid4())
+    now = datetime.now(timezone.utc).isoformat()
+    with get_conn() as conn:
+        conn.execute("""
+            INSERT INTO s2d_suite_schedules
+                (id, suite_id, trigger_type, trigger_config, timezone, active, created_at)
+            VALUES (?, ?, ?, ?, ?, 1, ?)
+        """, (schedule_id, suite_id, trigger_type, json.dumps(trigger_config), timezone_name, now))
+    return schedule_id
+
+
+def list_suite_schedules(suite_id=None):
+    query = """
+        SELECT s.*, ts.name AS suite_name, ts.mapping_id AS suite_mapping_id
+        FROM s2d_suite_schedules s
+        LEFT JOIN s2d_test_suites ts ON ts.id = s.suite_id
+    """
+    params = []
+    if suite_id:
+        query += " WHERE s.suite_id = ?"
+        params.append(suite_id)
+    query += " ORDER BY s.created_at DESC"
+    with get_conn() as conn:
+        rows = conn.execute(query, params).fetchall()
+        return [_schedule_row_to_dict(r) for r in rows]
+
+
+def get_suite_schedule(schedule_id):
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM s2d_suite_schedules WHERE id = ?", (schedule_id,)
+        ).fetchone()
+        return _schedule_row_to_dict(row) if row else None
+
+
+def update_suite_schedule(schedule_id, trigger_type=None, trigger_config=None, timezone_name=None, active=None):
+    with get_conn() as conn:
+        current = conn.execute(
+            "SELECT * FROM s2d_suite_schedules WHERE id = ?", (schedule_id,)
+        ).fetchone()
+        if not current:
+            return False
+        new_trigger_type = trigger_type if trigger_type is not None else current["trigger_type"]
+        new_trigger_config = json.dumps(trigger_config) if trigger_config is not None else current["trigger_config"]
+        new_tz = timezone_name if timezone_name is not None else current["timezone"]
+        new_active = (1 if active else 0) if active is not None else current["active"]
+        conn.execute("""
+            UPDATE s2d_suite_schedules
+            SET trigger_type = ?, trigger_config = ?, timezone = ?, active = ?
+            WHERE id = ?
+        """, (new_trigger_type, new_trigger_config, new_tz, new_active, schedule_id))
+    return True
+
+
+def delete_suite_schedule(schedule_id):
+    with get_conn() as conn:
+        conn.execute("DELETE FROM s2d_suite_schedules WHERE id = ?", (schedule_id,))
+
+
+def touch_suite_schedule(schedule_id, last_status, last_run_id=None):
+    now = datetime.now(timezone.utc).isoformat()
+    with get_conn() as conn:
+        conn.execute("""
+            UPDATE s2d_suite_schedules
+            SET last_fired_at = ?, last_status = ?, last_run_id = COALESCE(?, last_run_id)
+            WHERE id = ?
+        """, (now, last_status, last_run_id, schedule_id))
+
+
+def bump_schedule_misfire(schedule_kind, schedule_id):
+    table = 's2d_suite_schedules' if schedule_kind == 'suite' else 'harvest_schedules'
+    with get_conn() as conn:
+        conn.execute(f"UPDATE {table} SET misfire_count = misfire_count + 1 WHERE id = ?", (schedule_id,))
+
+
+# Harvest schedules — same shape ---------------------------------------------
+
+def create_harvest_schedule(connector_id, mode, trigger_type, trigger_config, timezone_name):
+    schedule_id = str(uuid.uuid4())
+    now = datetime.now(timezone.utc).isoformat()
+    with get_conn() as conn:
+        conn.execute("""
+            INSERT INTO harvest_schedules
+                (id, connector_id, mode, trigger_type, trigger_config, timezone, active, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, 1, ?)
+        """, (schedule_id, connector_id, mode, trigger_type, json.dumps(trigger_config), timezone_name, now))
+    return schedule_id
+
+
+def list_harvest_schedules(connector_id=None):
+    query = "SELECT * FROM harvest_schedules"
+    params = []
+    if connector_id:
+        query += " WHERE connector_id = ?"
+        params.append(connector_id)
+    query += " ORDER BY created_at DESC"
+    with get_conn() as conn:
+        rows = conn.execute(query, params).fetchall()
+        return [_schedule_row_to_dict(r) for r in rows]
+
+
+def get_harvest_schedule(schedule_id):
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM harvest_schedules WHERE id = ?", (schedule_id,)
+        ).fetchone()
+        return _schedule_row_to_dict(row) if row else None
+
+
+def update_harvest_schedule(schedule_id, mode=None, trigger_type=None, trigger_config=None, timezone_name=None, active=None):
+    with get_conn() as conn:
+        current = conn.execute(
+            "SELECT * FROM harvest_schedules WHERE id = ?", (schedule_id,)
+        ).fetchone()
+        if not current:
+            return False
+        new_mode = mode if mode is not None else current["mode"]
+        new_trigger_type = trigger_type if trigger_type is not None else current["trigger_type"]
+        new_trigger_config = json.dumps(trigger_config) if trigger_config is not None else current["trigger_config"]
+        new_tz = timezone_name if timezone_name is not None else current["timezone"]
+        new_active = (1 if active else 0) if active is not None else current["active"]
+        conn.execute("""
+            UPDATE harvest_schedules
+            SET mode = ?, trigger_type = ?, trigger_config = ?, timezone = ?, active = ?
+            WHERE id = ?
+        """, (new_mode, new_trigger_type, new_trigger_config, new_tz, new_active, schedule_id))
+    return True
+
+
+def delete_harvest_schedule(schedule_id):
+    with get_conn() as conn:
+        conn.execute("DELETE FROM harvest_schedules WHERE id = ?", (schedule_id,))
+
+
+def touch_harvest_schedule(schedule_id, last_status):
+    now = datetime.now(timezone.utc).isoformat()
+    with get_conn() as conn:
+        conn.execute("""
+            UPDATE harvest_schedules
+            SET last_fired_at = ?, last_status = ?
+            WHERE id = ?
+        """, (now, last_status, schedule_id))
+
+
+# Schedule events ------------------------------------------------------------
+
+def record_schedule_event(schedule_kind, schedule_id, event_type, run_id=None, message=None):
+    event_id = str(uuid.uuid4())
+    now = datetime.now(timezone.utc).isoformat()
+    with get_conn() as conn:
+        conn.execute("""
+            INSERT INTO schedule_events (id, schedule_kind, schedule_id, event_type, run_id, fired_at, message)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (event_id, schedule_kind, schedule_id, event_type, run_id, now, message))
+
+
+def list_schedule_events(schedule_kind, schedule_id, limit=50):
+    with get_conn() as conn:
+        rows = conn.execute("""
+            SELECT * FROM schedule_events
+            WHERE schedule_kind = ? AND schedule_id = ?
+            ORDER BY fired_at DESC
+            LIMIT ?
+        """, (schedule_kind, schedule_id, limit)).fetchall()
         return [dict(r) for r in rows]

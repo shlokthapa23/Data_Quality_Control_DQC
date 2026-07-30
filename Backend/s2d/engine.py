@@ -225,8 +225,14 @@ def _run_cross_table_parity_check(tc, mapping, source_connector, destination_con
     destination_tables = tc["destination_target_tables"]
     rule_target = f"{', '.join(source_tables)} -> {', '.join(destination_tables)} (key: {key_column})"
 
-    source_query = f"SELECT val FROM ({_build_column_union(source_tables, key_column)}) combined"
-    destination_query = f"SELECT val FROM ({_build_column_union(destination_tables, key_column)}) combined"
+    source_query = (
+        f"SELECT COALESCE(CAST(TRY_CAST(val AS DATE) AS VARCHAR), CAST(val AS VARCHAR)) AS val "
+        f"FROM ({_build_column_union(source_tables, key_column)}) combined"
+    )
+    destination_query = (
+        f"SELECT COALESCE(CAST(TRY_CAST(val AS DATE) AS VARCHAR), CAST(val AS VARCHAR)) AS val "
+        f"FROM ({_build_column_union(destination_tables, key_column)}) combined"
+    )
     evaluated_query = f"[source] {source_query}  |  [destination] {destination_query}"
 
     try:
@@ -281,7 +287,7 @@ def run_single_test_case(tc, mapping, source_connector, destination_connector):
     return _run_sql_check(tc, mapping, source_connector, destination_connector)
 
 
-def _persist_run(mapping_id, results, compute_time_seconds):
+def _persist_run(mapping_id, results, compute_time_seconds, suite_id=None):
     started_at = datetime.now(timezone.utc).isoformat()
     pass_count = sum(1 for r in results if r["status"] == "PASS")
     fail_count = len(results) - pass_count
@@ -292,17 +298,17 @@ def _persist_run(mapping_id, results, compute_time_seconds):
         total_checkpoints=len(results), pass_count=pass_count, fail_count=fail_count,
         compute_time_seconds=compute_time_seconds,
         started_at=started_at, finished_at=datetime.now(timezone.utc).isoformat(),
+        suite_id=suite_id,
     )
     for r in results:
         s2d_db.add_result(run_id=run_id, **r)
     return run_id
 
 
-def run_pipeline(source_connector, destination_connector, mapping, test_cases):
-    """Runs every test case attached to a mapping, in one run record."""
+def _execute_test_cases(source_connector, destination_connector, mapping, test_cases):
+    """Runs the given test cases and returns (results, compute_time_seconds)."""
     run_start = time.monotonic()
     results = []
-
     for i, tc in enumerate(test_cases, start=1):
         label = f"TC-{i:03d}"
         test_start = time.monotonic()
@@ -318,9 +324,23 @@ def run_pipeline(source_connector, destination_connector, mapping, test_cases):
             "duration_seconds": round(time.monotonic() - test_start, 3),
             "executed_at": datetime.now(timezone.utc).isoformat(),
         })
+    return results, round(time.monotonic() - run_start, 3)
 
-    compute_time_seconds = round(time.monotonic() - run_start, 3)
+
+def run_pipeline(source_connector, destination_connector, mapping, test_cases):
+    """Runs every test case attached to a mapping, in one run record."""
+    results, compute_time_seconds = _execute_test_cases(
+        source_connector, destination_connector, mapping, test_cases
+    )
     return _persist_run(mapping["id"], results, compute_time_seconds)
+
+
+def run_suite(source_connector, destination_connector, mapping, suite_id, test_cases):
+    """Runs the given (already active-filtered) test cases and tags the run with suite_id."""
+    results, compute_time_seconds = _execute_test_cases(
+        source_connector, destination_connector, mapping, test_cases
+    )
+    return _persist_run(mapping["id"], results, compute_time_seconds, suite_id=suite_id)
 
 
 def run_one(source_connector, destination_connector, mapping, test_case):

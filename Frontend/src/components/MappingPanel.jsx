@@ -260,7 +260,7 @@ export default function MappingPanel({ mappings, selectedMappingId, onSelectMapp
           onClick={() => setShowForm((v) => !v)}
           className="w-full flex items-center justify-between text-xs font-bold text-slate-400 uppercase tracking-wider mb-3 hover:text-slate-600"
         >
-          New Mapping
+          Create New S2D Validation
           {isFormOpen ? <ChevronDown className="w-3.5 h-3.5" /> : <ChevronRight className="w-3.5 h-3.5" />}
         </button>
 
@@ -269,7 +269,7 @@ export default function MappingPanel({ mappings, selectedMappingId, onSelectMapp
             onClick={() => setShowForm(true)}
             className="w-full flex items-center justify-center gap-2 px-4 py-2 text-sm font-medium text-mastek-primary bg-mastek-primary/10 rounded-lg hover:bg-mastek-primary/20"
           >
-            <Plus className="w-4 h-4" /> New Mapping
+            <Plus className="w-4 h-4" /> New Validation
           </button>
         )}
 

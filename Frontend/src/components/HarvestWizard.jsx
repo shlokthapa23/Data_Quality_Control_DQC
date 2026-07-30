@@ -3,7 +3,12 @@ import {
   Database, Table2, FileText, BarChart3, NotebookText, Folder,
   Loader2, AlertCircle, CheckCircle2, DownloadCloud,
 } from 'lucide-react';
-import { fetchConnectors, fetchConnectorItems, runHarvest } from '../api';
+import {
+  fetchConnectors, fetchConnectorItems, runHarvest,
+  fetchHarvestSchedules, createHarvestSchedule, updateHarvestSchedule,
+  deleteHarvestSchedule, fetchHarvestScheduleEvents,
+} from '../api';
+import SchedulesSection from './SchedulesSection';
 
 const CATEGORY_ICON = {
   Lakehouse: Database,
@@ -115,6 +120,20 @@ export default function HarvestWizard() {
             ))}
           </select>
         </label>
+
+        {/* Schedules for this connector — harvests everything visible at fire time */}
+        {connectorId && (
+          <SchedulesSection
+            parentId={connectorId}
+            kind="harvest"
+            fetchList={fetchHarvestSchedules}
+            create={createHarvestSchedule}
+            update={updateHarvestSchedule}
+            remove={deleteHarvestSchedule}
+            fetchEvents={fetchHarvestScheduleEvents}
+            createExtras={{ mode: 'incremental' }}
+          />
+        )}
 
         {/* Step 2: choose assets */}
         {isLoadingItems && (

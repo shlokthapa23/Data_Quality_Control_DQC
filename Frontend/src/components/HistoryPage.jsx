@@ -50,6 +50,7 @@ export default function HistoryPage({ onOpenRun }) {
             <thead className="bg-slate-50 border-b border-slate-200 text-slate-500">
               <tr>
                 <th className="px-6 py-3 font-medium">Mapping</th>
+                <th className="px-6 py-3 font-medium">Suite</th>
                 <th className="px-6 py-3 font-medium">Status</th>
                 <th className="px-6 py-3 font-medium">Checkpoints</th>
                 <th className="px-6 py-3 font-medium">Pass / Fail</th>
@@ -66,6 +67,9 @@ export default function HistoryPage({ onOpenRun }) {
                 >
                   <td className="px-6 py-3 font-medium text-slate-800 truncate max-w-[200px]">
                     {run.mapping_name || '(deleted mapping)'}
+                  </td>
+                  <td className="px-6 py-3 text-slate-500 truncate max-w-[180px]">
+                    {run.suite_name || <span className="text-slate-300">—</span>}
                   </td>
                   <td className="px-6 py-3">
                     {run.status === 'passed' ? (
@@ -90,7 +94,7 @@ export default function HistoryPage({ onOpenRun }) {
               ))}
               {runs.length === 0 && (
                 <tr>
-                  <td colSpan={6} className="px-6 py-8 text-center text-slate-400">
+                  <td colSpan={7} className="px-6 py-8 text-center text-slate-400">
                     No test runs yet - run a pipeline from the S2D Validation page.
                   </td>
                 </tr>

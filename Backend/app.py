@@ -1,7 +1,8 @@
+import os
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 from dotenv import load_dotenv
-from s2d.engine import run_pipeline, run_one
+from s2d.engine import run_pipeline, run_one, run_suite
 from catalog import db as catalog_db
 from connector_factory import build_connector
 from harvest import run_harvest
@@ -10,9 +11,10 @@ from s2d import db as s2d_db
 from s2d.engine import run_pipeline
 from ai_service import (
     generate_test_case_sql, generate_rules_from_sample, generate_parity_rules_from_samples,
-    generate_key_column_suggestion, PARITY_VALIDATION_TYPES,
+    generate_key_column_suggestion, generate_key_column_suggestions_from_samples, PARITY_VALIDATION_TYPES,
 )
 from connectors.sql_guard import validate_select_only
+import scheduler as _scheduler
 
 
 
@@ -843,6 +845,199 @@ def ai_suggest_parity_rules(mapping_id):
     return jsonify({"created": created, "skipped": skipped})
 
 
+@app.route('/api/s2d/mappings/<mapping_id>/ai/suggest-cross-table-parity-rules', methods=['POST'])
+def ai_suggest_cross_table_parity_rules(mapping_id):
+    """
+    Body: { "source_tables": ["..."], "destination_tables": ["..."] }
+
+    Sample-based counterpart to ai_suggest_parity_rules, but for
+    cross_table_parity instead of column_parity: reads a random sample from
+    the FIRST table on each side (multiple tables per side are assumed
+    similarly-shaped, same assumption row_count_match/ai_suggest_parity_rules
+    already make), hands both samples to the AI, and lets it propose one or
+    more candidate join/key columns on its own - no description required.
+    cross_table_parity has no SQL to generate/validate (it's engine-computed
+    by s2d/engine.py's _run_cross_table_parity_check), so each surviving
+    suggestion is validated by confirming its key_column exists in EVERY
+    selected table's schema on both sides, then saved immediately as an
+    'ai'-origin cross_table_parity test case spanning the full table lists.
+    """
+    mapping = s2d_db.get_mapping(mapping_id)
+    if not mapping:
+        return jsonify({"error": "Mapping not found"}), 404
+
+    body = request.get_json(force=True)
+    source_tables = body.get("source_tables")
+    destination_tables = body.get("destination_tables")
+    if not source_tables or not destination_tables:
+        return jsonify({"error": "source_tables and destination_tables are required"}), 400
+
+    try:
+        _, source_connector = get_connector_instance(mapping["source_connector_id"])
+        _, destination_connector = get_connector_instance(mapping["destination_connector_id"])
+    except KeyError as e:
+        return jsonify({"error": str(e)}), 404
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+
+    try:
+        source_schema = source_connector.list_tables_in_container(mapping["source_container_id"])
+        source_entries = {t["table"]: t for t in source_schema if t["table"] in source_tables}
+        missing_source = set(source_tables) - source_entries.keys()
+        if missing_source:
+            return jsonify({"error": f"Source table(s) not found: {', '.join(missing_source)}"}), 404
+
+        destination_schema = destination_connector.list_tables_in_container(mapping["destination_container_id"])
+        destination_entries = {t["table"]: t for t in destination_schema if t["table"] in destination_tables}
+        missing_destination = set(destination_tables) - destination_entries.keys()
+        if missing_destination:
+            return jsonify({"error": f"Destination table(s) not found: {', '.join(missing_destination)}"}), 404
+
+        first_source_table, first_destination_table = source_tables[0], destination_tables[0]
+        source_sample = source_connector.sample_rows(mapping["source_container_id"], first_source_table, limit=20)
+        destination_sample = destination_connector.sample_rows(mapping["destination_container_id"], first_destination_table, limit=20)
+
+        rules = generate_key_column_suggestions_from_samples(
+            first_source_table, source_entries[first_source_table]["columns"], source_sample,
+            first_destination_table, destination_entries[first_destination_table]["columns"], destination_sample,
+        )
+    except Exception as e:
+        print(f"AI cross-table parity rule suggestion error: {e}")
+        return jsonify({"error": "AI parity rule suggestion failed", "details": str(e)}), 502
+
+    # Key column must exist on EVERY selected table per side, not just the
+    # one the AI actually saw a sample of - otherwise the UNION ALL query
+    # the engine builds would fail against tables the AI never looked at.
+    source_column_names = set.intersection(*(
+        {c["name"] for c in entry["columns"]} for entry in source_entries.values()
+    ))
+    destination_column_names = set.intersection(*(
+        {c["name"] for c in entry["columns"]} for entry in destination_entries.values()
+    ))
+
+    created = []
+    skipped = []
+    for rule in rules:
+        name = rule.get("name", "unnamed")
+        key_column = rule.get("key_column")
+
+        if key_column not in source_column_names:
+            skipped.append({"name": name, "reason": f"key_column '{key_column}' isn't common to every selected source table"})
+            continue
+        if key_column not in destination_column_names:
+            skipped.append({"name": name, "reason": f"key_column '{key_column}' isn't common to every selected destination table"})
+            continue
+
+        test_case_id = s2d_db.create_test_case(
+            mapping_id=mapping_id, name=name, validation_type="Custom", check_type="sql",
+            check_scope="cross_table_parity", key_column=key_column,
+            source_target_tables=source_tables, destination_target_tables=destination_tables,
+            origin="ai", severity=rule.get("severity", "error"), description=rule.get("description"),
+        )
+        created.append(s2d_db.get_test_case(test_case_id))
+
+    return jsonify({"created": created, "skipped": skipped})
+
+
+# --- S2D: Test suites -------------------------------------------------------
+
+@app.route('/api/s2d/suites', methods=['GET'])
+def list_all_s2d_suites():
+    mapping_id = request.args.get('mapping_id')
+    return jsonify(s2d_db.list_suites(mapping_id=mapping_id))
+
+
+@app.route('/api/s2d/mappings/<mapping_id>/suites', methods=['GET'])
+def list_s2d_suites_for_mapping(mapping_id):
+    return jsonify(s2d_db.list_suites(mapping_id=mapping_id))
+
+
+@app.route('/api/s2d/mappings/<mapping_id>/suites', methods=['POST'])
+def create_s2d_suite(mapping_id):
+    body = request.get_json(force=True) or {}
+    name = (body.get("name") or "").strip()
+    description = body.get("description")
+    test_case_ids = body.get("test_case_ids") or []
+
+    if not name:
+        return jsonify({"error": "name is required"}), 400
+    if not isinstance(test_case_ids, list) or not test_case_ids:
+        return jsonify({"error": "test_case_ids must be a non-empty list"}), 400
+
+    if not s2d_db.get_mapping(mapping_id):
+        return jsonify({"error": "Mapping not found"}), 404
+
+    mapping_test_case_ids = {tc["id"] for tc in s2d_db.list_test_cases(mapping_id)}
+    invalid = [tc_id for tc_id in test_case_ids if tc_id not in mapping_test_case_ids]
+    if invalid:
+        return jsonify({"error": f"test_case_ids do not belong to this mapping: {invalid}"}), 400
+
+    suite_id = s2d_db.create_suite(mapping_id, name, description, test_case_ids)
+    return jsonify({"id": suite_id}), 201
+
+
+@app.route('/api/s2d/suites/<suite_id>', methods=['GET'])
+def get_s2d_suite(suite_id):
+    suite = s2d_db.get_suite(suite_id)
+    if not suite:
+        return jsonify({"error": "Suite not found"}), 404
+    return jsonify(suite)
+
+
+@app.route('/api/s2d/suites/<suite_id>', methods=['PATCH'])
+def update_s2d_suite(suite_id):
+    suite = s2d_db.get_suite(suite_id)
+    if not suite:
+        return jsonify({"error": "Suite not found"}), 404
+
+    body = request.get_json(force=True) or {}
+    name = body.get("name")
+    description = body.get("description")
+    test_case_ids = body.get("test_case_ids")
+
+    if test_case_ids is not None:
+        if not isinstance(test_case_ids, list) or not test_case_ids:
+            return jsonify({"error": "test_case_ids must be a non-empty list"}), 400
+        mapping_test_case_ids = {tc["id"] for tc in s2d_db.list_test_cases(suite["mapping_id"])}
+        invalid = [tc_id for tc_id in test_case_ids if tc_id not in mapping_test_case_ids]
+        if invalid:
+            return jsonify({"error": f"test_case_ids do not belong to this suite's mapping: {invalid}"}), 400
+
+    s2d_db.update_suite(suite_id, name=name, description=description, test_case_ids=test_case_ids)
+    return jsonify(s2d_db.get_suite(suite_id))
+
+
+@app.route('/api/s2d/suites/<suite_id>', methods=['DELETE'])
+def delete_s2d_suite(suite_id):
+    s2d_db.delete_suite(suite_id)
+    return jsonify({"ok": True})
+
+
+@app.route('/api/s2d/suites/<suite_id>/run', methods=['POST'])
+def run_s2d_suite(suite_id):
+    suite = s2d_db.get_suite(suite_id)
+    if not suite:
+        return jsonify({"error": "Suite not found"}), 404
+    if not suite.get("mapping"):
+        return jsonify({"error": "Suite's mapping no longer exists"}), 400
+
+    active_test_cases = [tc for tc in suite["test_cases"] if tc.get("active")]
+    if not active_test_cases:
+        return jsonify({"error": "This suite has no active test cases to run"}), 400
+
+    mapping = suite["mapping"]
+    try:
+        _, source_connector = get_connector_instance(mapping["source_connector_id"])
+        _, destination_connector = get_connector_instance(mapping["destination_connector_id"])
+    except KeyError as e:
+        return jsonify({"error": str(e)}), 404
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+
+    run_id = run_suite(source_connector, destination_connector, mapping, suite_id, active_test_cases)
+    return jsonify({"run_id": run_id})
+
+
 @app.route('/api/s2d/mappings/<mapping_id>/run', methods=['POST'])
 def run_s2d_pipeline(mapping_id):
     mapping = s2d_db.get_mapping(mapping_id)
@@ -879,5 +1074,243 @@ def get_s2d_run(run_id):
     return jsonify(run)
 
 
+# --- Schedules --------------------------------------------------------------
+
+def _validate_schedule_body(body):
+    """Common validation for suite + harvest schedule payloads. Returns (error, tuple_or_None).
+    On success returns (None, (trigger_type, trigger_config, timezone_name)).
+    """
+    trigger_type = body.get("trigger_type")
+    trigger_config = body.get("trigger_config")
+    timezone_name = body.get("timezone") or "UTC"
+
+    if trigger_type not in ("cron", "interval"):
+        return "trigger_type must be 'cron' or 'interval'", None
+    if not isinstance(trigger_config, dict):
+        return "trigger_config must be an object", None
+
+    if trigger_type == "cron":
+        expr = trigger_config.get("expression")
+        if not isinstance(expr, str) or not expr.strip():
+            return "trigger_config.expression is required for cron", None
+        try:
+            from apscheduler.triggers.cron import CronTrigger
+            from zoneinfo import ZoneInfo
+            CronTrigger.from_crontab(expr.strip(), timezone=ZoneInfo(timezone_name))
+        except Exception as e:
+            return f"Invalid cron expression or timezone: {e}", None
+    else:
+        try:
+            seconds = int(trigger_config.get("seconds"))
+        except (TypeError, ValueError):
+            return "trigger_config.seconds must be an integer", None
+        if seconds < 60:
+            return "trigger_config.seconds must be at least 60", None
+
+    return None, (trigger_type, trigger_config, timezone_name)
+
+
+def _serialize_next_fires(trigger_type, trigger_config, timezone_name, count=3):
+    try:
+        return [dt.isoformat() for dt in _scheduler.compute_next_fires(trigger_type, trigger_config, timezone_name, count=count)]
+    except Exception:
+        return []
+
+
+# Suite schedules ------------------------------------------------------------
+
+@app.route('/api/s2d/suites/<suite_id>/schedules', methods=['GET'])
+def list_suite_schedules_route(suite_id):
+    schedules = s2d_db.list_suite_schedules(suite_id=suite_id)
+    for s in schedules:
+        s["next_fires"] = _serialize_next_fires(s["trigger_type"], s["trigger_config"], s.get("timezone")) if s.get("active") else []
+    return jsonify(schedules)
+
+
+@app.route('/api/s2d/suites/<suite_id>/schedules', methods=['POST'])
+def create_suite_schedule_route(suite_id):
+    if not s2d_db.get_suite(suite_id):
+        return jsonify({"error": "Suite not found"}), 404
+    body = request.get_json(force=True) or {}
+    err, parsed = _validate_schedule_body(body)
+    if err:
+        return jsonify({"error": err}), 400
+    trigger_type, trigger_config, timezone_name = parsed
+    schedule_id = s2d_db.create_suite_schedule(suite_id, trigger_type, trigger_config, timezone_name)
+    row = s2d_db.get_suite_schedule(schedule_id)
+    try:
+        _scheduler.add_suite_schedule_job(row)
+    except Exception as e:
+        s2d_db.delete_suite_schedule(schedule_id)
+        return jsonify({"error": f"Failed to register schedule: {e}"}), 500
+    return jsonify({"id": schedule_id, "next_fires": _serialize_next_fires(trigger_type, trigger_config, timezone_name)}), 201
+
+
+@app.route('/api/s2d/schedules/<schedule_id>', methods=['PATCH'])
+def update_suite_schedule_route(schedule_id):
+    existing = s2d_db.get_suite_schedule(schedule_id)
+    if not existing:
+        return jsonify({"error": "Schedule not found"}), 404
+    body = request.get_json(force=True) or {}
+
+    trigger_changed = any(k in body for k in ("trigger_type", "trigger_config", "timezone"))
+    if trigger_changed:
+        merged = {
+            "trigger_type": body.get("trigger_type", existing["trigger_type"]),
+            "trigger_config": body.get("trigger_config", existing["trigger_config"]),
+            "timezone": body.get("timezone", existing.get("timezone") or "UTC"),
+        }
+        err, _ = _validate_schedule_body(merged)
+        if err:
+            return jsonify({"error": err}), 400
+
+    s2d_db.update_suite_schedule(
+        schedule_id,
+        trigger_type=body.get("trigger_type"),
+        trigger_config=body.get("trigger_config"),
+        timezone_name=body.get("timezone"),
+        active=body.get("active"),
+    )
+    updated = s2d_db.get_suite_schedule(schedule_id)
+    _scheduler.remove_suite_schedule_job(schedule_id)
+    if updated.get("active"):
+        try:
+            _scheduler.add_suite_schedule_job(updated)
+        except Exception as e:
+            return jsonify({"error": f"Failed to re-register schedule: {e}"}), 500
+    updated["next_fires"] = _serialize_next_fires(updated["trigger_type"], updated["trigger_config"], updated.get("timezone")) if updated.get("active") else []
+    return jsonify(updated)
+
+
+@app.route('/api/s2d/schedules/<schedule_id>', methods=['DELETE'])
+def delete_suite_schedule_route(schedule_id):
+    _scheduler.remove_suite_schedule_job(schedule_id)
+    s2d_db.delete_suite_schedule(schedule_id)
+    return jsonify({"ok": True})
+
+
+@app.route('/api/s2d/schedules/<schedule_id>/events', methods=['GET'])
+def list_suite_schedule_events_route(schedule_id):
+    limit = int(request.args.get('limit', 50))
+    return jsonify(s2d_db.list_schedule_events('suite', schedule_id, limit=limit))
+
+
+# Harvest schedules ----------------------------------------------------------
+
+@app.route('/api/connectors/<connector_id>/schedules', methods=['GET'])
+def list_harvest_schedules_route(connector_id):
+    schedules = s2d_db.list_harvest_schedules(connector_id=connector_id)
+    for s in schedules:
+        s["next_fires"] = _serialize_next_fires(s["trigger_type"], s["trigger_config"], s.get("timezone")) if s.get("active") else []
+    return jsonify(schedules)
+
+
+@app.route('/api/connectors/<connector_id>/schedules', methods=['POST'])
+def create_harvest_schedule_route(connector_id):
+    if not catalog_db.get_connector_config(connector_id):
+        return jsonify({"error": "Connector not found"}), 404
+    body = request.get_json(force=True) or {}
+    err, parsed = _validate_schedule_body(body)
+    if err:
+        return jsonify({"error": err}), 400
+    trigger_type, trigger_config, timezone_name = parsed
+    mode = body.get("mode") or "incremental"
+    if mode not in ("incremental", "full_refresh"):
+        return jsonify({"error": "mode must be 'incremental' or 'full_refresh'"}), 400
+    schedule_id = s2d_db.create_harvest_schedule(connector_id, mode, trigger_type, trigger_config, timezone_name)
+    row = s2d_db.get_harvest_schedule(schedule_id)
+    try:
+        _scheduler.add_harvest_schedule_job(row)
+    except Exception as e:
+        s2d_db.delete_harvest_schedule(schedule_id)
+        return jsonify({"error": f"Failed to register schedule: {e}"}), 500
+    return jsonify({"id": schedule_id, "next_fires": _serialize_next_fires(trigger_type, trigger_config, timezone_name)}), 201
+
+
+@app.route('/api/harvest/schedules/<schedule_id>', methods=['PATCH'])
+def update_harvest_schedule_route(schedule_id):
+    existing = s2d_db.get_harvest_schedule(schedule_id)
+    if not existing:
+        return jsonify({"error": "Schedule not found"}), 404
+    body = request.get_json(force=True) or {}
+
+    if "mode" in body and body["mode"] not in ("incremental", "full_refresh"):
+        return jsonify({"error": "mode must be 'incremental' or 'full_refresh'"}), 400
+
+    trigger_changed = any(k in body for k in ("trigger_type", "trigger_config", "timezone"))
+    if trigger_changed:
+        merged = {
+            "trigger_type": body.get("trigger_type", existing["trigger_type"]),
+            "trigger_config": body.get("trigger_config", existing["trigger_config"]),
+            "timezone": body.get("timezone", existing.get("timezone") or "UTC"),
+        }
+        err, _ = _validate_schedule_body(merged)
+        if err:
+            return jsonify({"error": err}), 400
+
+    s2d_db.update_harvest_schedule(
+        schedule_id,
+        mode=body.get("mode"),
+        trigger_type=body.get("trigger_type"),
+        trigger_config=body.get("trigger_config"),
+        timezone_name=body.get("timezone"),
+        active=body.get("active"),
+    )
+    updated = s2d_db.get_harvest_schedule(schedule_id)
+    _scheduler.remove_harvest_schedule_job(schedule_id)
+    if updated.get("active"):
+        try:
+            _scheduler.add_harvest_schedule_job(updated)
+        except Exception as e:
+            return jsonify({"error": f"Failed to re-register schedule: {e}"}), 500
+    updated["next_fires"] = _serialize_next_fires(updated["trigger_type"], updated["trigger_config"], updated.get("timezone")) if updated.get("active") else []
+    return jsonify(updated)
+
+
+@app.route('/api/harvest/schedules/<schedule_id>', methods=['DELETE'])
+def delete_harvest_schedule_route(schedule_id):
+    _scheduler.remove_harvest_schedule_job(schedule_id)
+    s2d_db.delete_harvest_schedule(schedule_id)
+    return jsonify({"ok": True})
+
+
+@app.route('/api/harvest/schedules/<schedule_id>/events', methods=['GET'])
+def list_harvest_schedule_events_route(schedule_id):
+    limit = int(request.args.get('limit', 50))
+    return jsonify(s2d_db.list_schedule_events('harvest', schedule_id, limit=limit))
+
+
+# Cross-cutting --------------------------------------------------------------
+
+@app.route('/api/schedules', methods=['GET'])
+def list_all_schedules_route():
+    suites = s2d_db.list_suite_schedules()
+    harvests = s2d_db.list_harvest_schedules()
+    for s in suites:
+        s["kind"] = "suite"
+        s["next_fires"] = _serialize_next_fires(s["trigger_type"], s["trigger_config"], s.get("timezone")) if s.get("active") else []
+    for h in harvests:
+        h["kind"] = "harvest"
+        h["next_fires"] = _serialize_next_fires(h["trigger_type"], h["trigger_config"], h.get("timezone")) if h.get("active") else []
+    return jsonify({"suite_schedules": suites, "harvest_schedules": harvests})
+
+
+@app.route('/api/schedules/preview', methods=['POST'])
+def preview_schedule_route():
+    body = request.get_json(force=True) or {}
+    err, parsed = _validate_schedule_body(body)
+    if err:
+        return jsonify({"error": err}), 400
+    trigger_type, trigger_config, timezone_name = parsed
+    return jsonify({"next_fires": _serialize_next_fires(trigger_type, trigger_config, timezone_name, count=5)})
+
+
 if __name__ == '__main__':
+    # WERKZEUG_RUN_MAIN='true' is set only in the child reloader process that
+    # actually serves requests. Without this guard, debug=True would spin up
+    # two schedulers (parent watcher + child) and every fire would double.
+    # For a WSGI deploy (gunicorn/waitress) the app.run() branch isn't hit
+    # anyway; that entry point should call scheduler.init_scheduler() itself.
+    if os.environ.get('WERKZEUG_RUN_MAIN') == 'true':
+        _scheduler.init_scheduler()
     app.run(debug=True, port=5000)

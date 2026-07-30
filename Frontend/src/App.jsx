@@ -1,9 +1,10 @@
 import { useState } from 'react';
-import { Plug, DownloadCloud, LayoutGrid, GitCompareArrows, History } from 'lucide-react';
+import { Plug, DownloadCloud, LayoutGrid, GitCompareArrows, ListChecks, History } from 'lucide-react';
 import ConnectPage from './components/ConnectPage';
 import HarvestWizard from './components/HarvestWizard';
 import CatalogPage from './components/CatalogPage';
 import S2DPage from './components/S2DPage';
+import TestSuitesPage from './components/TestSuitesPage';
 import AnalyticsPage from './components/AnalyticsPage';
 import HistoryPage from './components/HistoryPage';
 import mastekLogo from './images/logo.png'
@@ -12,6 +13,7 @@ const NAV_PAGES = [
   { id: 'harvest', label: 'Harvest', icon: DownloadCloud },
   { id: 'catalog', label: 'Catalog', icon: LayoutGrid },
   { id: 's2d', label: 'S2D Validation', icon: GitCompareArrows },
+  { id: 'suites', label: 'Test Suites', icon: ListChecks },
   { id: 'history', label: 'History', icon: History },
 ];
 
@@ -59,6 +61,8 @@ function App() {
     content = <CatalogPage />;
   } else if (activePage === 'history') {
     content = <HistoryPage onOpenRun={handleOpenRunFromHistory} />;
+  } else if (activePage === 'suites') {
+    content = <TestSuitesPage onNavigateToRun={handleRunComplete} />;
   } else {
     content = <S2DPage onNavigateToRun={handleRunComplete} />;
   }
