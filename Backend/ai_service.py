@@ -83,7 +83,21 @@ Output ONLY a JSON object (no markdown fences, no explanation before or after) w
 Output only the JSON object, nothing else."""
 
 
-def _build_sample_prompt(table_name, columns, sample_rows, max_rules):
+def _already_covered_section(already_covered_text):
+    """Shared snippet appended to a sample-based prompt so a repeat click has
+    a real shot at proposing something different, instead of reliably
+    reconverging on the same rules (low temperature + same sampled rows
+    otherwise means a repeat call is nearly deterministic)."""
+    if not already_covered_text:
+        return ""
+    return f"""
+
+The following are ALREADY covered by existing checks on this mapping - do NOT repeat them, find genuinely DIFFERENT ones instead:
+{already_covered_text}
+If you cannot find anything genuinely new and different, return an empty JSON array [] rather than repeating an already-covered one."""
+
+
+def _build_sample_prompt(table_name, columns, sample_rows, max_rules, already_covered_text=""):
     columns_desc = ", ".join(f"{c['name']} ({c['data_type']})" for c in columns)
     sample_json = json.dumps(sample_rows[:15], default=str)
     types_list = ", ".join(f'"{t}"' for t in VALIDATION_TYPES)
@@ -102,13 +116,14 @@ Available columns: {columns_desc}
 Quote any column or table name that contains a space, hyphen, or other special character using double quotes (DuckDB syntax). Do not invent columns that aren't in the list above.
 
 Random sample of {min(len(sample_rows), 15)} rows from this table:
-{sample_json}
+{sample_json}{_already_covered_section(already_covered_text)}
 
 Output only the JSON array, nothing else."""
 
 
 def _build_parity_sample_prompt(source_table, source_columns, source_sample,
-                                 destination_table, destination_columns, destination_sample, max_rules):
+                                 destination_table, destination_columns, destination_sample, max_rules,
+                                 already_covered_text=""):
     source_columns_desc = ", ".join(f"{c['name']} ({c['data_type']})" for c in source_columns)
     destination_columns_desc = ", ".join(f"{c['name']} ({c['data_type']})" for c in destination_columns)
     source_json = json.dumps(source_sample[:15], default=str)
@@ -137,13 +152,14 @@ Random sample of {min(len(source_sample), 15)} source rows:
 Destination table: {destination_table}
 Destination columns: {destination_columns_desc}
 Random sample of {min(len(destination_sample), 15)} destination rows:
-{destination_json}
+{destination_json}{_already_covered_section(already_covered_text)}
 
 Output only the JSON array, nothing else."""
 
 
 def _build_key_column_sample_prompt(source_table, source_columns, source_sample,
-                                     destination_table, destination_columns, destination_sample, max_rules):
+                                     destination_table, destination_columns, destination_sample, max_rules,
+                                     already_covered_text=""):
     source_columns_desc = ", ".join(f"{c['name']} ({c['data_type']})" for c in source_columns)
     destination_columns_desc = ", ".join(f"{c['name']} ({c['data_type']})" for c in destination_columns)
     source_json = json.dumps(source_sample[:15], default=str)
@@ -169,7 +185,7 @@ Random sample of {min(len(source_sample), 15)} source rows:
 Destination table: {destination_table}
 Destination columns: {destination_columns_desc}
 Random sample of {min(len(destination_sample), 15)} destination rows:
-{destination_json}
+{destination_json}{_already_covered_section(already_covered_text)}
 
 Output only the JSON array, nothing else."""
 
@@ -280,7 +296,7 @@ def generate_key_column_suggestion(source_tables, destination_tables, descriptio
     return result
 
 
-def generate_rules_from_sample(table_name, columns, sample_rows, max_rules=6):
+def generate_rules_from_sample(table_name, columns, sample_rows, max_rules=6, already_covered_text=""):
     """
     columns: the table's REAL schema, same as generate_test_case_sql.
     sample_rows: a list of dicts, a random sample of the table's actual
@@ -289,8 +305,11 @@ def generate_rules_from_sample(table_name, columns, sample_rows, max_rules=6):
     {"name", "description", "validation_type", "severity", "script_text"}.
     None of the script_text values are validated here - the caller must
     run each through validate_select_only before trusting/saving them.
+    already_covered_text: optional human-readable listing of existing rule
+    names for this table, nudging the model to propose different ones on a
+    repeat call - best-effort only, the caller still de-dupes on save.
     """
-    prompt = _build_sample_prompt(table_name, columns, sample_rows, max_rules)
+    prompt = _build_sample_prompt(table_name, columns, sample_rows, max_rules, already_covered_text)
     text = _call_gemini(prompt, max_output_tokens=2000)
     cleaned = _clean_json(text)
 
@@ -306,7 +325,8 @@ def generate_rules_from_sample(table_name, columns, sample_rows, max_rules=6):
 
 
 def generate_parity_rules_from_samples(source_table, source_columns, source_sample,
-                                        destination_table, destination_columns, destination_sample, max_rules=6):
+                                        destination_table, destination_columns, destination_sample, max_rules=6,
+                                        already_covered_text=""):
     """
     Reads BOTH tables' real schemas and random samples (no user-typed
     prompt) and asks the model to find corresponding column pairs to run
@@ -319,10 +339,14 @@ def generate_parity_rules_from_samples(source_table, source_columns, source_samp
     + the two column names, so there's no SQL here for the caller to
     safety-check; the caller instead validates the returned column names
     actually exist in each side's schema before saving.
+    already_covered_text: optional human-readable listing of existing
+    column-pair checks, nudging the model to propose different pairs on a
+    repeat call - best-effort only, the caller still de-dupes on save.
     """
     prompt = _build_parity_sample_prompt(
         source_table, source_columns, source_sample,
         destination_table, destination_columns, destination_sample, max_rules,
+        already_covered_text,
     )
     text = _call_gemini(prompt, max_output_tokens=2000)
     cleaned = _clean_json(text)
@@ -340,7 +364,7 @@ def generate_parity_rules_from_samples(source_table, source_columns, source_samp
 
 def generate_key_column_suggestions_from_samples(source_table, source_columns, source_sample,
                                                    destination_table, destination_columns, destination_sample,
-                                                   max_rules=3):
+                                                   max_rules=3, already_covered_text=""):
     """
     Sample-based counterpart to generate_key_column_suggestion - reads BOTH
     tables' real schemas and random samples (no user-typed description) and
@@ -350,10 +374,14 @@ def generate_key_column_suggestions_from_samples(source_table, source_columns, s
     checks are engine-computed (no SQL) - the caller is responsible for
     validating each returned key_column actually exists in every selected
     table's schema on both sides before saving.
+    already_covered_text: optional human-readable listing of existing key
+    columns already used, nudging the model to propose a different one on a
+    repeat call - best-effort only, the caller still de-dupes on save.
     """
     prompt = _build_key_column_sample_prompt(
         source_table, source_columns, source_sample,
         destination_table, destination_columns, destination_sample, max_rules,
+        already_covered_text,
     )
     text = _call_gemini(prompt, max_output_tokens=1000)
     cleaned = _clean_json(text)

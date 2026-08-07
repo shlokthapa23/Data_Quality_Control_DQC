@@ -210,7 +210,10 @@ def remove_harvest_schedule_job(schedule_id):
 
 
 def _run_harvest_job(schedule_id):
-    """Fires when a harvest schedule is due. Picks up everything visible right now."""
+    """Fires when a harvest schedule is due. Uses the item selection frozen at
+    schedule-creation time (only those assets get harvested). Legacy rows with
+    a NULL selected_items fall back to "everything the connector sees" for
+    backward compatibility, but new schedules always store an explicit list."""
     schedule = s2d_db.get_harvest_schedule(schedule_id)
     if not schedule:
         log.warning("Harvest schedule %s vanished before firing", schedule_id)
@@ -221,30 +224,38 @@ def _run_harvest_job(schedule_id):
         if not config:
             raise KeyError(f"Connector {schedule['connector_id']} not found")
         connector = build_connector(config)
-        items = connector.list_items()
-        if not items:
-            msg = "Connector reported zero items — nothing to harvest"
+
+        selected_items = schedule.get("selected_items")
+        if selected_items:
+            # Frozen snapshot from schedule creation — the user's chosen assets.
+            selected = [
+                {"id": it.get("id"), "name": it.get("name"), "type": it.get("type")}
+                for it in selected_items
+                if it.get("id") and it.get("type")
+            ]
+        else:
+            # Legacy fallback: harvest everything the connector reports now.
+            items = connector.list_items()
+            selected = []
+            for it in items or []:
+                d = {
+                    "id": getattr(it, "id", None) if hasattr(it, "__dict__") else it.get("id") if isinstance(it, dict) else None,
+                    "name": getattr(it, "name", None) if hasattr(it, "__dict__") else it.get("name") if isinstance(it, dict) else None,
+                    "type": getattr(it, "type", None) if hasattr(it, "__dict__") else it.get("type") if isinstance(it, dict) else None,
+                }
+                if d["id"] and d["type"]:
+                    selected.append(d)
+
+        if not selected:
+            msg = "Nothing to harvest — the schedule's selection is empty"
             s2d_db.touch_harvest_schedule(schedule_id, "ran")
             s2d_db.record_schedule_event("harvest", schedule_id, "ran", message=msg)
             return
 
-        # BaseConnector.list_items() returns AssetItem dataclasses; harvest
-        # expects list-of-dicts with id/name/type keys.
-        selected = []
-        for it in items:
-            if hasattr(it, "__dict__"):
-                d = {"id": getattr(it, "id", None), "name": getattr(it, "name", None), "type": getattr(it, "type", None)}
-            elif isinstance(it, dict):
-                d = {"id": it.get("id"), "name": it.get("name"), "type": it.get("type")}
-            else:
-                continue
-            if d["id"] and d["type"]:
-                selected.append(d)
-
-        result = run_harvest(connector, config["name"], selected, mode=schedule.get("mode") or "incremental")
+        result = run_harvest(connector, schedule["connector_id"], config["name"], selected, mode=schedule.get("mode") or "incremental")
         n_harvested = len(result.get("harvested", []))
         n_errors = len(result.get("errors", []))
-        message = f"harvested {n_harvested} items ({n_errors} errors)"
+        message = f"harvested {n_harvested}/{len(selected)} items ({n_errors} errors)"
         s2d_db.touch_harvest_schedule(schedule_id, "ran")
         s2d_db.record_schedule_event("harvest", schedule_id, "ran", message=message)
     except Exception as e:

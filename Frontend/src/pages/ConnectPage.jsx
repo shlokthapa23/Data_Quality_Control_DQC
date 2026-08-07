@@ -1,9 +1,9 @@
 import { useEffect, useState } from 'react';
 import { Database, HardDrive, Trash2, Loader2, ChevronDown, ChevronRight } from 'lucide-react';
 import { fetchConnectors, deleteConnector } from '../api';
-import ConnectorForm from './ConnectorForm';
-import PinLakehousesPanel from './PinLakehousesPanel';
-import LocalFilesPanel from './LocalFilesPanel';
+import ConnectorForm from '../components/connect/ConnectorForm';
+import PinLakehousesPanel from '../components/connect/PinLakehousesPanel';
+import LocalFilesPanel from '../components/connect/LocalFilesPanel';
 
 export default function ConnectPage() {
   const [connectors, setConnectors] = useState([]);

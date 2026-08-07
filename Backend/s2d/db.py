@@ -255,6 +255,7 @@ def init_s2d_tables():
                 id TEXT PRIMARY KEY,
                 connector_id TEXT NOT NULL,
                 mode TEXT NOT NULL DEFAULT 'incremental',
+                selected_items TEXT,             -- JSON array of {id, name, type}; NULL = legacy "harvest all live"
                 trigger_type TEXT NOT NULL,
                 trigger_config TEXT NOT NULL,
                 timezone TEXT NOT NULL DEFAULT 'UTC',
@@ -301,6 +302,16 @@ def _add_missing_test_run_columns():
         existing = {r[1] for r in conn.execute("PRAGMA table_info(s2d_test_runs)").fetchall()}
         if "suite_id" not in existing:
             conn.execute("ALTER TABLE s2d_test_runs ADD COLUMN suite_id TEXT")
+
+        # harvest_schedules gained selected_items so scheduled harvests only
+        # pull the user-chosen assets, not everything the connector sees.
+        hs_row = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='harvest_schedules'"
+        ).fetchone()
+        if hs_row:
+            hs_existing = {r[1] for r in conn.execute("PRAGMA table_info(harvest_schedules)").fetchall()}
+            if "selected_items" not in hs_existing:
+                conn.execute("ALTER TABLE harvest_schedules ADD COLUMN selected_items TEXT")
 
 
 def _add_missing_test_result_columns():
@@ -375,8 +386,30 @@ def get_mapping(mapping_id):
         return _mapping_row_to_dict(row) if row else None
 
 
-def delete_mapping(mapping_id):
+def rename_mapping(mapping_id, name):
     with get_conn() as conn:
+        conn.execute("UPDATE s2d_mappings SET name = ? WHERE id = ?", (name, mapping_id))
+
+
+def delete_mapping(mapping_id):
+    """Deletes a mapping and everything that lives inside it - test cases,
+    test suites, suite membership, and suite schedules. Run history
+    (s2d_test_runs/s2d_test_results) is deliberately NOT cascaded here -
+    HistoryPage already renders "(deleted validation)" for orphaned runs,
+    keeping the audit trail intact after its validation is gone is the
+    existing, deliberate design. Callers that also need the live
+    APScheduler jobs for any suite_schedules deregistered before calling
+    this (app.py's delete route does exactly that)."""
+    with get_conn() as conn:
+        conn.execute("""
+            DELETE FROM s2d_suite_schedules
+            WHERE suite_id IN (SELECT id FROM s2d_test_suites WHERE mapping_id = ?)
+        """, (mapping_id,))
+        conn.execute("""
+            DELETE FROM s2d_test_suite_cases
+            WHERE suite_id IN (SELECT id FROM s2d_test_suites WHERE mapping_id = ?)
+        """, (mapping_id,))
+        conn.execute("DELETE FROM s2d_test_suites WHERE mapping_id = ?", (mapping_id,))
         conn.execute("DELETE FROM s2d_test_cases WHERE mapping_id = ?", (mapping_id,))
         conn.execute("DELETE FROM s2d_mappings WHERE id = ?", (mapping_id,))
 
@@ -666,6 +699,8 @@ def _schedule_row_to_dict(row):
     s = dict(row)
     if s.get("trigger_config"):
         s["trigger_config"] = json.loads(s["trigger_config"])
+    if "selected_items" in s and s["selected_items"]:
+        s["selected_items"] = json.loads(s["selected_items"])
     s["active"] = bool(s["active"])
     return s
 
@@ -748,25 +783,31 @@ def bump_schedule_misfire(schedule_kind, schedule_id):
 
 # Harvest schedules — same shape ---------------------------------------------
 
-def create_harvest_schedule(connector_id, mode, trigger_type, trigger_config, timezone_name):
+def create_harvest_schedule(connector_id, mode, trigger_type, trigger_config, timezone_name, selected_items=None):
     schedule_id = str(uuid.uuid4())
     now = datetime.now(timezone.utc).isoformat()
     with get_conn() as conn:
         conn.execute("""
             INSERT INTO harvest_schedules
-                (id, connector_id, mode, trigger_type, trigger_config, timezone, active, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, 1, ?)
-        """, (schedule_id, connector_id, mode, trigger_type, json.dumps(trigger_config), timezone_name, now))
+                (id, connector_id, mode, selected_items, trigger_type, trigger_config, timezone, active, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)
+        """, (schedule_id, connector_id, mode,
+              json.dumps(selected_items) if selected_items is not None else None,
+              trigger_type, json.dumps(trigger_config), timezone_name, now))
     return schedule_id
 
 
 def list_harvest_schedules(connector_id=None):
-    query = "SELECT * FROM harvest_schedules"
+    query = """
+        SELECT h.*, c.name AS connector_name
+        FROM harvest_schedules h
+        LEFT JOIN connector_configs c ON c.id = h.connector_id
+    """
     params = []
     if connector_id:
-        query += " WHERE connector_id = ?"
+        query += " WHERE h.connector_id = ?"
         params.append(connector_id)
-    query += " ORDER BY created_at DESC"
+    query += " ORDER BY h.created_at DESC"
     with get_conn() as conn:
         rows = conn.execute(query, params).fetchall()
         return [_schedule_row_to_dict(r) for r in rows]
@@ -780,7 +821,7 @@ def get_harvest_schedule(schedule_id):
         return _schedule_row_to_dict(row) if row else None
 
 
-def update_harvest_schedule(schedule_id, mode=None, trigger_type=None, trigger_config=None, timezone_name=None, active=None):
+def update_harvest_schedule(schedule_id, mode=None, trigger_type=None, trigger_config=None, timezone_name=None, active=None, selected_items=None):
     with get_conn() as conn:
         current = conn.execute(
             "SELECT * FROM harvest_schedules WHERE id = ?", (schedule_id,)
@@ -792,11 +833,12 @@ def update_harvest_schedule(schedule_id, mode=None, trigger_type=None, trigger_c
         new_trigger_config = json.dumps(trigger_config) if trigger_config is not None else current["trigger_config"]
         new_tz = timezone_name if timezone_name is not None else current["timezone"]
         new_active = (1 if active else 0) if active is not None else current["active"]
+        new_selected = json.dumps(selected_items) if selected_items is not None else current["selected_items"]
         conn.execute("""
             UPDATE harvest_schedules
-            SET mode = ?, trigger_type = ?, trigger_config = ?, timezone = ?, active = ?
+            SET mode = ?, selected_items = ?, trigger_type = ?, trigger_config = ?, timezone = ?, active = ?
             WHERE id = ?
-        """, (new_mode, new_trigger_type, new_trigger_config, new_tz, new_active, schedule_id))
+        """, (new_mode, new_selected, new_trigger_type, new_trigger_config, new_tz, new_active, schedule_id))
     return True
 
 

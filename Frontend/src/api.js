@@ -100,10 +100,11 @@ export function runHarvest({ connectorId, mode, items }) {
 
 // --- Catalog ---
 
-export function fetchCatalog({ search, type, connectorType } = {}) {
+export function fetchCatalog({ search, type, connectorId, connectorType } = {}) {
   const params = new URLSearchParams();
   if (search) params.set('search', search);
   if (type) params.set('type', type);
+  if (connectorId) params.set('connector_id', connectorId);
   if (connectorType) params.set('connector_type', connectorType);
   const qs = params.toString();
   return request(`/api/catalog${qs ? `?${qs}` : ''}`);
@@ -123,6 +124,13 @@ export function createS2DMapping(payload) {
   return request('/api/s2d/mappings', {
     method: 'POST',
     body: JSON.stringify(payload),
+  });
+}
+
+export function renameS2DMapping(id, name) {
+  return request(`/api/s2d/mappings/${id}`, {
+    method: 'PATCH',
+    body: JSON.stringify({ name }),
   });
 }
 

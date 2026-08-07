@@ -1,19 +1,23 @@
 import { useState } from 'react';
-import { Plug, DownloadCloud, LayoutGrid, GitCompareArrows, ListChecks, History } from 'lucide-react';
-import ConnectPage from './components/ConnectPage';
-import HarvestWizard from './components/HarvestWizard';
-import CatalogPage from './components/CatalogPage';
-import S2DPage from './components/S2DPage';
-import TestSuitesPage from './components/TestSuitesPage';
-import AnalyticsPage from './components/AnalyticsPage';
-import HistoryPage from './components/HistoryPage';
+import { Plug, DownloadCloud, LayoutGrid, Waypoints, GitCompareArrows, ListChecks, CalendarClock, History } from 'lucide-react';
+import ConnectPage from './pages/ConnectPage';
+import HarvestWizard from './pages/HarvestWizard';
+import CatalogPage from './pages/CatalogPage';
+import MappingsPage from './pages/MappingsPage';
+import S2DPage from './pages/S2DPage';
+import TestSuitesPage from './pages/TestSuitesPage';
+import SchedulesDashboard from './pages/SchedulesDashboard';
+import AnalyticsPage from './pages/AnalyticsPage';
+import HistoryPage from './pages/HistoryPage';
 import mastekLogo from './images/logo.png'
 const NAV_PAGES = [
   { id: 'connect', label: 'Connect', icon: Plug },
   { id: 'harvest', label: 'Harvest', icon: DownloadCloud },
   { id: 'catalog', label: 'Catalog', icon: LayoutGrid },
+  { id: 'mapping', label: 'Validation Layer Setup', icon: Waypoints },
   { id: 's2d', label: 'S2D Validation', icon: GitCompareArrows },
   { id: 'suites', label: 'Test Suites', icon: ListChecks },
+  { id: 'schedules', label: 'Schedules', icon: CalendarClock },
   { id: 'history', label: 'History', icon: History },
 ];
 
@@ -21,10 +25,30 @@ function App() {
   const [activePage, setActivePage] = useState('harvest');
   const [activeRunId, setActiveRunId] = useState(null);
   const [analyticsReturnTo, setAnalyticsReturnTo] = useState('s2d'); // where "back" goes from Analytics
+  // Cross-page handoff into S2D Validation: { mappingId, suiteId } to open
+  // suite-membership editing pre-targeted at that suite, or
+  // { mappingId, testCaseId } to open the edit form for that test case.
+  // Set by Test Suites page's Edit Suite / row Edit buttons. Deliberately
+  // NOT auto-cleared right after TestCasePanel consumes it - React 18
+  // StrictMode's dev-only double-mount check (mount -> unmount -> remount,
+  // to verify effects are safely re-runnable) would otherwise discard the
+  // state the first "throwaway" mount just set, with nothing left for the
+  // real second mount to pick up since the trigger was already cleared.
+  // Instead it lives here in the stable parent until the user actually
+  // navigates elsewhere via goToPage, so any StrictMode remount of the
+  // S2D subtree still sees the same focus and re-applies it identically.
+  const [s2dFocus, setS2dFocus] = useState(null);
 
   const goToPage = (id) => {
     setActiveRunId(null);
+    setS2dFocus(null);
     setActivePage(id);
+  };
+
+  const goToS2DWithFocus = (focus) => {
+    setActiveRunId(null);
+    setS2dFocus(focus);
+    setActivePage('s2d');
   };
 
   const handleRunComplete = (runId) => {
@@ -59,12 +83,27 @@ function App() {
     content = <HarvestWizard />;
   } else if (activePage === 'catalog') {
     content = <CatalogPage />;
+  } else if (activePage === 'mapping') {
+    content = <MappingsPage />;
   } else if (activePage === 'history') {
     content = <HistoryPage onOpenRun={handleOpenRunFromHistory} />;
   } else if (activePage === 'suites') {
-    content = <TestSuitesPage onNavigateToRun={handleRunComplete} />;
+    content = (
+      <TestSuitesPage
+        onNavigateToRun={handleRunComplete}
+        onEditSuite={(mappingId, suiteId) => goToS2DWithFocus({ mappingId, suiteId })}
+        onEditTestCase={(mappingId, testCaseId) => goToS2DWithFocus({ mappingId, testCaseId })}
+      />
+    );
+  } else if (activePage === 'schedules') {
+    content = <SchedulesDashboard />;
   } else {
-    content = <S2DPage onNavigateToRun={handleRunComplete} />;
+    content = (
+      <S2DPage
+        onNavigateToRun={handleRunComplete}
+        focus={s2dFocus}
+      />
+    );
   }
 
   return (

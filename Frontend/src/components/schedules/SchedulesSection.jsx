@@ -1,27 +1,10 @@
 import { useEffect, useState } from 'react';
 import {
   CalendarClock, Plus, Trash2, Loader2, AlertCircle, CheckCircle2,
-  X, ChevronDown, ChevronRight,
+  X, ChevronDown, ChevronRight, Pencil, RefreshCw,
 } from 'lucide-react';
 import SchedulePicker from './SchedulePicker';
-
-function humanizeTrigger(sched) {
-  if (sched.trigger_type === 'interval') {
-    const s = sched.trigger_config?.seconds || 0;
-    if (s % 3600 === 0) return `Every ${s / 3600}h`;
-    if (s % 60 === 0) return `Every ${s / 60}m`;
-    return `Every ${s}s`;
-  }
-  const expr = sched.trigger_config?.expression || '';
-  return `cron: ${expr} (${sched.timezone || 'UTC'})`;
-}
-
-const STATUS_STYLES = {
-  ran:       'bg-mastek-success/10 text-mastek-success',
-  coalesced: 'bg-amber-100 text-amber-700',
-  missed:    'bg-amber-100 text-amber-700',
-  errored:   'bg-red-100 text-red-700',
-};
+import { humanizeTrigger, STATUS_STYLES } from '../../scheduleFormat';
 
 export default function SchedulesSection({
   parentId,
@@ -31,6 +14,10 @@ export default function SchedulesSection({
   remove,
   fetchEvents,
   createExtras, // optional: object passed into create payload (e.g. { mode: 'incremental' } for harvest)
+  createDisabledReason, // optional: if set, blocks Add Schedule and shows this reason
+  headerHint, // optional: extra note shown next to the section header
+  onRefreshSelection, // optional (harvest only): async (schedule) -> void — reconcile stored items with live source
+  showItemCount, // optional (harvest only): render "N items" per row when selected_items is set
 }) {
   const [schedules, setSchedules] = useState([]);
   const [isLoading, setIsLoading] = useState(true);
@@ -41,6 +28,9 @@ export default function SchedulesSection({
   const [expandedId, setExpandedId] = useState(null);
   const [events, setEvents] = useState({}); // scheduleId -> events[]
   const [refreshTick, setRefreshTick] = useState(0);
+  const [editingId, setEditingId] = useState(null);
+  const [editValue, setEditValue] = useState(null);
+  const [refreshingId, setRefreshingId] = useState(null);
 
   useEffect(() => {
     if (!parentId) return;
@@ -98,6 +88,49 @@ export default function SchedulesSection({
     }
   };
 
+  const startEdit = (sched) => {
+    setEditingId(sched.id);
+    setEditValue({
+      trigger_type: sched.trigger_type,
+      trigger_config: sched.trigger_config,
+      timezone: sched.timezone || 'UTC',
+    });
+  };
+
+  const cancelEdit = () => {
+    setEditingId(null);
+    setEditValue(null);
+  };
+
+  const saveEdit = async (schedId) => {
+    if (!editValue) return;
+    setIsSaving(true);
+    setError(null);
+    try {
+      await update(schedId, editValue);
+      cancelEdit();
+      reload();
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setIsSaving(false);
+    }
+  };
+
+  const handleRefresh = async (sched) => {
+    if (!onRefreshSelection) return;
+    setRefreshingId(sched.id);
+    setError(null);
+    try {
+      await onRefreshSelection(sched);
+      reload();
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setRefreshingId(null);
+    }
+  };
+
   const handleExpand = async (sched) => {
     if (expandedId === sched.id) { setExpandedId(null); return; }
     setExpandedId(sched.id);
@@ -121,12 +154,18 @@ export default function SchedulesSection({
         {!isAdding && (
           <button
             onClick={() => { setIsAdding(true); setPickerValue(null); }}
-            className="flex items-center gap-1 px-2.5 py-1 text-xs font-medium text-mastek-primary border border-mastek-primary/40 rounded-md hover:bg-mastek-primary/10"
+            disabled={!!createDisabledReason}
+            title={createDisabledReason || undefined}
+            className="flex items-center gap-1 px-2.5 py-1 text-xs font-medium text-mastek-primary border border-mastek-primary/40 rounded-md hover:bg-mastek-primary/10 disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:bg-transparent"
           >
             <Plus className="w-3.5 h-3.5" /> Add Schedule
           </button>
         )}
       </div>
+
+      {(createDisabledReason || headerHint) && !isAdding && (
+        <p className="text-xs text-slate-500 -mt-1 mb-2 italic">{createDisabledReason || headerHint}</p>
+      )}
 
       {error && (
         <div className="mb-2 flex items-start gap-2 rounded-md border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700">
@@ -179,6 +218,9 @@ export default function SchedulesSection({
                     <div className="text-sm text-slate-800 truncate">{humanizeTrigger(sched)}</div>
                     <div className="text-xs text-slate-500 truncate">
                       {nextFire ? <>Next: <span className="font-mono">{new Date(nextFire).toLocaleString()}</span></> : (sched.active ? '—' : 'Inactive')}
+                      {showItemCount && Array.isArray(sched.selected_items) && (
+                        <span className="ml-2 text-slate-400">· {sched.selected_items.length} item{sched.selected_items.length === 1 ? '' : 's'}</span>
+                      )}
                     </div>
                   </div>
                   {sched.last_status && (
@@ -204,6 +246,25 @@ export default function SchedulesSection({
                       sched.active ? 'translate-x-4' : 'translate-x-0.5'
                     }`} />
                   </button>
+                  {onRefreshSelection && (
+                    <button
+                      onClick={() => handleRefresh(sched)}
+                      disabled={refreshingId === sched.id}
+                      className="p-1 text-slate-400 hover:text-mastek-primary hover:bg-mastek-primary/10 rounded shrink-0 disabled:opacity-50"
+                      title="Refresh selection from source (add any newly-created items)"
+                    >
+                      {refreshingId === sched.id
+                        ? <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                        : <RefreshCw className="w-3.5 h-3.5" />}
+                    </button>
+                  )}
+                  <button
+                    onClick={() => startEdit(sched)}
+                    className="p-1 text-slate-400 hover:text-mastek-primary hover:bg-mastek-primary/10 rounded shrink-0"
+                    title="Edit trigger"
+                  >
+                    <Pencil className="w-3.5 h-3.5" />
+                  </button>
                   <button
                     onClick={() => handleDelete(sched.id)}
                     className="p-1 text-slate-400 hover:text-red-600 hover:bg-red-50 rounded shrink-0"
@@ -212,6 +273,28 @@ export default function SchedulesSection({
                     <Trash2 className="w-3.5 h-3.5" />
                   </button>
                 </div>
+
+                {editingId === sched.id && (
+                  <div className="border-t border-slate-100 px-3 py-3 bg-slate-50">
+                    <SchedulePicker value={editValue} onChange={setEditValue} />
+                    <div className="flex items-center justify-end gap-2 mt-3 pt-3 border-t border-slate-200">
+                      <button
+                        onClick={cancelEdit}
+                        className="px-3 py-1.5 text-sm font-medium text-slate-600 border border-slate-300 rounded-md hover:bg-slate-50"
+                      >
+                        Cancel
+                      </button>
+                      <button
+                        onClick={() => saveEdit(sched.id)}
+                        disabled={isSaving || !editValue}
+                        className="flex items-center gap-1.5 px-3 py-1.5 text-sm font-medium text-white bg-mastek-primary rounded-md hover:bg-mastek-primary-dark disabled:opacity-50 disabled:cursor-not-allowed"
+                      >
+                        {isSaving ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <CheckCircle2 className="w-3.5 h-3.5" />}
+                        Save Changes
+                      </button>
+                    </div>
+                  </div>
+                )}
                 {isOpen && (
                   <div className="border-t border-slate-100 px-3 py-2 bg-slate-50">
                     <div className="text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-1">Recent events</div>

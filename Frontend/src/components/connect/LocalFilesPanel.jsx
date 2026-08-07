@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { UploadCloud, FileText, Trash2, Loader2, AlertCircle } from 'lucide-react';
-import { fetchLocalFiles, uploadLocalFile, deleteLocalFile } from '../api';
+import { fetchLocalFiles, uploadLocalFile, deleteLocalFile } from '../../api';
 
 export default function LocalFilesPanel({ connector }) {
   const [files, setFiles] = useState([]);

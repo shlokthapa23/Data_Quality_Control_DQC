@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { X, Loader2, ChevronDown, ChevronRight } from 'lucide-react';
-import { fetchCatalogAsset } from '../api';
+import { fetchCatalogAsset } from '../../api';
 
 function ExpandableTable({ table }) {
   const [open, setOpen] = useState(false);

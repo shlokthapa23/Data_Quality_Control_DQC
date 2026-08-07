@@ -58,5 +58,10 @@
 5. Learn → tasks/lessons.md after corrections
  
 ## LEARNED
- 
-(Claude fills this in over time)
+
+- **Effects that clear one-shot/handoff state must not do so in the same pass that consumes it.** React 18 StrictMode double-mounts in dev; clearing a trigger right after reading it means the throwaway first mount eats it before the real mount runs. Clear it only on an unambiguous, unrelated user action instead.
+- **Lint errors are real signal, not noise** — `no-use-before-define`, etc. have caught genuine ordering bugs in this codebase. Fix by reordering/restructuring, never by suppressing.
+- **Schema migrations are additive-only.** `ALTER TABLE ADD COLUMN` + backfill. Never drop-and-recreate for a shape change — rejected outright once already, don't reintroduce it.
+- **Never assume "the first item the API returns" is disposable test fixture material**, especially mid-session while the user is doing real work in parallel. Print the full list, read names, and build a dedicated obviously-named throwaway object for any destructive verification.
+- **Verification means proving it against real data**, not just a clean compile/lint pass — curl the live route, check the actual DB rows, or drive the real browser session before marking a feature done.
+- Full lesson-by-lesson detail lives in `tasks/lessons.md` — read it every session start, this section is just the durable rollup.

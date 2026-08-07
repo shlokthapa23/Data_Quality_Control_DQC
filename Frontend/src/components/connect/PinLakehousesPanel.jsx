@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { Database, Loader2, CheckCircle2, AlertCircle } from 'lucide-react';
-import { fetchAllLakehouses, pinConnectorContainers } from '../api';
+import { fetchAllLakehouses, pinConnectorContainers } from '../../api';
 
 export default function PinLakehousesPanel({ connector, onPinned }) {
   const [lakehouses, setLakehouses] = useState([]);

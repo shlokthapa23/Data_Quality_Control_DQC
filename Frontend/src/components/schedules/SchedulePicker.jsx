@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { Clock, Calendar, ChevronDown, AlertCircle, Loader2 } from 'lucide-react';
-import { previewSchedule } from '../api';
+import { previewSchedule } from '../../api';
 
 // Cron under the hood for everything. Presets are just canned expressions.
 // The preset dropdown says the "browser TZ" label but the actual timezone

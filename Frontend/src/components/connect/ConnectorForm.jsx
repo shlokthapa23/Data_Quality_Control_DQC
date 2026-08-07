@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { Plug, HardDrive, CheckCircle2, XCircle, Loader2 } from 'lucide-react';
-import { createConnector, testConnectorDraft } from '../api';
+import { createConnector, testConnectorDraft } from '../../api';
 
 const EMPTY_FABRIC_FORM = {
   name: '', tenant_id: '', client_id: '', client_secret: '', workspace_id: '',

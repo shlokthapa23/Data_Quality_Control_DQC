@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
-import { Search, RefreshCw, Loader2 } from 'lucide-react';
-import { fetchCatalog } from '../api';
-import AssetDetailModal from './AssetDetailModal';
+import { Search, RefreshCw, Loader2, Plug } from 'lucide-react';
+import { fetchCatalog, fetchConnectors } from '../api';
+import AssetDetailModal from '../components/catalog/AssetDetailModal';
 
 const TYPE_BADGE_COLOR = {
   Lakehouse: 'bg-emerald-100 text-emerald-700',
@@ -12,6 +12,8 @@ const TYPE_BADGE_COLOR = {
 };
 
 export default function CatalogPage() {
+  const [connectors, setConnectors] = useState([]);
+  const [connectorId, setConnectorId] = useState('');
   const [assets, setAssets] = useState([]);
   const [search, setSearch] = useState('');
   const [typeFilter, setTypeFilter] = useState(null);
@@ -19,9 +21,17 @@ export default function CatalogPage() {
   const [error, setError] = useState(null);
   const [selectedAssetId, setSelectedAssetId] = useState(null);
 
+  useEffect(() => {
+    fetchConnectors().then((data) => {
+      setConnectors(data);
+      if (data.length > 0) setConnectorId(data[0].id);
+    });
+  }, []);
+
   const load = () => {
+    if (!connectorId) { setAssets([]); setIsLoading(false); return; }
     setIsLoading(true);
-    fetchCatalog({ search, type: typeFilter })
+    fetchCatalog({ search, type: typeFilter, connectorId })
       .then((data) => {
         setAssets(data.assets);
         setIsLoading(false);
@@ -32,7 +42,7 @@ export default function CatalogPage() {
       });
   };
 
-  useEffect(load, [search, typeFilter]);
+  useEffect(load, [search, typeFilter, connectorId]);
 
   const typeCounts = assets.reduce((acc, a) => {
     acc[a.type] = (acc[a.type] || 0) + 1;
@@ -52,6 +62,22 @@ export default function CatalogPage() {
           <RefreshCw className="w-3.5 h-3.5" /> Refresh
         </button>
       </div>
+
+      <label className="flex items-center gap-3 mb-4 max-w-sm">
+        <span className="text-xs font-bold text-slate-400 uppercase tracking-wider shrink-0 flex items-center gap-1.5">
+          <Plug className="w-3.5 h-3.5" /> Connector
+        </span>
+        <select
+          value={connectorId}
+          onChange={(e) => setConnectorId(e.target.value)}
+          className="flex-1 px-2.5 py-1.5 text-sm border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+        >
+          {connectors.length === 0 && <option value="">No connectors configured</option>}
+          {connectors.map((c) => (
+            <option key={c.id} value={c.id}>{c.name}</option>
+          ))}
+        </select>
+      </label>
 
       <div className="flex items-center gap-3 mb-4">
         <div className="relative flex-1 max-w-sm">

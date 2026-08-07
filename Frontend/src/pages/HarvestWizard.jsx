@@ -1,14 +1,14 @@
 import { useEffect, useState } from 'react';
 import {
   Database, Table2, FileText, BarChart3, NotebookText, Folder,
-  Loader2, AlertCircle, CheckCircle2, DownloadCloud,
+  Loader2, AlertCircle, CheckCircle2, DownloadCloud, RefreshCw,
 } from 'lucide-react';
 import {
   fetchConnectors, fetchConnectorItems, runHarvest,
   fetchHarvestSchedules, createHarvestSchedule, updateHarvestSchedule,
   deleteHarvestSchedule, fetchHarvestScheduleEvents,
 } from '../api';
-import SchedulesSection from './SchedulesSection';
+import SchedulesSection from '../components/schedules/SchedulesSection';
 
 const CATEGORY_ICON = {
   Lakehouse: Database,
@@ -72,6 +72,29 @@ export default function HarvestWizard() {
       });
   }, [connectorId]);
 
+  const [refreshedNote, setRefreshedNote] = useState(null);
+  const handleRefreshAssets = async () => {
+    if (!connectorId) return;
+    setIsLoadingItems(true);
+    setItemsError(null);
+    setRefreshedNote(null);
+    try {
+      const data = await fetchConnectorItems(connectorId);
+      const prevIds = new Set(items.map((i) => i.id));
+      const newlyDiscovered = (data.items || []).filter((i) => !prevIds.has(i.id));
+      setItems(data.items);
+      setRefreshedNote(
+        newlyDiscovered.length === 0
+          ? 'Up to date — nothing new since last load.'
+          : `Found ${newlyDiscovered.length} new asset${newlyDiscovered.length === 1 ? '' : 's'}: ${newlyDiscovered.slice(0, 4).map((i) => i.name).join(', ')}${newlyDiscovered.length > 4 ? '…' : ''}`
+      );
+    } catch (err) {
+      setItemsError(err.message);
+    } finally {
+      setIsLoadingItems(false);
+    }
+  };
+
   const toggleItem = (item) => {
     setCheckedKeys((prev) => {
       const next = new Set(prev);
@@ -107,32 +130,35 @@ export default function HarvestWizard() {
         </p>
 
         {/* Step 1: connector */}
-        <label className="block mb-5">
-          <span className="block text-xs font-medium text-slate-500 mb-1">Connector</span>
-          <select
-            value={connectorId}
-            onChange={(e) => setConnectorId(e.target.value)}
-            className="w-full px-3 py-2 text-sm border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+        <div className="flex items-end gap-2 mb-5">
+          <label className="block flex-1 min-w-0">
+            <span className="block text-xs font-medium text-slate-500 mb-1">Connector</span>
+            <select
+              value={connectorId}
+              onChange={(e) => setConnectorId(e.target.value)}
+              className="w-full px-3 py-2 text-sm border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+            >
+              {connectors.length === 0 && <option value="">No connectors configured</option>}
+              {connectors.map((c) => (
+                <option key={c.id} value={c.id}>{c.name}</option>
+              ))}
+            </select>
+          </label>
+          <button
+            onClick={handleRefreshAssets}
+            disabled={!connectorId || isLoadingItems}
+            title="Re-check the workspace for new lakehouses, notebooks, or other assets since this list was loaded"
+            className="flex items-center gap-1.5 px-3 py-2 text-sm font-medium text-slate-600 border border-slate-300 rounded-lg hover:bg-slate-50 disabled:opacity-50 disabled:cursor-not-allowed shrink-0"
           >
-            {connectors.length === 0 && <option value="">No connectors configured</option>}
-            {connectors.map((c) => (
-              <option key={c.id} value={c.id}>{c.name}</option>
-            ))}
-          </select>
-        </label>
+            <RefreshCw className={`w-3.5 h-3.5 ${isLoadingItems ? 'animate-spin' : ''}`} />
+            Refresh
+          </button>
+        </div>
 
-        {/* Schedules for this connector — harvests everything visible at fire time */}
-        {connectorId && (
-          <SchedulesSection
-            parentId={connectorId}
-            kind="harvest"
-            fetchList={fetchHarvestSchedules}
-            create={createHarvestSchedule}
-            update={updateHarvestSchedule}
-            remove={deleteHarvestSchedule}
-            fetchEvents={fetchHarvestScheduleEvents}
-            createExtras={{ mode: 'incremental' }}
-          />
+        {refreshedNote && (
+          <div className="flex items-center gap-2 text-xs text-slate-500 -mt-3 mb-4">
+            <CheckCircle2 className="w-3.5 h-3.5 text-mastek-success shrink-0" /> {refreshedNote}
+          </div>
         )}
 
         {/* Step 2: choose assets */}
@@ -231,6 +257,48 @@ export default function HarvestWizard() {
               </div>
             )}
           </div>
+        )}
+
+        {/* Schedules — freeze the current selection into a recurring harvest */}
+        {connectorId && (
+          <SchedulesSection
+            parentId={connectorId}
+            fetchList={fetchHarvestSchedules}
+            create={createHarvestSchedule}
+            update={updateHarvestSchedule}
+            remove={deleteHarvestSchedule}
+            fetchEvents={fetchHarvestScheduleEvents}
+            createExtras={{
+              mode,
+              selected_items: items
+                .filter((i) => checkedKeys.has(i.id))
+                .map((i) => ({ id: i.id, name: i.name, type: i.type })),
+            }}
+            createDisabledReason={selectedCount === 0 ? 'Check at least one asset above — the schedule will harvest exactly those items on each fire.' : null}
+            headerHint={selectedCount > 0 ? `New schedule will freeze the current ${selectedCount} selected item${selectedCount === 1 ? '' : 's'}.` : null}
+            showItemCount
+            onRefreshSelection={async (sched) => {
+              const live = await fetchConnectorItems(connectorId);
+              const liveItems = live.items || [];
+              const storedIds = new Set((sched.selected_items || []).map((i) => i.id));
+              const newlyDiscovered = liveItems.filter((i) => !storedIds.has(i.id));
+              if (newlyDiscovered.length === 0) {
+                alert('Selection is already up to date — no new items discovered since this schedule was created.');
+                return;
+              }
+              const preview = newlyDiscovered.slice(0, 8).map((i) => `  • ${i.type}: ${i.name}`).join('\n');
+              const more = newlyDiscovered.length > 8 ? `\n  … and ${newlyDiscovered.length - 8} more` : '';
+              const ok = confirm(
+                `${newlyDiscovered.length} new item(s) discovered since this schedule was created:\n\n${preview}${more}\n\nAdd them to the schedule?`
+              );
+              if (!ok) return;
+              const merged = [
+                ...(sched.selected_items || []),
+                ...newlyDiscovered.map((i) => ({ id: i.id, name: i.name, type: i.type })),
+              ];
+              await updateHarvestSchedule(sched.id, { selected_items: merged });
+            }}
+          />
         )}
       </div>
     </div>

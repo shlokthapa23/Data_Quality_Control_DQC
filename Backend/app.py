@@ -127,11 +127,18 @@ def test_connector(connector_id):
     return jsonify({"ok": ok, "message": message}), (200 if ok else 502)
 
 
+HARVEST_VISIBLE_FABRIC_TYPES = {"Lakehouse", "Warehouse", "DataPipeline"}
+
+
 @app.route('/api/connectors/<connector_id>/items', methods=['GET'])
 def get_connector_items(connector_id):
-    """Full, unrestricted live browse - powers the Harvest wizard's checkbox tree."""
+    """Powers the Harvest wizard's checkbox tree. For Fabric connectors, only
+    surfaces the item types testers actually validate against (Lakehouse,
+    Warehouse, DataPipeline) - Reports/SemanticModels/Notebooks/etc are real
+    workspace items but not ones a tester harvests metadata for here. Local
+    connectors are untouched (their items aren't Fabric-typed at all)."""
     try:
-        _, connector = get_connector_instance(connector_id)
+        config, connector = get_connector_instance(connector_id)
     except KeyError as e:
         return jsonify({"error": str(e)}), 404
     except ValueError as e:
@@ -139,6 +146,8 @@ def get_connector_items(connector_id):
 
     try:
         items = connector.list_items()
+        if config.get("type") == "fabric":
+            items = [i for i in items if i.type in HARVEST_VISIBLE_FABRIC_TYPES]
         return jsonify({"items": [i.to_dict() for i in items]})
     except Exception as e:
         return jsonify({"error": "Failed to list items", "details": str(e)}), 502
@@ -311,7 +320,7 @@ def harvest_route():
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
 
-    result = run_harvest(connector, config["name"], items, mode=mode)
+    result = run_harvest(connector, connector_id, config["name"], items, mode=mode)
     return jsonify(result)
 
 
@@ -319,10 +328,11 @@ def harvest_route():
 
 @app.route('/api/catalog', methods=['GET'])
 def get_catalog():
+    connector_id = request.args.get('connector_id')
     connector_type = request.args.get('connector_type')
     asset_type = request.args.get('type')
     search = request.args.get('search')
-    assets = catalog_db.list_assets(connector_type=connector_type, asset_type=asset_type, search=search)
+    assets = catalog_db.list_assets(connector_id=connector_id, connector_type=connector_type, asset_type=asset_type, search=search)
     return jsonify({"assets": assets})
 
 
@@ -390,8 +400,29 @@ def create_s2d_mapping():
     return jsonify({"id": mapping_id}), 201
 
 
+@app.route('/api/s2d/mappings/<mapping_id>', methods=['PATCH'])
+def rename_s2d_mapping(mapping_id):
+    if not s2d_db.get_mapping(mapping_id):
+        return jsonify({"error": "Mapping not found"}), 404
+    body = request.get_json(force=True) or {}
+    name = (body.get("name") or "").strip()
+    if not name:
+        return jsonify({"error": "name is required"}), 400
+    s2d_db.rename_mapping(mapping_id, name)
+    return jsonify(s2d_db.get_mapping(mapping_id))
+
+
 @app.route('/api/s2d/mappings/<mapping_id>', methods=['DELETE'])
 def delete_s2d_mapping(mapping_id):
+    # Deregister any live APScheduler jobs for this mapping's suites BEFORE
+    # the cascade delete removes the rows they point to - otherwise the job
+    # stays scheduled in memory and fires forever against a suite that can
+    # never be found again (s2d_db.delete_mapping can't do this itself:
+    # scheduler.py already imports s2d.db, so the reverse import would be
+    # circular).
+    for suite in s2d_db.list_suites(mapping_id=mapping_id):
+        for schedule in s2d_db.list_suite_schedules(suite_id=suite["id"]):
+            _scheduler.remove_suite_schedule_job(schedule["id"])
     s2d_db.delete_mapping(mapping_id)
     return jsonify({"deleted": mapping_id})
 
@@ -713,6 +744,18 @@ def ai_suggest_rules(mapping_id):
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
 
+    # Raw SQL is too fuzzy to compare token-for-token across repeat AI
+    # calls, so existing rule NAMES for this exact target+table are the
+    # practical dedup key here - the AI tends to reuse the same short name
+    # when it reconverges on the same idea (low temperature + same sample).
+    existing_names = {
+        tc["name"].strip().lower()
+        for tc in s2d_db.list_test_cases(mapping_id)
+        if tc["check_type"] == "sql" and tc.get("check_scope") == "single_side"
+        and tc.get("target") == target and (tc.get("target_tables") or [tc.get("target_table")]) == [table_name]
+    }
+    already_covered_text = "\n".join(f"- {n}" for n in sorted(existing_names)) if existing_names else ""
+
     try:
         schema = connector.list_tables_in_container(container_id)
         table_entry = next((t for t in schema if t["table"] == table_name), None)
@@ -720,7 +763,7 @@ def ai_suggest_rules(mapping_id):
             return jsonify({"error": f"Table '{table_name}' not found in this container"}), 404
 
         sample = connector.sample_rows(container_id, table_name, limit=20)
-        rules = generate_rules_from_sample(table_name, table_entry["columns"], sample)
+        rules = generate_rules_from_sample(table_name, table_entry["columns"], sample, already_covered_text=already_covered_text)
     except Exception as e:
         print(f"AI rule suggestion error: {e}")
         return jsonify({"error": "AI rule suggestion failed", "details": str(e)}), 502
@@ -728,11 +771,16 @@ def ai_suggest_rules(mapping_id):
     created = []
     skipped = []
     for rule in rules:
+        name = rule.get("name", "unnamed")
         script_text = rule.get("script_text", "")
+
+        if name.strip().lower() in existing_names:
+            skipped.append({"name": name, "reason": "Duplicate of an existing rule"})
+            continue
         try:
             validate_select_only(script_text)
         except ValueError as e:
-            skipped.append({"name": rule.get("name", "unnamed"), "reason": str(e)})
+            skipped.append({"name": name, "reason": str(e)})
             continue
 
         test_case_id = s2d_db.create_test_case(
@@ -743,8 +791,12 @@ def ai_suggest_rules(mapping_id):
             origin="ai", severity=rule.get("severity", "error"), description=rule.get("description"),
         )
         created.append(s2d_db.get_test_case(test_case_id))
+        existing_names.add(name.strip().lower())  # guard against the AI proposing the same name twice in one batch
 
-    return jsonify({"created": created, "skipped": skipped})
+    response = {"created": created, "skipped": skipped}
+    if not created and rules:
+        response["message"] = "The AI didn't find anything new to suggest — every rule it proposed already exists. Try a different table, or add one manually."
+    return jsonify(response)
 
 
 @app.route('/api/s2d/mappings/<mapping_id>/ai/suggest-parity-rules', methods=['POST'])
@@ -798,9 +850,28 @@ def ai_suggest_parity_rules(mapping_id):
         source_sample = source_connector.sample_rows(mapping["source_container_id"], first_source_table, limit=20)
         destination_sample = destination_connector.sample_rows(mapping["destination_container_id"], first_destination_table, limit=20)
 
+        # Signature = (source tables, source column, destination tables,
+        # destination column, validation type) for every existing
+        # column_parity rule - this is what actually guarantees no
+        # duplicates get saved, independent of whether the AI cooperates
+        # with the prompt-level nudge below.
+        existing_signatures = {
+            (
+                tuple(sorted(tc.get("source_tables") or [])), tc.get("source_column"),
+                tuple(sorted(tc.get("destination_tables") or [])), tc.get("destination_column"),
+                tc.get("validation_type"),
+            )
+            for tc in s2d_db.list_test_cases(mapping_id)
+            if tc["check_type"] == "column_parity"
+        }
+        already_covered_text = "\n".join(
+            f"- {sig[1]} (source) <-> {sig[3]} (destination): {sig[4]}" for sig in sorted(existing_signatures, key=lambda s: (s[1] or "", s[3] or ""))
+        ) if existing_signatures else ""
+
         rules = generate_parity_rules_from_samples(
             first_source_table, source_entries[first_source_table]["columns"], source_sample,
             first_destination_table, destination_entries[first_destination_table]["columns"], destination_sample,
+            already_covered_text=already_covered_text,
         )
     except Exception as e:
         print(f"AI parity rule suggestion error: {e}")
@@ -834,6 +905,15 @@ def ai_suggest_parity_rules(mapping_id):
             skipped.append({"name": name, "reason": f"destination_column '{destination_column}' isn't common to every selected destination table"})
             continue
 
+        signature = (
+            tuple(sorted(source_tables)), source_column,
+            tuple(sorted(destination_tables)), destination_column,
+            validation_type,
+        )
+        if signature in existing_signatures:
+            skipped.append({"name": name, "reason": "Duplicate of an existing rule"})
+            continue
+
         test_case_id = s2d_db.create_test_case(
             mapping_id=mapping_id, name=name, validation_type=validation_type, check_type="column_parity",
             source_tables=source_tables, source_column=source_column,
@@ -841,8 +921,12 @@ def ai_suggest_parity_rules(mapping_id):
             origin="ai", severity=rule.get("severity", "error"), description=rule.get("description"),
         )
         created.append(s2d_db.get_test_case(test_case_id))
+        existing_signatures.add(signature)  # guard against the AI proposing the same pair twice in one batch
 
-    return jsonify({"created": created, "skipped": skipped})
+    response = {"created": created, "skipped": skipped}
+    if not created and rules:
+        response["message"] = "The AI didn't find any new column pair to suggest — every rule it proposed already exists. Try different tables, or add one manually."
+    return jsonify(response)
 
 
 @app.route('/api/s2d/mappings/<mapping_id>/ai/suggest-cross-table-parity-rules', methods=['POST'])
@@ -897,9 +981,27 @@ def ai_suggest_cross_table_parity_rules(mapping_id):
         source_sample = source_connector.sample_rows(mapping["source_container_id"], first_source_table, limit=20)
         destination_sample = destination_connector.sample_rows(mapping["destination_container_id"], first_destination_table, limit=20)
 
+        # Signature = (source tables, destination tables, key column) for
+        # every existing cross_table_parity rule - guarantees no duplicates
+        # get saved regardless of whether the AI cooperates with the
+        # prompt-level nudge below.
+        existing_signatures = {
+            (
+                tuple(sorted(tc.get("source_target_tables") or [])),
+                tuple(sorted(tc.get("destination_target_tables") or [])),
+                tc.get("key_column"),
+            )
+            for tc in s2d_db.list_test_cases(mapping_id)
+            if tc["check_type"] == "sql" and tc.get("check_scope") == "cross_table_parity"
+        }
+        already_covered_text = "\n".join(
+            f"- key column: {sig[2]}" for sig in sorted(existing_signatures, key=lambda s: s[2] or "")
+        ) if existing_signatures else ""
+
         rules = generate_key_column_suggestions_from_samples(
             first_source_table, source_entries[first_source_table]["columns"], source_sample,
             first_destination_table, destination_entries[first_destination_table]["columns"], destination_sample,
+            already_covered_text=already_covered_text,
         )
     except Exception as e:
         print(f"AI cross-table parity rule suggestion error: {e}")
@@ -928,6 +1030,11 @@ def ai_suggest_cross_table_parity_rules(mapping_id):
             skipped.append({"name": name, "reason": f"key_column '{key_column}' isn't common to every selected destination table"})
             continue
 
+        signature = (tuple(sorted(source_tables)), tuple(sorted(destination_tables)), key_column)
+        if signature in existing_signatures:
+            skipped.append({"name": name, "reason": "Duplicate of an existing rule"})
+            continue
+
         test_case_id = s2d_db.create_test_case(
             mapping_id=mapping_id, name=name, validation_type="Custom", check_type="sql",
             check_scope="cross_table_parity", key_column=key_column,
@@ -935,8 +1042,12 @@ def ai_suggest_cross_table_parity_rules(mapping_id):
             origin="ai", severity=rule.get("severity", "error"), description=rule.get("description"),
         )
         created.append(s2d_db.get_test_case(test_case_id))
+        existing_signatures.add(signature)  # guard against the AI proposing the same key twice in one batch
 
-    return jsonify({"created": created, "skipped": skipped})
+    response = {"created": created, "skipped": skipped}
+    if not created and rules:
+        response["message"] = "The AI didn't find any new key column to suggest — every rule it proposed already exists. Try different tables, or add one manually."
+    return jsonify(response)
 
 
 # --- S2D: Test suites -------------------------------------------------------
@@ -961,16 +1072,17 @@ def create_s2d_suite(mapping_id):
 
     if not name:
         return jsonify({"error": "name is required"}), 400
-    if not isinstance(test_case_ids, list) or not test_case_ids:
-        return jsonify({"error": "test_case_ids must be a non-empty list"}), 400
+    if not isinstance(test_case_ids, list):
+        return jsonify({"error": "test_case_ids must be a list"}), 400
 
     if not s2d_db.get_mapping(mapping_id):
         return jsonify({"error": "Mapping not found"}), 404
 
-    mapping_test_case_ids = {tc["id"] for tc in s2d_db.list_test_cases(mapping_id)}
-    invalid = [tc_id for tc_id in test_case_ids if tc_id not in mapping_test_case_ids]
-    if invalid:
-        return jsonify({"error": f"test_case_ids do not belong to this mapping: {invalid}"}), 400
+    if test_case_ids:
+        mapping_test_case_ids = {tc["id"] for tc in s2d_db.list_test_cases(mapping_id)}
+        invalid = [tc_id for tc_id in test_case_ids if tc_id not in mapping_test_case_ids]
+        if invalid:
+            return jsonify({"error": f"test_case_ids do not belong to this mapping: {invalid}"}), 400
 
     suite_id = s2d_db.create_suite(mapping_id, name, description, test_case_ids)
     return jsonify({"id": suite_id}), 201
@@ -1205,6 +1317,23 @@ def list_harvest_schedules_route(connector_id):
     return jsonify(schedules)
 
 
+def _validate_selected_items(items):
+    """Returns (error, cleaned_list) — a list of {id, name, type} dicts."""
+    if not isinstance(items, list) or not items:
+        return "selected_items must be a non-empty list", None
+    cleaned = []
+    for it in items:
+        if not isinstance(it, dict):
+            return "each selected_items entry must be an object with id/name/type", None
+        item_id = it.get("id")
+        item_type = it.get("type")
+        item_name = it.get("name")
+        if not item_id or not item_type:
+            return "each selected_items entry must have id and type", None
+        cleaned.append({"id": str(item_id), "name": item_name, "type": str(item_type)})
+    return None, cleaned
+
+
 @app.route('/api/connectors/<connector_id>/schedules', methods=['POST'])
 def create_harvest_schedule_route(connector_id):
     if not catalog_db.get_connector_config(connector_id):
@@ -1217,7 +1346,15 @@ def create_harvest_schedule_route(connector_id):
     mode = body.get("mode") or "incremental"
     if mode not in ("incremental", "full_refresh"):
         return jsonify({"error": "mode must be 'incremental' or 'full_refresh'"}), 400
-    schedule_id = s2d_db.create_harvest_schedule(connector_id, mode, trigger_type, trigger_config, timezone_name)
+
+    items_err, selected_items = _validate_selected_items(body.get("selected_items"))
+    if items_err:
+        return jsonify({"error": items_err}), 400
+
+    schedule_id = s2d_db.create_harvest_schedule(
+        connector_id, mode, trigger_type, trigger_config, timezone_name,
+        selected_items=selected_items,
+    )
     row = s2d_db.get_harvest_schedule(schedule_id)
     try:
         _scheduler.add_harvest_schedule_job(row)
@@ -1248,6 +1385,12 @@ def update_harvest_schedule_route(schedule_id):
         if err:
             return jsonify({"error": err}), 400
 
+    selected_items_arg = None
+    if "selected_items" in body:
+        items_err, selected_items_arg = _validate_selected_items(body["selected_items"])
+        if items_err:
+            return jsonify({"error": items_err}), 400
+
     s2d_db.update_harvest_schedule(
         schedule_id,
         mode=body.get("mode"),
@@ -1255,6 +1398,7 @@ def update_harvest_schedule_route(schedule_id):
         trigger_config=body.get("trigger_config"),
         timezone_name=body.get("timezone"),
         active=body.get("active"),
+        selected_items=selected_items_arg,
     )
     updated = s2d_db.get_harvest_schedule(schedule_id)
     _scheduler.remove_harvest_schedule_job(schedule_id)

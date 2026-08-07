@@ -65,25 +65,58 @@ def init_db():
         except sqlite3.OperationalError:
             pass  # column already exists
 
+        # Additive migration: harvested_assets gained connector_id so Catalog
+        # can scope to one specific connector instance, not just a type -
+        # needed once a second connector of the same type (e.g. a second
+        # Fabric workspace) exists, since connector_type alone can't tell
+        # them apart. The primary key scheme deliberately stays
+        # f"{connector_type}:{source_item_id}" (unchanged) - switching it to
+        # include connector_id would rewrite every existing asset's id (used
+        # in URLs and AssetDetailModal's fetch-by-id) for a collision risk
+        # that's negligible in practice (Fabric item ids are workspace-scoped
+        # GUIDs).
+        try:
+            conn.execute("ALTER TABLE harvested_assets ADD COLUMN connector_id TEXT")
+        except sqlite3.OperationalError:
+            pass  # column already exists
+        else:
+            # One-time backfill for pre-existing rows: only safe when exactly
+            # one connector of that type exists (true for this app today -
+            # one Fabric + one Local connector). Ambiguous cases are left
+            # NULL rather than guessing which connector harvested them.
+            for row in conn.execute(
+                "SELECT DISTINCT connector_type FROM harvested_assets WHERE connector_id IS NULL"
+            ).fetchall():
+                ctype = row["connector_type"]
+                matches = conn.execute(
+                    "SELECT id FROM connector_configs WHERE type = ?", (ctype,)
+                ).fetchall()
+                if len(matches) == 1:
+                    conn.execute(
+                        "UPDATE harvested_assets SET connector_id = ? WHERE connector_type = ? AND connector_id IS NULL",
+                        (matches[0]["id"], ctype),
+                    )
+
 
 # --- Harvested assets -------------------------------------------------------
 
-def upsert_asset(connector_type, connector_name, item, schema=None, owner=None):
+def upsert_asset(connector_id, connector_type, connector_name, item, schema=None, owner=None):
     asset_id = f"{connector_type}:{item['id']}"
     now = datetime.now(timezone.utc).isoformat()
 
     with get_conn() as conn:
         conn.execute("""
             INSERT INTO harvested_assets
-                (id, connector_type, connector_name, source_item_id, name, type, owner, schema_json, harvested_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (id, connector_id, connector_type, connector_name, source_item_id, name, type, owner, schema_json, harvested_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
+                connector_id=excluded.connector_id,
                 name=excluded.name,
                 type=excluded.type,
                 schema_json=excluded.schema_json,
                 harvested_at=excluded.harvested_at
         """, (
-            asset_id, connector_type, connector_name, item['id'],
+            asset_id, connector_id, connector_type, connector_name, item['id'],
             item['name'], item['type'], owner,
             json.dumps(schema) if schema is not None else None,
             now,
@@ -91,30 +124,38 @@ def upsert_asset(connector_type, connector_name, item, schema=None, owner=None):
     return asset_id
 
 
-def full_refresh_clear(connector_type, asset_types=None):
+def full_refresh_clear(connector_type, connector_id=None, asset_types=None):
     """
     Wipe existing catalog entries before a full refresh.
-    If asset_types is given, only wipe entries of those types for this
-    connector - e.g. refreshing Notebooks won't touch previously-harvested
-    Lakehouses. Omitting asset_types falls back to wiping the whole
-    connector (kept for backward compatibility, but the harvest engine
-    always passes asset_types now).
+    connector_id scopes the wipe to one specific connector instance so a full
+    refresh on one Fabric connector never touches another Fabric connector's
+    assets (connector_type alone can't distinguish two connectors of the
+    same type). If asset_types is given, only wipe entries of those types -
+    e.g. refreshing Notebooks won't touch previously-harvested Lakehouses.
+    Omitting asset_types falls back to wiping everything for the scope
+    (kept for backward compatibility, but the harvest engine always passes
+    asset_types now).
     """
     with get_conn() as conn:
+        clauses = ["connector_type = ?"]
+        params = [connector_type]
+        if connector_id:
+            clauses.append("connector_id = ?")
+            params.append(connector_id)
         if asset_types:
             placeholders = ",".join("?" for _ in asset_types)
-            conn.execute(
-                f"DELETE FROM harvested_assets WHERE connector_type = ? AND type IN ({placeholders})",
-                [connector_type, *asset_types],
-            )
-        else:
-            conn.execute("DELETE FROM harvested_assets WHERE connector_type = ?", (connector_type,))
+            clauses.append(f"type IN ({placeholders})")
+            params.extend(asset_types)
+        conn.execute(f"DELETE FROM harvested_assets WHERE {' AND '.join(clauses)}", params)
 
 
-def list_assets(connector_type=None, asset_type=None, search=None):
+def list_assets(connector_id=None, connector_type=None, asset_type=None, search=None):
     query = "SELECT * FROM harvested_assets WHERE 1=1"
     params = []
-    if connector_type:
+    if connector_id:
+        query += " AND connector_id = ?"
+        params.append(connector_id)
+    elif connector_type:
         query += " AND connector_type = ?"
         params.append(connector_type)
     if asset_type:

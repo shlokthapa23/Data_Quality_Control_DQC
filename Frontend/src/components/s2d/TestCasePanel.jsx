@@ -1,15 +1,15 @@
 import { useEffect, useState } from 'react';
 import {
-  Sparkles, Code2, Plus, Trash2, Loader2, AlertCircle, Rocket, GitCompareArrows,
+  Sparkles, Code2, Plus, Trash2, Loader2, AlertCircle, GitCompareArrows,
   Pencil, Play, X, FileCode2, Wand2, User, ListChecks, CheckCircle2,
 } from 'lucide-react';
 import {
   fetchS2DTestCases, createS2DTestCase, updateS2DTestCase, deleteS2DTestCase,
-  runS2DPipeline, runSingleS2DTestCase, fetchContainerTables, generateAITestCase,
+  runSingleS2DTestCase, fetchContainerTables, generateAITestCase,
   generateAISuggestedRules, generateAISuggestedParityRules, generateKeyColumnSuggestion,
   generateAISuggestedCrossTableParityRules, setS2DTestCaseActive,
-  createTestSuite,
-} from '../api';
+  fetchTestSuitesForMapping, fetchTestSuite, updateTestSuite,
+} from '../../api';
 
 const SEVERITY_STYLES = {
   critical: 'bg-red-100 text-red-700',
@@ -101,7 +101,7 @@ WHERE LENGTH(<column_name>) < <min_length> OR LENGTH(<column_name>) > <max_lengt
   CASE WHEN COUNT(*) = 0 THEN 1 ELSE 0 END AS passed,
   CAST(COUNT(*) AS VARCHAR) || ' rows with <column_name> outside allowed values' AS details
 FROM <table_name>
-WHERE <column_name> NOT IN ('<value1>', '<value2>', '<value3>')`,
+WHERE <column_name> NOT IN (<allowed_values_list>)`,
   },
   referential_check: {
     label: 'Referential Check',
@@ -151,6 +151,85 @@ WHERE <your_condition_identifying_bad_rows>`,
   },
 };
 
+// Per-template placeholder spec, so the tester never hand-edits <table_name>/
+// <column_name>/etc inside the raw SQL - table/column vars render as
+// dropdowns sourced from the mapping's already-fetched live schema
+// (sourceSchema/destinationSchema, the same data commonColumns() already
+// uses for the Column Parity picker - zero extra network cost), everything
+// else (a threshold, a regex, an allowed-values list) is a small labeled
+// input. custom_sql has no entry here - it's the intentional freehand
+// escape hatch and keeps today's raw textarea unchanged.
+const TEMPLATE_VARS = {
+  null_check: [
+    { key: 'table_name', type: 'table', label: 'Table' },
+    { key: 'column_name', type: 'column', label: 'Column', tableKey: 'table_name' },
+  ],
+  range_check: [
+    { key: 'table_name', type: 'table', label: 'Table' },
+    { key: 'column_name', type: 'column', label: 'Column', tableKey: 'table_name' },
+    { key: 'min_value', type: 'text', label: 'Min value' },
+    { key: 'max_value', type: 'text', label: 'Max value' },
+  ],
+  format_check: [
+    { key: 'table_name', type: 'table', label: 'Table' },
+    { key: 'column_name', type: 'column', label: 'Column', tableKey: 'table_name' },
+    { key: 'regex_pattern', type: 'text', label: 'Regex pattern' },
+  ],
+  uniqueness_check: [
+    { key: 'table_name', type: 'table', label: 'Table' },
+    { key: 'column_name', type: 'column', label: 'Column', tableKey: 'table_name' },
+  ],
+  length_check: [
+    { key: 'table_name', type: 'table', label: 'Table' },
+    { key: 'column_name', type: 'column', label: 'Column', tableKey: 'table_name' },
+    { key: 'min_length', type: 'number', label: 'Min length' },
+    { key: 'max_length', type: 'number', label: 'Max length' },
+  ],
+  categorical_check: [
+    { key: 'table_name', type: 'table', label: 'Table' },
+    { key: 'column_name', type: 'column', label: 'Column', tableKey: 'table_name' },
+    { key: 'allowed_values_list', type: 'list', label: 'Allowed values (comma-separated)' },
+  ],
+  referential_check: [
+    // Both tables must live on the SAME side (source or destination) - one
+    // query can't reach across two separate database connections.
+    { key: 'child_table', type: 'table', label: 'Child table' },
+    { key: 'child_column', type: 'column', label: 'Child column', tableKey: 'child_table' },
+    { key: 'parent_table', type: 'table', label: 'Parent table' },
+    { key: 'parent_column', type: 'column', label: 'Parent column', tableKey: 'parent_table' },
+  ],
+  recency_check: [
+    { key: 'table_name', type: 'table', label: 'Table' },
+    { key: 'date_column', type: 'column', label: 'Date column', tableKey: 'table_name' },
+    { key: 'days', type: 'number', label: 'Days threshold' },
+  ],
+  row_count_check: [
+    { key: 'table_name', type: 'table', label: 'Table' },
+  ],
+  custom_expression: [
+    { key: 'table_name', type: 'table', label: 'Table' },
+    { key: 'your_condition_identifying_bad_rows', type: 'textarea', label: 'Condition identifying BAD rows' },
+  ],
+};
+
+// Fills in a template's raw SQL from the current variable values. Unset
+// vars are left as their literal <key> placeholder so the preview visibly
+// shows what's still missing, rather than silently rendering broken SQL.
+function renderTemplateSql(templateKey, vars) {
+  const template = PREBUILT_TEMPLATES[templateKey];
+  if (!template) return '';
+  let sql = template.sql;
+  for (const varDef of TEMPLATE_VARS[templateKey] || []) {
+    const raw = vars[varDef.key];
+    if (raw === undefined || raw === null || raw === '') continue;
+    const formatted = varDef.type === 'list'
+      ? String(raw).split(',').map((v) => v.trim()).filter(Boolean).map((v) => `'${v}'`).join(', ')
+      : String(raw);
+    sql = sql.split(`<${varDef.key}>`).join(formatted);
+  }
+  return sql;
+}
+
 const SQL_PLACEHOLDER = `-- Must return exactly one row with a "passed" column (0/1)
 -- and optionally a "details" column shown in the error trace.
 SELECT
@@ -162,6 +241,7 @@ WHERE student_id IS NULL`;
 const EMPTY_FORM = {
   name: '', validationType: VALIDATION_TYPES[0], checkType: 'sql', checkScope: 'single_side',
   target: 'source', targetTable: '', targetTables: [], scriptType: 'sql', scriptText: '',
+  templateVars: {}, // schema-driven template variables (table/column/etc) - keyed by TEMPLATE_VARS[key].key
   rowCountSourceTables: [], rowCountDestinationTables: [],
   sourceTables: [], sourceColumn: '', destinationTables: [], destinationColumn: '',
   sourceTargetTables: [], destinationTargetTables: [], keyColumn: '',
@@ -199,7 +279,7 @@ function TableCheckboxList({ tables, selected, onToggle }) {
   );
 }
 
-export default function TestCasePanel({ mapping, onRunComplete }) {
+export default function TestCasePanel({ mapping, onRunComplete, focus }) {
 const [tab, setTab] = useState('ai'); // 'ai' | 'manual'
 
   const [testCases, setTestCases] = useState([]);
@@ -212,7 +292,6 @@ const [tab, setTab] = useState('ai'); // 'ai' | 'manual'
   const [saveError, setSaveError] = useState(null);
 
   const [runningId, setRunningId] = useState(null); // per-row running state
-  const [isRunningAll, setIsRunningAll] = useState(false);
   const [runError, setRunError] = useState(null);
   // AI tab state - separate from the Manual tab's form until generation succeeds
   const [aiMode, setAiMode] = useState('single'); // 'single' | 'parity' | 'cross_parity'
@@ -229,12 +308,15 @@ const [tab, setTab] = useState('ai'); // 'ai' | 'manual'
   const [suggestSummary, setSuggestSummary] = useState(null); // { createdCount, skipped }
   const [togglingId, setTogglingId] = useState(null);
 
-  // Suite creation selection mode
+  // Add-to-suite selection mode - test suites themselves are created ahead
+  // of time on the Mapping tab; this picks an existing one and adds the
+  // checked test cases into it.
   const [isSelectingSuite, setIsSelectingSuite] = useState(false);
   const [selectedTestCaseIds, setSelectedTestCaseIds] = useState(new Set());
-  const [suiteName, setSuiteName] = useState('');
-  const [suiteDescription, setSuiteDescription] = useState('');
-  const [isCreatingSuite, setIsCreatingSuite] = useState(false);
+  const [availableSuites, setAvailableSuites] = useState([]);
+  const [isLoadingSuites, setIsLoadingSuites] = useState(false);
+  const [targetSuiteId, setTargetSuiteId] = useState('');
+  const [isAddingToSuite, setIsAddingToSuite] = useState(false);
   const [suiteError, setSuiteError] = useState(null);
   const [suiteSuccess, setSuiteSuccess] = useState(null);
   // Column Parity Check tables+columns - fetched once per mapping, shared by
@@ -282,9 +364,16 @@ const [tab, setTab] = useState('ai'); // 'ai' | 'manual'
     setAiCrossSourceTables([]); setAiCrossDestinationTables([]); setAiCrossDescription('');
     setSuggestKeyColumnError(null);
     setSuggestCrossParityError(null); setSuggestCrossParitySummary(null);
-    setIsSelectingSuite(false); setSelectedTestCaseIds(new Set());
-    setSuiteName(''); setSuiteDescription(''); setSuiteError(null); setSuiteSuccess(null);
-  }, [mapping]);
+    // Skip clearing suite-selection state when a cross-page focus (from the
+    // Test Suites page's Edit Suite button) is about to open it right back
+    // up for this same mapping - otherwise this reset always wins the race
+    // against the focus-consuming effect below, since both fire off the
+    // same [mapping] change.
+    if (!(focus && focus.mappingId === mapping?.id)) {
+      setIsSelectingSuite(false); setSelectedTestCaseIds(new Set());
+      setAvailableSuites([]); setTargetSuiteId(''); setSuiteError(null); setSuiteSuccess(null);
+    }
+  }, [mapping]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     if (!mapping) return;
@@ -365,11 +454,11 @@ const [tab, setTab] = useState('ai'); // 'ai' | 'manual'
     setSuggestError(null);
     setSuggestSummary(null);
     try {
-      const { created, skipped } = await generateAISuggestedRules(mapping.id, {
+      const { created, skipped, message } = await generateAISuggestedRules(mapping.id, {
         target: aiTarget,
         tableName: aiTableNames[0],
       });
-      setSuggestSummary({ createdCount: created.length, skipped });
+      setSuggestSummary({ createdCount: created.length, skipped, message });
       loadTestCases();
     } catch (err) {
       setSuggestError(err.message);
@@ -384,11 +473,11 @@ const [tab, setTab] = useState('ai'); // 'ai' | 'manual'
     setSuggestParityError(null);
     setSuggestParitySummary(null);
     try {
-      const { created, skipped } = await generateAISuggestedParityRules(mapping.id, {
+      const { created, skipped, message } = await generateAISuggestedParityRules(mapping.id, {
         sourceTables: aiParitySourceTables,
         destinationTables: aiParityDestinationTables,
       });
-      setSuggestParitySummary({ createdCount: created.length, skipped });
+      setSuggestParitySummary({ createdCount: created.length, skipped, message });
       loadTestCases();
     } catch (err) {
       setSuggestParityError(err.message);
@@ -447,11 +536,11 @@ const [tab, setTab] = useState('ai'); // 'ai' | 'manual'
     setSuggestCrossParityError(null);
     setSuggestCrossParitySummary(null);
     try {
-      const { created, skipped } = await generateAISuggestedCrossTableParityRules(mapping.id, {
+      const { created, skipped, message } = await generateAISuggestedCrossTableParityRules(mapping.id, {
         sourceTables: aiCrossSourceTables,
         destinationTables: aiCrossDestinationTables,
       });
-      setSuggestCrossParitySummary({ createdCount: created.length, skipped });
+      setSuggestCrossParitySummary({ createdCount: created.length, skipped, message });
       loadTestCases();
     } catch (err) {
       setSuggestCrossParityError(err.message);
@@ -484,6 +573,7 @@ const [tab, setTab] = useState('ai'); // 'ai' | 'manual'
       target: tc.target || 'source', targetTable: tc.target_table || '',
       targetTables: tc.target_tables || (tc.target_table ? [tc.target_table] : []),
       scriptType: tc.script_type || 'sql', scriptText: tc.script_text || '',
+      templateVars: {}, // editing always falls back to the raw-text 'custom_sql' template - we never stored which template/vars produced the saved SQL, only the final string
       rowCountSourceTables: tc.row_count_source_tables || [],
       rowCountDestinationTables: tc.row_count_destination_tables || [],
       sourceTables: tc.source_tables || [], sourceColumn: tc.source_column || '',
@@ -500,6 +590,11 @@ const [tab, setTab] = useState('ai'); // 'ai' | 'manual'
   };
 
   const isCrossTableParity = form.checkType === 'sql' && form.checkScope === 'cross_table_parity';
+  const isTemplateMode = form.checkType === 'sql' && form.checkScope === 'single_side' && prebuiltKey !== 'custom_sql';
+  const templateVarsComplete = (TEMPLATE_VARS[prebuiltKey] || []).every((v) => {
+    const val = form.templateVars[v.key];
+    return val !== undefined && val !== null && String(val).trim() !== '';
+  });
 
   const canSave = form.checkType === 'row_count_match'
     ? !!(form.name && form.rowCountSourceTables.length > 0 && form.rowCountDestinationTables.length > 0)
@@ -507,6 +602,8 @@ const [tab, setTab] = useState('ai'); // 'ai' | 'manual'
     ? !!(form.name && form.sourceTables.length > 0 && form.sourceColumn && form.destinationTables.length > 0 && form.destinationColumn)
     : isCrossTableParity
     ? !!(form.name && form.sourceTargetTables.length > 0 && form.destinationTargetTables.length > 0 && form.keyColumn)
+    : isTemplateMode
+    ? !!(form.name && templateVarsComplete)
     : !!(form.name && form.targetTables.length > 0 && form.scriptText);
 
   const buildPayload = () => {
@@ -576,24 +673,23 @@ const [tab, setTab] = useState('ai'); // 'ai' | 'manual'
     }
   };
 
-  const handleRunAll = async () => {
-    setIsRunningAll(true);
-    setRunError(null);
-    try {
-      const { run_id } = await runS2DPipeline(mapping.id);
-      onRunComplete(run_id);
-    } catch (err) {
-      setRunError(err.message);
-    } finally {
-      setIsRunningAll(false);
-    }
-  };
-
   const enterSuiteSelection = () => {
     setIsSelectingSuite(true);
     setSelectedTestCaseIds(new Set());
-    setSuiteName(''); setSuiteDescription('');
+    setTargetSuiteId('');
     setSuiteError(null); setSuiteSuccess(null);
+    if (mapping) {
+      setIsLoadingSuites(true);
+      fetchTestSuitesForMapping(mapping.id)
+        .then((data) => {
+          setAvailableSuites(data);
+          setIsLoadingSuites(false);
+        })
+        .catch((err) => {
+          setSuiteError(err.message);
+          setIsLoadingSuites(false);
+        });
+    }
   };
 
   const cancelSuiteSelection = () => {
@@ -610,30 +706,83 @@ const [tab, setTab] = useState('ai'); // 'ai' | 'manual'
     });
   };
 
-  const handleCreateSuite = async () => {
-    if (!mapping) return;
-    const name = suiteName.trim();
-    if (!name) { setSuiteError('Suite name is required'); return; }
-    if (selectedTestCaseIds.size === 0) { setSuiteError('Pick at least one test case'); return; }
+  // Picking a target suite pre-checks its current members - lets the user
+  // see (and freely uncheck to remove) what's already in the suite, rather
+  // than only being able to add. originalSuiteMemberIds is kept so Save can
+  // report how many were added vs removed.
+  // Deliberately an explicit function call (from the dropdown's onChange
+  // and from the cross-page focus effect) rather than a useEffect keyed on
+  // targetSuiteId - a separate reactive effect here raced against
+  // enterSuiteSelection's own setSelectedTestCaseIds(new Set()) reset,
+  // since both fire from the same "open suite editing" action and their
+  // relative order isn't guaranteed once both are effects.
+  const [originalSuiteMemberIds, setOriginalSuiteMemberIds] = useState(null);
 
-    setIsCreatingSuite(true);
+  const loadSuiteMembers = async (suiteId) => {
+    if (!suiteId) { setOriginalSuiteMemberIds(null); return; }
+    try {
+      const suite = await fetchTestSuite(suiteId);
+      const memberIds = suite.test_cases.map((tc) => tc.id);
+      setOriginalSuiteMemberIds(memberIds);
+      setSelectedTestCaseIds((prev) => new Set([...prev, ...memberIds]));
+    } catch (err) {
+      setSuiteError(err.message);
+    }
+  };
+
+  // Cross-page handoff from the Test Suites page: once this mapping's test
+  // cases have finished loading, either open the edit form for a specific
+  // test case, or open suite-membership editing pre-targeted at a specific
+  // suite. Bails while isLoading is still true (initial mount) and only
+  // acts once testCases has actually settled for the focused mapping.
+  // Declared after startEdit/enterSuiteSelection/loadSuiteMembers so it can
+  // reference them (ESLint's no-use-before-define check is static and
+  // doesn't know the callback only runs after the full render completes).
+  useEffect(() => {
+    if (!focus || !mapping || focus.mappingId !== mapping.id || isLoading) return;
+    let cancelled = false;
+    Promise.resolve().then(() => {
+      if (cancelled) return;
+      if (focus.testCaseId) {
+        const tc = testCases.find((t) => t.id === focus.testCaseId);
+        if (tc) startEdit(tc);
+      } else if (focus.suiteId) {
+        enterSuiteSelection();
+        setTargetSuiteId(focus.suiteId);
+        loadSuiteMembers(focus.suiteId);
+      }
+    });
+    return () => { cancelled = true; };
+  }, [focus, mapping, testCases, isLoading]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const handleSaveSuiteMembership = async () => {
+    if (!mapping || !targetSuiteId) return;
+    if (selectedTestCaseIds.size === 0) { setSuiteError('A suite must keep at least one test case'); return; }
+
+    setIsAddingToSuite(true);
     setSuiteError(null);
     try {
-      // Preserve on-screen order (order in testCases) rather than click-order
-      const orderedIds = testCases.filter((tc) => selectedTestCaseIds.has(tc.id)).map((tc) => tc.id);
-      await createTestSuite(mapping.id, {
-        name,
-        description: suiteDescription.trim() || null,
-        test_case_ids: orderedIds,
-      });
-      setSuiteSuccess(`Created suite "${name}" with ${orderedIds.length} test case${orderedIds.length === 1 ? '' : 's'}.`);
+      const finalIds = testCases.filter((tc) => selectedTestCaseIds.has(tc.id)).map((tc) => tc.id);
+      const before = new Set(originalSuiteMemberIds || []);
+      const after = new Set(finalIds);
+      const addedCount = finalIds.filter((id) => !before.has(id)).length;
+      const removedCount = (originalSuiteMemberIds || []).filter((id) => !after.has(id)).length;
+      const suite = await updateTestSuite(targetSuiteId, { test_case_ids: finalIds });
+      const parts = [];
+      if (addedCount) parts.push(`added ${addedCount}`);
+      if (removedCount) parts.push(`removed ${removedCount}`);
+      setSuiteSuccess(
+        parts.length
+          ? `Saved "${suite.name}" — ${parts.join(', ')}.`
+          : `"${suite.name}" is unchanged.`
+      );
       setIsSelectingSuite(false);
       setSelectedTestCaseIds(new Set());
-      setSuiteName(''); setSuiteDescription('');
+      setTargetSuiteId('');
     } catch (err) {
       setSuiteError(err.message);
     } finally {
-      setIsCreatingSuite(false);
+      setIsAddingToSuite(false);
     }
   };
 
@@ -683,12 +832,13 @@ const [tab, setTab] = useState('ai'); // 'ai' | 'manual'
   if (!mapping) {
     return (
       <main className="flex-1 flex items-center justify-center text-slate-400 text-sm">
-        Create or select a mapping on the left to configure validation logic.
+        Select a validation above to configure its test cases, or create one on the Validation Setup tab.
       </main>
     );
   }
 
   const targetTableOptions = form.target === 'source' ? mapping.source_tables : mapping.destination_tables;
+  const templateSchema = form.target === 'source' ? sourceSchema : destinationSchema;
 
   const handlePrebuiltChange = (key) => {
     setPrebuiltKey(key);
@@ -697,8 +847,38 @@ const [tab, setTab] = useState('ai'); // 'ai' | 'manual'
       ...f,
       scriptType: 'sql',
       scriptText: template.sql,
+      templateVars: {},
+      targetTables: [],
       validationType: template.validationType || f.validationType,
     }));
+  };
+
+  // Updates one template variable, keeps form.targetTables in sync with
+  // whichever table(s) got picked (so the existing Table-column display and
+  // backend contract for check_type='sql' single_side need no changes),
+  // clears any column variable whose table just changed under it, and
+  // re-derives scriptText from the template right here - synchronous, no
+  // extra effect needed, so the read-only preview always matches instantly.
+  const setTemplateVar = (varKey, value) => {
+    setForm((f) => {
+      const varDef = (TEMPLATE_VARS[prebuiltKey] || []).find((v) => v.key === varKey);
+      const nextVars = { ...f.templateVars, [varKey]: value };
+      if (varDef?.type === 'table') {
+        // Clear any column var that depended on this table - it may no
+        // longer be valid for the newly-picked table.
+        for (const v of TEMPLATE_VARS[prebuiltKey] || []) {
+          if (v.tableKey === varKey) delete nextVars[v.key];
+        }
+      }
+      const tableVars = (TEMPLATE_VARS[prebuiltKey] || []).filter((v) => v.type === 'table');
+      const nextTargetTables = tableVars.map((v) => nextVars[v.key]).filter(Boolean);
+      return {
+        ...f,
+        templateVars: nextVars,
+        targetTables: nextTargetTables,
+        scriptText: renderTemplateSql(prebuiltKey, nextVars),
+      };
+    });
   };
   return (
     <main className="flex-1 bg-slate-50 p-6 flex flex-col gap-4 overflow-y-auto">
@@ -759,6 +939,17 @@ const [tab, setTab] = useState('ai'); // 'ai' | 'manual'
             >
               <GitCompareArrows className="w-3.5 h-3.5" /> Cross-Table Parity
             </button>
+          </div>
+          <div className="text-xs text-slate-500 -mt-2">
+            {aiMode === 'single' && (
+              <>Generate SQL checks on one side. Pick a table (or several), describe the rule in plain English, and the AI writes the SQL against real column names.</>
+            )}
+            {aiMode === 'parity' && (
+              <>Auto-generate <strong>column parity</strong> rules from real samples of both sides. Compares stats like null-count and uniqueness column-by-column.</>
+            )}
+            {aiMode === 'cross_parity' && (
+              <>Auto-generate <strong>cross-table parity</strong> rules — the AI picks a shared key column and creates row-level existence checks between source and destination.</>
+            )}
           </div>
 
           {aiMode === 'single' && (
@@ -848,12 +1039,17 @@ const [tab, setTab] = useState('ai'); // 'ai' | 'manual'
                 </div>
               )}
 
-              {suggestSummary && (
+              {suggestSummary && suggestSummary.createdCount === 0 && suggestSummary.message ? (
+                <div className="flex items-start gap-2 text-sm text-slate-600 bg-slate-100 border border-slate-200 rounded-lg px-3 py-2">
+                  <AlertCircle className="w-4 h-4 mt-0.5 shrink-0 text-slate-400" />
+                  {suggestSummary.message}
+                </div>
+              ) : suggestSummary && (
                 <div className="text-sm text-mastek-success">
                   {suggestSummary.createdCount} rule{suggestSummary.createdCount === 1 ? '' : 's'} created from a random sample of {aiTableNames[0]}.
                   {suggestSummary.skipped.length > 0 && (
                     <span className="text-amber-600">
-                      {' '}{suggestSummary.skipped.length} skipped (failed the SQL safety check).
+                      {' '}{suggestSummary.skipped.length} skipped (failed the SQL safety check or duplicated an existing rule).
                     </span>
                   )}
                 </div>
@@ -912,13 +1108,18 @@ const [tab, setTab] = useState('ai'); // 'ai' | 'manual'
                 AI Suggest Parity Rules
               </button>
 
-              {suggestParitySummary && (
+              {suggestParitySummary && suggestParitySummary.createdCount === 0 && suggestParitySummary.message ? (
+                <div className="flex items-start gap-2 text-sm text-slate-600 bg-slate-100 border border-slate-200 rounded-lg px-3 py-2">
+                  <AlertCircle className="w-4 h-4 mt-0.5 shrink-0 text-slate-400" />
+                  {suggestParitySummary.message}
+                </div>
+              ) : suggestParitySummary && (
                 <div className="text-sm text-mastek-success">
                   {suggestParitySummary.createdCount} parity rule{suggestParitySummary.createdCount === 1 ? '' : 's'} created
                   from {aiParitySourceTables.join(', ')} ↔ {aiParityDestinationTables.join(', ')}.
                   {suggestParitySummary.skipped.length > 0 && (
                     <span className="text-amber-600">
-                      {' '}{suggestParitySummary.skipped.length} skipped (invalid column/type suggestion).
+                      {' '}{suggestParitySummary.skipped.length} skipped (invalid column/type suggestion or duplicated an existing rule).
                     </span>
                   )}
                 </div>
@@ -1013,13 +1214,18 @@ const [tab, setTab] = useState('ai'); // 'ai' | 'manual'
                   AI Suggest Parity Rules
                 </button>
 
-                {suggestCrossParitySummary && (
+                {suggestCrossParitySummary && suggestCrossParitySummary.createdCount === 0 && suggestCrossParitySummary.message ? (
+                  <div className="flex items-start gap-2 text-sm text-slate-600 bg-slate-100 border border-slate-200 rounded-lg px-3 py-2">
+                    <AlertCircle className="w-4 h-4 mt-0.5 shrink-0 text-slate-400" />
+                    {suggestCrossParitySummary.message}
+                  </div>
+                ) : suggestCrossParitySummary && (
                   <div className="text-sm text-mastek-success">
                     {suggestCrossParitySummary.createdCount} parity rule{suggestCrossParitySummary.createdCount === 1 ? '' : 's'} created
                     from {aiCrossSourceTables.join(', ')} ↔ {aiCrossDestinationTables.join(', ')}.
                     {suggestCrossParitySummary.skipped.length > 0 && (
                       <span className="text-amber-600">
-                        {' '}{suggestCrossParitySummary.skipped.length} skipped (invalid key column suggestion).
+                        {' '}{suggestCrossParitySummary.skipped.length} skipped (invalid key column suggestion or duplicated an existing rule).
                       </span>
                     )}
                   </div>
@@ -1059,44 +1265,88 @@ const [tab, setTab] = useState('ai'); // 'ai' | 'manual'
             </select>
           </div>
 
-          <div className="flex flex-wrap items-center gap-x-4 gap-y-2 text-sm border-b border-slate-100 pb-3">
-            <span className="text-xs font-medium text-slate-500">Check type:</span>
-            <label className="flex items-center gap-2 cursor-pointer">
-              <input type="radio" checked={form.checkType === 'sql' && form.checkScope === 'single_side'}
-                onChange={() => setForm((f) => ({ ...f, checkType: 'sql', checkScope: 'single_side' }))}
-                className="text-mastek-primary focus:ring-mastek-accent" />
-              Custom SQL script
-            </label>
-            <label className="flex items-center gap-2 cursor-pointer">
-              <input type="radio" checked={form.checkType === 'sql' && form.checkScope === 'cross_table_parity'}
-                onChange={() => setForm((f) => ({ ...f, checkType: 'sql', checkScope: 'cross_table_parity', validationType: 'Custom' }))}
-                className="text-mastek-primary focus:ring-mastek-accent" />
-              <GitCompareArrows className="w-3.5 h-3.5 text-mastek-highlight" />
-              Cross-Table Parity (existence check)
-            </label>
-            <label className="flex items-center gap-2 cursor-pointer">
-              <input type="radio" checked={form.checkType === 'row_count_match'} onChange={() => setForm((f) => ({ ...f, checkType: 'row_count_match' }))}
-                className="text-mastek-primary focus:ring-mastek-accent" />
-              <GitCompareArrows className="w-3.5 h-3.5 text-mastek-highlight" />
-              Row count match (built-in)
-            </label>
-            <label className="flex items-center gap-2 cursor-pointer">
-              <input type="radio" checked={form.checkType === 'column_parity'}
-                onChange={() => setForm((f) => ({
-                  ...f, checkType: 'column_parity',
-                  validationType: PARITY_VALIDATION_TYPES.includes(f.validationType) ? f.validationType : PARITY_VALIDATION_TYPES[0],
-                }))}
-                className="text-mastek-primary focus:ring-mastek-accent" />
-              <GitCompareArrows className="w-3.5 h-3.5 text-mastek-highlight" />
-              Column Parity Check (built-in)
-            </label>
+          <div className="border-b border-slate-100 pb-3">
+            <div className="text-xs font-medium text-slate-500 mb-2">Check type — pick what fits your validation:</div>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+              <label className={`flex items-start gap-2 cursor-pointer p-2 rounded-lg border ${
+                form.checkType === 'sql' && form.checkScope === 'single_side'
+                  ? 'border-mastek-primary bg-mastek-primary/5' : 'border-slate-200 hover:bg-slate-50'
+              }`}>
+                <input type="radio" checked={form.checkType === 'sql' && form.checkScope === 'single_side'}
+                  onChange={() => setForm((f) => ({ ...f, checkType: 'sql', checkScope: 'single_side' }))}
+                  className="text-mastek-primary focus:ring-mastek-accent mt-0.5 shrink-0" />
+                <div className="min-w-0">
+                  <div className="text-sm font-medium text-slate-800">Custom SQL script</div>
+                  <div className="text-xs text-slate-500 mt-0.5">
+                    Write your own SQL. Must return one row with a <code className="font-mono">passed</code> (1/0) column. Use when the built-ins don't fit.
+                  </div>
+                </div>
+              </label>
+
+              <label className={`flex items-start gap-2 cursor-pointer p-2 rounded-lg border ${
+                form.checkType === 'row_count_match'
+                  ? 'border-mastek-primary bg-mastek-primary/5' : 'border-slate-200 hover:bg-slate-50'
+              }`}>
+                <input type="radio" checked={form.checkType === 'row_count_match'}
+                  onChange={() => setForm((f) => ({ ...f, checkType: 'row_count_match' }))}
+                  className="text-mastek-primary focus:ring-mastek-accent mt-0.5 shrink-0" />
+                <div className="min-w-0">
+                  <div className="text-sm font-medium text-slate-800 flex items-center gap-1.5">
+                    <GitCompareArrows className="w-3.5 h-3.5 text-mastek-highlight" />
+                    Row count match
+                  </div>
+                  <div className="text-xs text-slate-500 mt-0.5">
+                    Compares total row counts between source and destination tables. Fastest, cheapest first check — good for a quick sanity pass.
+                  </div>
+                </div>
+              </label>
+
+              <label className={`flex items-start gap-2 cursor-pointer p-2 rounded-lg border ${
+                form.checkType === 'column_parity'
+                  ? 'border-mastek-primary bg-mastek-primary/5' : 'border-slate-200 hover:bg-slate-50'
+              }`}>
+                <input type="radio" checked={form.checkType === 'column_parity'}
+                  onChange={() => setForm((f) => ({
+                    ...f, checkType: 'column_parity',
+                    validationType: PARITY_VALIDATION_TYPES.includes(f.validationType) ? f.validationType : PARITY_VALIDATION_TYPES[0],
+                  }))}
+                  className="text-mastek-primary focus:ring-mastek-accent mt-0.5 shrink-0" />
+                <div className="min-w-0">
+                  <div className="text-sm font-medium text-slate-800 flex items-center gap-1.5">
+                    <GitCompareArrows className="w-3.5 h-3.5 text-mastek-highlight" />
+                    Column parity
+                  </div>
+                  <div className="text-xs text-slate-500 mt-0.5">
+                    Compares one column's stats — nulls, unique values, or min–max range — between source and destination. Spot-check quality on a specific field.
+                  </div>
+                </div>
+              </label>
+
+              <label className={`flex items-start gap-2 cursor-pointer p-2 rounded-lg border ${
+                form.checkType === 'sql' && form.checkScope === 'cross_table_parity'
+                  ? 'border-mastek-primary bg-mastek-primary/5' : 'border-slate-200 hover:bg-slate-50'
+              }`}>
+                <input type="radio" checked={form.checkType === 'sql' && form.checkScope === 'cross_table_parity'}
+                  onChange={() => setForm((f) => ({ ...f, checkType: 'sql', checkScope: 'cross_table_parity', validationType: 'Custom' }))}
+                  className="text-mastek-primary focus:ring-mastek-accent mt-0.5 shrink-0" />
+                <div className="min-w-0">
+                  <div className="text-sm font-medium text-slate-800 flex items-center gap-1.5">
+                    <GitCompareArrows className="w-3.5 h-3.5 text-mastek-highlight" />
+                    Cross-table parity
+                  </div>
+                  <div className="text-xs text-slate-500 mt-0.5">
+                    Checks that every key value on source also exists on destination (and vice versa). Slower but tells you <em>which specific rows</em> are missing.
+                  </div>
+                </div>
+              </label>
+            </div>
           </div>
 
           {form.checkType === 'row_count_match' && (
             <div className="space-y-3">
               <p className="text-sm text-slate-500">
                 Sums <code className="font-mono text-xs">COUNT(*)</code> across whichever tables you pick on each
-                side, then compares the two totals. Pick any subset of this mapping's tables per side.
+                side, then compares the two totals. Pick any subset of this validation's tables per side.
               </p>
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                 <div>
@@ -1233,30 +1483,16 @@ const [tab, setTab] = useState('ai'); // 'ai' | 'manual'
                 <span className="text-xs font-medium text-slate-500">Runs against:</span>
                 <label className="flex items-center gap-2 cursor-pointer">
                   <input type="radio" checked={form.target === 'source'}
-                    onChange={() => setForm((f) => ({ ...f, target: 'source', targetTables: [] }))}
+                    onChange={() => setForm((f) => ({ ...f, target: 'source', targetTables: [], templateVars: {} }))}
                     className="text-mastek-primary focus:ring-mastek-accent" />
                   Source
                 </label>
                 <label className="flex items-center gap-2 cursor-pointer">
                   <input type="radio" checked={form.target === 'destination'}
-                    onChange={() => setForm((f) => ({ ...f, target: 'destination', targetTables: [] }))}
+                    onChange={() => setForm((f) => ({ ...f, target: 'destination', targetTables: [], templateVars: {} }))}
                     className="text-mastek-primary focus:ring-mastek-accent" />
                   Destination
                 </label>
-              </div>
-
-              <div>
-                <p className="text-xs font-medium text-slate-500 mb-1">Target tables</p>
-                <TableCheckboxList
-                  tables={targetTableOptions}
-                  selected={form.targetTables}
-                  onToggle={toggleTargetTable}
-                />
-                {form.targetTables.length > 1 && (
-                  <p className="text-xs text-mastek-primary mt-1">
-                    {form.targetTables.length} tables selected - will be combined (UNION ALL) for this check.
-                  </p>
-                )}
               </div>
 
               <div className="flex items-center gap-2">
@@ -1271,34 +1507,122 @@ const [tab, setTab] = useState('ai'); // 'ai' | 'manual'
                   ))}
                 </select>
               </div>
-              {prebuiltKey !== 'custom_sql' && (
-                <p className="text-xs text-slate-400 -mt-2">
-                  Fill in <code className="font-mono">&lt;table_name&gt;</code> and any other{' '}
-                  <code className="font-mono">&lt;...&gt;</code> placeholders below yourself - copy the table name
-                  exactly from the dropdown above rather than retyping it, since Fabric table names are sometimes
-                  quoted (e.g. dotted names from auto-loaded files).
-                </p>
+
+              {prebuiltKey === 'custom_sql' ? (
+                <>
+                  <div>
+                    <p className="text-xs font-medium text-slate-500 mb-1">Target tables</p>
+                    <TableCheckboxList
+                      tables={targetTableOptions}
+                      selected={form.targetTables}
+                      onToggle={toggleTargetTable}
+                    />
+                    {form.targetTables.length > 1 && (
+                      <p className="text-xs text-mastek-primary mt-1">
+                        {form.targetTables.length} tables selected - will be combined (UNION ALL) for this check.
+                      </p>
+                    )}
+                  </div>
+
+                  <div className="flex flex-wrap items-center gap-x-4 gap-y-2 text-sm">
+                    <label className="flex items-center gap-2 cursor-pointer">
+                      <input type="radio" checked={form.scriptType === 'sql'} onChange={() => setForm((f) => ({ ...f, scriptType: 'sql' }))}
+                        className="text-mastek-primary focus:ring-mastek-accent" />
+                      SQL <span className="text-slate-400">(runs now)</span>
+                    </label>
+                    <label className="flex items-center gap-2 cursor-pointer">
+                      <input type="radio" checked={form.scriptType === 'pyspark'} onChange={() => setForm((f) => ({ ...f, scriptType: 'pyspark' }))}
+                        className="text-mastek-primary focus:ring-mastek-accent" />
+                      PySpark <span className="text-slate-400">(save only)</span>
+                    </label>
+                  </div>
+
+                  <textarea
+                    value={form.scriptText}
+                    onChange={(e) => setForm((f) => ({ ...f, scriptText: e.target.value }))}
+                    placeholder={form.scriptType === 'sql' ? SQL_PLACEHOLDER : 'def validate(df):\n    ...'}
+                    className="w-full h-40 bg-slate-950 text-slate-100 border border-slate-800 rounded-lg p-4 text-sm font-mono placeholder-slate-600 focus:outline-none focus:ring-2 focus:ring-mastek-accent"
+                  />
+                </>
+              ) : (
+                <>
+                  <p className="text-xs text-slate-400">
+                    Pick the table and column below - the SQL is built for you, no typing required.
+                  </p>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                    {(TEMPLATE_VARS[prebuiltKey] || []).map((varDef) => {
+                      if (varDef.type === 'table') {
+                        return (
+                          <label key={varDef.key} className="block">
+                            <span className="block text-xs font-medium text-slate-500 mb-1">{varDef.label}</span>
+                            <select
+                              value={form.templateVars[varDef.key] || ''}
+                              onChange={(e) => setTemplateVar(varDef.key, e.target.value)}
+                              className="w-full px-2.5 py-1.5 text-sm font-mono border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-mastek-accent"
+                            >
+                              <option value="">Select table</option>
+                              {targetTableOptions.map((t) => <option key={t} value={t}>{t}</option>)}
+                            </select>
+                          </label>
+                        );
+                      }
+                      if (varDef.type === 'column') {
+                        const chosenTable = form.templateVars[varDef.tableKey];
+                        const columns = chosenTable ? commonColumns(templateSchema, [chosenTable]) : [];
+                        return (
+                          <label key={varDef.key} className="block">
+                            <span className="block text-xs font-medium text-slate-500 mb-1">{varDef.label}</span>
+                            <select
+                              value={form.templateVars[varDef.key] || ''}
+                              onChange={(e) => setTemplateVar(varDef.key, e.target.value)}
+                              disabled={!chosenTable}
+                              className="w-full px-2.5 py-1.5 text-sm font-mono border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-mastek-accent disabled:opacity-50"
+                            >
+                              <option value="">{chosenTable ? 'Select column' : 'Select table first'}</option>
+                              {columns.map((c) => <option key={c.name} value={c.name}>{c.name} ({c.data_type})</option>)}
+                            </select>
+                          </label>
+                        );
+                      }
+                      if (varDef.type === 'textarea') {
+                        return (
+                          <label key={varDef.key} className="block sm:col-span-2">
+                            <span className="block text-xs font-medium text-slate-500 mb-1">{varDef.label}</span>
+                            <textarea
+                              value={form.templateVars[varDef.key] || ''}
+                              onChange={(e) => setTemplateVar(varDef.key, e.target.value)}
+                              rows={2}
+                              className="w-full px-2.5 py-1.5 text-sm font-mono border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-mastek-accent"
+                            />
+                          </label>
+                        );
+                      }
+                      // 'text' | 'number' | 'list'
+                      return (
+                        <label key={varDef.key} className="block">
+                          <span className="block text-xs font-medium text-slate-500 mb-1">{varDef.label}</span>
+                          <input
+                            type={varDef.type === 'number' ? 'number' : 'text'}
+                            value={form.templateVars[varDef.key] || ''}
+                            onChange={(e) => setTemplateVar(varDef.key, e.target.value)}
+                            placeholder={varDef.type === 'list' ? 'e.g. Active, Pending, Closed' : undefined}
+                            className="w-full px-2.5 py-1.5 text-sm border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-mastek-accent"
+                          />
+                        </label>
+                      );
+                    })}
+                  </div>
+
+                  <div>
+                    <p className="text-xs font-medium text-slate-500 mb-1">Generated SQL (read-only)</p>
+                    <textarea
+                      value={form.scriptText}
+                      readOnly
+                      className="w-full h-32 bg-slate-950 text-slate-100 border border-slate-800 rounded-lg p-4 text-sm font-mono cursor-default focus:outline-none"
+                    />
+                  </div>
+                </>
               )}
-
-              <div className="flex flex-wrap items-center gap-x-4 gap-y-2 text-sm">
-                <label className="flex items-center gap-2 cursor-pointer">
-                  <input type="radio" checked={form.scriptType === 'sql'} onChange={() => setForm((f) => ({ ...f, scriptType: 'sql' }))}
-                    className="text-mastek-primary focus:ring-mastek-accent" />
-                  SQL <span className="text-slate-400">(runs now)</span>
-                </label>
-                <label className="flex items-center gap-2 cursor-pointer">
-                  <input type="radio" checked={form.scriptType === 'pyspark'} onChange={() => setForm((f) => ({ ...f, scriptType: 'pyspark' }))}
-                    className="text-mastek-primary focus:ring-mastek-accent" />
-                  PySpark <span className="text-slate-400">(save only)</span>
-                </label>
-              </div>
-
-              <textarea
-                value={form.scriptText}
-                onChange={(e) => setForm((f) => ({ ...f, scriptText: e.target.value }))}
-                placeholder={form.scriptType === 'sql' ? SQL_PLACEHOLDER : 'def validate(df):\n    ...'}
-                className="w-full h-40 bg-slate-950 text-slate-100 border border-slate-800 rounded-lg p-4 text-sm font-mono placeholder-slate-600 focus:outline-none focus:ring-2 focus:ring-mastek-accent"
-              />
             </>
           )}
 
@@ -1331,25 +1655,14 @@ const [tab, setTab] = useState('ai'); // 'ai' | 'manual'
           </h3>
           <div className="flex items-center gap-2">
             {!isSelectingSuite && (
-              <>
-                <button
-                  onClick={enterSuiteSelection}
-                  disabled={testCases.length === 0}
-                  className="flex items-center justify-center gap-2 px-3 py-2 text-sm font-medium text-mastek-primary border border-mastek-primary/40 rounded-lg hover:bg-mastek-primary/10 disabled:opacity-50 disabled:cursor-not-allowed"
-                >
-                  <ListChecks className="w-4 h-4" />
-                  Create Suite
-                </button>
-                <button
-                  onClick={handleRunAll}
-                  disabled={isRunningAll || testCases.length === 0}
-                  className="flex items-center justify-center gap-2 px-4 py-2 text-sm font-medium text-white bg-mastek-success rounded-lg hover:brightness-110 disabled:opacity-50 disabled:cursor-not-allowed"
-                >
-                  {isRunningAll ? <Loader2 className="w-4 h-4 animate-spin" /> : <Rocket className="w-4 h-4" />}
-                  <span className="hidden sm:inline">Run Integration Test Pipeline</span>
-                  <span className="sm:hidden">Run All</span>
-                </button>
-              </>
+              <button
+                onClick={enterSuiteSelection}
+                disabled={testCases.length === 0}
+                className="flex items-center justify-center gap-2 px-3 py-2 text-sm font-medium text-mastek-primary border border-mastek-primary/40 rounded-lg hover:bg-mastek-primary/10 disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                <ListChecks className="w-4 h-4" />
+                Edit Test Suite Membership
+              </button>
             )}
             {isSelectingSuite && (
               <button
@@ -1510,32 +1823,40 @@ const [tab, setTab] = useState('ai'); // 'ai' | 'manual'
         {isSelectingSuite && (
           <div className="border-t border-slate-200 bg-slate-50 px-5 py-3 flex flex-col sm:flex-row sm:items-end gap-3">
             <div className="flex-1 min-w-0">
-              <label className="block text-xs font-medium text-slate-500 mb-1">Suite name</label>
-              <input
-                type="text"
-                value={suiteName}
-                onChange={(e) => setSuiteName(e.target.value)}
-                placeholder="e.g. Nightly critical checks"
-                className="w-full px-3 py-1.5 text-sm border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-mastek-primary/40"
-              />
-            </div>
-            <div className="flex-1 min-w-0">
-              <label className="block text-xs font-medium text-slate-500 mb-1">Description (optional)</label>
-              <input
-                type="text"
-                value={suiteDescription}
-                onChange={(e) => setSuiteDescription(e.target.value)}
-                placeholder="What this suite is for"
-                className="w-full px-3 py-1.5 text-sm border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-mastek-primary/40"
-              />
+              <label className="block text-xs font-medium text-slate-500 mb-1">Suite</label>
+              {isLoadingSuites ? (
+                <div className="flex items-center gap-2 text-sm text-slate-400 px-3 py-1.5">
+                  <Loader2 className="w-3.5 h-3.5 animate-spin" /> Loading suites...
+                </div>
+              ) : availableSuites.length === 0 ? (
+                <p className="text-sm text-slate-400 italic px-1 py-1.5">
+                  No test suites for this validation yet — create one from the Validation Setup tab.
+                </p>
+              ) : (
+                <select
+                  value={targetSuiteId}
+                  onChange={(e) => { setTargetSuiteId(e.target.value); loadSuiteMembers(e.target.value); }}
+                  className="w-full px-3 py-1.5 text-sm border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-mastek-primary/40"
+                >
+                  <option value="">Select a suite</option>
+                  {availableSuites.map((s) => (
+                    <option key={s.id} value={s.id}>{s.name} ({s.test_case_count} test case{s.test_case_count === 1 ? '' : 's'})</option>
+                  ))}
+                </select>
+              )}
+              {targetSuiteId && (
+                <p className="text-xs text-slate-400 mt-1">
+                  Existing members are pre-checked above — uncheck to remove, check others to add.
+                </p>
+              )}
             </div>
             <button
-              onClick={handleCreateSuite}
-              disabled={isCreatingSuite || selectedTestCaseIds.size === 0 || !suiteName.trim()}
+              onClick={handleSaveSuiteMembership}
+              disabled={isAddingToSuite || selectedTestCaseIds.size === 0 || !targetSuiteId}
               className="flex items-center justify-center gap-2 px-4 py-2 text-sm font-medium text-white bg-mastek-primary rounded-lg hover:bg-mastek-primary-dark disabled:opacity-50 disabled:cursor-not-allowed shrink-0"
             >
-              {isCreatingSuite ? <Loader2 className="w-4 h-4 animate-spin" /> : <ListChecks className="w-4 h-4" />}
-              Save Suite
+              {isAddingToSuite ? <Loader2 className="w-4 h-4 animate-spin" /> : <ListChecks className="w-4 h-4" />}
+              Save Suite Membership
             </button>
           </div>
         )}

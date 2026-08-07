@@ -1,86 +1,69 @@
 # Todo
 
-Current state: **clean checkpoint** — no dangling work.
+**Current state: clean checkpoint.** All features below are shipped and verified (backend compiles, frontend lints at the 13-problem baseline, each feature checked against real data in the browser or via curl). Nothing is broken or half-finished. The one open item is that **none of this session's work is committed to git yet** — see "Uncommitted changes" below.
 
-Last major feature (per `HANDOFF.md`): S2D validation Part 4 — multi-table `sql` checks + cross-table key-based parity — shipped and verified. Latest commit `4657bc4` moved cross-table parity execution into Fabric to reduce local compute.
+Read `tasks/lessons.md` before touching anything — several of its entries (StrictMode focus-clearing, migration races, no-use-before-define) will save you from re-discovering the same bugs.
 
-## In-flight (uncommitted working tree)
+## Uncommitted changes (as of 2026-08-07)
 
-Modified files (not yet committed):
-- `Backend/ai_service.py`, `Backend/app.py`, `Backend/s2d/engine.py` — backend changes
-- `Backend/connectors/fabric_connector.py` — small change (~6 lines)
-- `Frontend/src/api.js`, `Frontend/src/components/MappingPanel.jsx`, `Frontend/src/components/TestCasePanel.jsx` — frontend changes
-- `Backend/check_last_results.py` — new debug script that dumps the last 2 rows of `s2d_test_results`
+Everything below is sitting in the working tree, not yet committed. Confirmed via `git status` — do not trust older notes in this file about which files changed, they were stale.
 
-Purpose of these changes is not documented yet — ask the user before assuming.
+**Backend, modified**: `ai_service.py`, `app.py`, `catalog/db.py`, `harvest.py`, `s2d/db.py`, `scheduler.py`, `catalog.db` (real data), `local_data_*.duckdb` (real data).
 
-## Backlog (from HANDOFF.md, explicitly out of scope until asked)
+**Frontend, restructured**: the old flat `Frontend/src/components/*.jsx` (9 page files + all sub-components) were **deleted** and rebuilt under `Frontend/src/pages/` and `Frontend/src/components/{connect,catalog,s2d,schedules}/` — this is an intentional move (see "Frontend folder restructure" entry below), not data loss. Also modified: `App.jsx`, `api.js`. New: `scheduleFormat.js`.
+
+When ready to commit, this represents ~10 distinct features shipped across one long session (full changelog below) — consider whether to squash into one commit or split by feature using the dated section headers below as natural boundaries.
+
+## Feature changelog (newest first)
+
+### AI-suggested rule dedup — 2026-08-07
+
+All 3 "AI Suggest Rules" sample-based flows (single-table, column-parity, cross-table-parity) now avoid duplicating rules on repeat clicks. Two layers: a prompt-level nudge (tell the AI what's already covered) plus a hard dedup-on-save guarantee (skip any AI-proposed rule whose signature already exists, regardless of what the AI does). If everything proposed was a duplicate, the response includes an explicit `message` the UI surfaces distinctly instead of a silent "0 created."
+
+- `ai_service.py`: `_already_covered_section()` shared helper + `already_covered_text` param on all 3 prompt builders and their public functions.
+- `app.py`: all 3 `ai/suggest-*` routes build a signature set from existing test cases before calling the AI (column-pair signature for parity, key-column signature for cross-table-parity, name-based for single-table), skip matches as `"Duplicate of an existing rule"`, add `message` when `created` is empty but the AI proposed something.
+- `TestCasePanel.jsx`: `message` threaded through all 3 summary states, shown as a distinct info callout.
+- **Verified against real data**: ran the actual flow 4× in a row against a live mapping (`Bronze to silver`) — 30 total rules, zero duplicate signatures, confirmed by direct signature-collision check.
+
+### Cascade-delete + schema-driven SQL templates — 2026-08-06
+
+**Cascade delete**: `delete_mapping()` now cascades to `s2d_test_suites` / `s2d_test_suite_cases` / `s2d_suite_schedules`, not just `s2d_test_cases` as before. `app.py`'s delete route deregisters live APScheduler jobs *before* the cascade (avoids a circular import between `s2d/db.py` and `scheduler.py`). Run history is deliberately not cascaded. Verified with a full throwaway fixture — all 5 dependent rows confirmed gone, scheduler job confirmed deregistered.
+
+**Schema-driven templates**: 9 of 10 `PREBUILT_TEMPLATES` in `TestCasePanel.jsx` (all but `custom_sql`) now render table/column dropdowns instead of `<table_name>`/`<column_name>` placeholders the tester had to hand-edit. Dropdowns source from `sourceSchema`/`destinationSchema`, already fetched live — zero new network cost. SQL is assembled automatically, shown read-only. `categorical_check` also upgraded from a fixed 3-value slot to an arbitrary comma-separated list. Known limitation: editing an existing template-built test case falls back to raw-text edit (provenance isn't stored, only the final SQL).
+
+### Five UX/workflow improvements — 2026-08-05
+
+1. Validation selector on Test Suites page (filter by mapping or "All Validations").
+2. "Add to Suite" redesigned into "Edit Suite Membership" — picking a suite pre-checks its current members, freely toggle to add/remove, full-replace on save. Per-row Run/Edit/Delete added to Test Suites page's test-case table. "Edit Suite" button cross-navigates to S2D pre-targeted at that suite.
+3. Catalog is now connector-scoped: `harvested_assets` gained `connector_id` (additive migration + backfill), threaded through the whole harvest pipeline, Catalog page gained a connector selector — needed for when a second connector of the same type exists.
+4. "Mapping" → "Validation" in every user-facing string (not internal names/routes).
+
+**Real bug found & fixed**: the cross-page "focus" handoff (Edit Suite/Edit Test Case buttons) silently failed under React 18 StrictMode's dev-only double-mount check — fixed by not auto-clearing the trigger right after consuming it (see `tasks/lessons.md`). Also fixed two real `no-use-before-define` ESLint violations by reordering, not suppressing.
+
+### Frontend folder restructure — 2026-08-04
+
+Flat `Frontend/src/components/*.jsx` (16 files) reorganized into `pages/` (9 routed pages) and `components/{connect,catalog,s2d,schedules}/` (7 shared widgets, grouped by owning domain). Pure file-move + import-path fix, confirmed via `git status` dependency grep before moving anything — no logic changed. Also renamed "Mapping" nav tab → "Validation Setup" and the generic "Fabrics" mapping → "Public Holidays ID Enrichment Check"; added mapping rename support.
+
+### Harvest filtering + Mapping/Suite workflow restructure — 2026-07-31
+
+Harvest now only shows Lakehouse/Warehouse/DataPipeline for Fabric connectors (was showing every item type). New **Validation Setup** tab (originally "Mapping") owns mapping creation + empty test-suite creation; S2D tab keeps only a lightweight mapping dropdown. "Run Integration Test Pipeline" removed, replaced by "Add Test Cases to Test Suite".
+
+### Global Schedules Dashboard, Harvest schedule editing/refresh, Scheduled Runs, Test Suites — 2026-07-29 to 2026-07-30
+
+Built the whole scheduling subsystem: APScheduler in-process (`scheduler.py`), suite + harvest schedules with coalesce/skip semantics, a visual cron/preset picker (`SchedulePicker.jsx`), per-schedule edit/refresh/delete, and a flat cross-cutting dashboard (`SchedulesDashboard.jsx`). Built Test Suites as a first-class concept (`s2d_test_suites`/`s2d_test_suite_cases`) with run/schedule/edit-membership support. See `tasks/lessons.md` for the StrictMode and migration-ordering lessons learned building this.
+
+## Backlog (explicitly out of scope until asked)
 
 - `AnalyticsPage.jsx` "Trends" and "Scorecard" tabs — disabled stubs, no data model yet.
 - "Isolate Bad Rows" button on `AnalyticsPage.jsx` — disabled, drill-down never implemented.
 - PySpark test-case execution — `script_type='pyspark'` returns ERROR "not wired up yet".
-- No automated test suite (pytest/jest) — verification is manual.
-
-## Test Suites feature — shipped 2026-07-29
-
-Plan: `C:\Users\shlok164201\.claude\plans\bubbly-honking-russell.md`
-
-**Backend** — all done
-- [x] `s2d/db.py`: `s2d_test_suites`, `s2d_test_suite_cases` tables + `_add_missing_test_run_columns()` (nullable `suite_id`)
-- [x] `s2d/db.py`: CRUD — `create_suite`, `list_suites`, `get_suite`, `update_suite`, `delete_suite`; extended `create_run` + `list_runs`
-- [x] `s2d/engine.py`: `_persist_run` accepts `suite_id`; `run_suite(...)`; refactored to `_execute_test_cases` helper
-- [x] `app.py`: routes GET/POST `/api/s2d/suites`, GET/PATCH/DELETE `/api/s2d/suites/<id>`, POST `/api/s2d/suites/<id>/run`
-
-**Frontend** — all done
-- [x] `api.js`: 7 new wrappers
-- [x] `App.jsx`: `ListChecks` nav item between S2D and History
-- [x] `TestSuitesPage.jsx`: two-pane list + detail + Run/Delete
-- [x] `TestCasePanel.jsx`: Create Suite selection mode with checkboxes + bottom bar
-- [x] `HistoryPage.jsx`: Suite column, colSpan 6 → 7
-
-**Verified**
-- Backend `py_compile` clean; migration idempotent (`init_s2d_tables()` ran repeatedly).
-- Curl end-to-end: create/list/get/run/get-run all work; validation rejects bad payloads.
-- Browser flow: created a suite ("smoke suite (UI)") from S2D page with 2 selected test cases → appears in Test Suites → Run Suite → Analytics shows 2 PASS results → History shows suite name in new column; legacy runs show "—".
-- Lint: 13 problems (11 err + 2 warn) — matches pre-change baseline exactly, no new lint debt.
-
-## Scheduled Runs — shipped 2026-07-30
-
-Plan: `C:\Users\shlok164201\.claude\plans\bubbly-honking-russell.md`
-
-**Backend** — all done
-- [x] `requirements.txt`: `APScheduler>=3.10.4,<4.0` (installed 3.11.3)
-- [x] `s2d/db.py`: tables `s2d_suite_schedules`, `harvest_schedules`, `schedule_events` + CRUD + event log helpers
-- [x] `scheduler.py` (new): `init_scheduler`, `add/remove_suite_schedule_job`, `add/remove_harvest_schedule_job`, `compute_next_fires`, `_run_suite_job`, `_run_harvest_job`, misfire listener; APScheduler defaults `max_instances=1, coalesce=True, misfire_grace_time=1800`
-- [x] `app.py`: `WERKZEUG_RUN_MAIN` guarded `init_scheduler()` call; suite/harvest schedule CRUD routes + `/api/schedules` (global) + `/api/schedules/preview`
-
-**Frontend** — all done
-- [x] `api.js`: 12 new wrappers (7 suite/harvest CRUD + preview + global list)
-- [x] `SchedulePicker.jsx` (new): preset dropdown + Custom card (Interval + Specific time tabs) + live preview
-- [x] `SchedulesSection.jsx` (new): reusable list/create/toggle/delete/events widget
-- [x] `TestSuitesPage.jsx`: Schedules section in suite detail
-- [x] `HarvestWizard.jsx`: Schedules section under selected connector
-
-**Verified end-to-end**
-- Backend `py_compile` clean; migration idempotent (all 3 new tables + FK created).
-- Preview: `POST /api/schedules/preview` returns 5 consecutive Fridays 4pm IST for `0 16 * * 5` cron.
-- Real fire: 60s interval suite schedule created via API → APScheduler fired at ~60s → suite ran on live Fabric → run row tagged with `suite_id` → schedule event `'ran'` logged with `run_id` → schedule row `last_status=ran` + `last_fired_at` populated.
-- Validation: bad cron rejected with 400; sub-60s interval rejected; unknown suite/connector returns 404.
-- UI: Custom picker → Specific time → Friday + 16:00 → preview updates to correct upcoming Fridays; Save → schedule row appears with human-readable summary + next-fire timestamp in local TZ.
-- Harvest UI: Schedules section renders under connector selector with same widget.
-- Lint: 13 problems, matches pre-change baseline (no new debt).
-
-## Backlog (from HANDOFF.md, still explicitly out of scope)
-
-## Backlog (from HANDOFF.md, still explicitly out of scope)
-
-- `AnalyticsPage.jsx` "Trends" and "Scorecard" tabs — disabled stubs, no data model yet.
-- "Isolate Bad Rows" button on `AnalyticsPage.jsx` — disabled.
-- PySpark test-case execution — returns ERROR.
-- No automated test suite (pytest/jest).
+- No automated test suite (pytest/jest) — verification has been manual throughout.
 - Cross-mapping test suites (would need engine changes since runs are per-mapping).
-- Cascade cleanup of orphaned junction rows on test-case delete (JOIN naturally hides them).
+- Editing a harvest schedule's `selected_items` inline (today: edit trigger only; refresh adds new items; delete + recreate to remove items).
+- `PATCH /api/s2d/suites/<id>` still rejects an empty `test_case_ids` list — a suite can't be emptied via that endpoint (only relevant if "remove all test cases from suite" is requested).
 
-## Uncommitted working tree
+## Reference docs
 
-New feature files are uncommitted. When ready to commit, also included: prior in-flight changes to `ai_service.py`, `Backend/app.py`, `s2d/engine.py`, `fabric_connector.py`, `Frontend/src/api.js`, `MappingPanel.jsx`, `TestCasePanel.jsx`, and the debug script `check_last_results.py`.
+- `HANDOFF.md` (repo root) — authoritative history of the original S2D Parts 1–4 build (pre-dates this session's work).
+- `README.md` (repo root) — architecture overview, connector abstraction, operational gotchas (plaintext secrets, SELECT-only guard, T-SQL vs DuckDB SQL dialect).
+- Plan files for every feature above are saved at `C:\Users\shlok164201\.claude\plans\bubbly-honking-russell.md` (overwritten per-feature — only the most recent plan survives there; this todo.md is the durable record).
