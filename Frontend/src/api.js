@@ -111,6 +111,35 @@ export function fetchPipelineRun(connectorId, itemId, runId) {
   return request(`/api/connectors/${connectorId}/pipelines/${itemId}/runs/${runId}`);
 }
 
+// Pipeline schedules. Note the path: /api/connectors/:id/schedules is already
+// the harvest schedule list, so these live under their own segment.
+export function fetchPipelineSchedules(connectorId, pipelineItemId) {
+  const query = pipelineItemId ? `?pipeline_item_id=${encodeURIComponent(pipelineItemId)}` : '';
+  return request(`/api/connectors/${connectorId}/pipeline-schedules${query}`);
+}
+
+export function createPipelineSchedule(connectorId, payload) {
+  return request(`/api/connectors/${connectorId}/pipeline-schedules`, {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  });
+}
+
+export function updatePipelineSchedule(scheduleId, payload) {
+  return request(`/api/pipelines/schedules/${scheduleId}`, {
+    method: 'PATCH',
+    body: JSON.stringify(payload),
+  });
+}
+
+export function deletePipelineSchedule(scheduleId) {
+  return request(`/api/pipelines/schedules/${scheduleId}`, { method: 'DELETE' });
+}
+
+export function fetchPipelineScheduleEvents(scheduleId, limit = 20) {
+  return request(`/api/pipelines/schedules/${scheduleId}/events?limit=${limit}`);
+}
+
 // --- Harvest ---
 
 export function runHarvest({ connectorId, mode, items }) {

@@ -294,6 +294,24 @@ def init_s2d_tables():
             )
         """)
         conn.execute("""
+            CREATE TABLE IF NOT EXISTS pipeline_schedules (
+                id TEXT PRIMARY KEY,
+                connector_id TEXT NOT NULL,
+                pipeline_item_id TEXT NOT NULL,   -- the Fabric DataPipeline item id
+                pipeline_name TEXT,               -- display name, cached so a renamed/deleted
+                                                  -- pipeline still shows something meaningful
+                trigger_type TEXT NOT NULL,
+                trigger_config TEXT NOT NULL,
+                timezone TEXT NOT NULL DEFAULT 'UTC',
+                active INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL,
+                last_fired_at TEXT,
+                last_run_id TEXT,                 -- Fabric job-instance id, like suite schedules
+                last_status TEXT,
+                misfire_count INTEGER NOT NULL DEFAULT 0
+            )
+        """)
+        conn.execute("""
             CREATE TABLE IF NOT EXISTS schedule_events (
                 id TEXT PRIMARY KEY,
                 schedule_kind TEXT NOT NULL,
@@ -847,8 +865,20 @@ def touch_suite_schedule(schedule_id, last_status, last_run_id=None):
         """, (now, last_status, last_run_id, schedule_id))
 
 
+# The one place a schedule kind maps to its table. Deliberately a dict and not
+# an if/else chain: this was `'s2d_suite_schedules' if kind == 'suite' else
+# 'harvest_schedules'`, so ANY new kind silently issued its UPDATE against the
+# harvest table - no exception, no log, misfire counts quietly lost. A KeyError
+# on an unknown kind is far better than a wrong-table write.
+SCHEDULE_TABLES = {
+    'suite': 's2d_suite_schedules',
+    'harvest': 'harvest_schedules',
+    'pipeline': 'pipeline_schedules',
+}
+
+
 def bump_schedule_misfire(schedule_kind, schedule_id):
-    table = 's2d_suite_schedules' if schedule_kind == 'suite' else 'harvest_schedules'
+    table = SCHEDULE_TABLES[schedule_kind]
     with get_conn() as conn:
         conn.execute(f"UPDATE {table} SET misfire_count = misfire_count + 1 WHERE id = ?", (schedule_id,))
 
@@ -927,6 +957,111 @@ def touch_harvest_schedule(schedule_id, last_status):
             SET last_fired_at = ?, last_status = ?
             WHERE id = ?
         """, (now, last_status, schedule_id))
+
+
+# Pipeline schedules - same shape as suite schedules, which also carry a
+# last_run_id (a Fabric job-instance id here, an S2D run id there) ------------
+
+def create_pipeline_schedule(connector_id, pipeline_item_id, pipeline_name,
+                              trigger_type, trigger_config, timezone_name):
+    schedule_id = str(uuid.uuid4())
+    now = datetime.now(timezone.utc).isoformat()
+    with get_conn() as conn:
+        conn.execute("""
+            INSERT INTO pipeline_schedules
+                (id, connector_id, pipeline_item_id, pipeline_name,
+                 trigger_type, trigger_config, timezone, active, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)
+        """, (schedule_id, connector_id, pipeline_item_id, pipeline_name,
+              trigger_type, json.dumps(trigger_config), timezone_name, now))
+    return schedule_id
+
+
+def list_pipeline_schedules(connector_id=None, pipeline_item_id=None):
+    # LEFT JOIN so a schedule whose connector was deleted still lists (with a
+    # NULL name the UI renders as "(deleted connector)") rather than vanishing
+    # while its job is still registered.
+    query = """
+        SELECT p.*, c.name AS connector_name
+        FROM pipeline_schedules p
+        LEFT JOIN connector_configs c ON c.id = p.connector_id
+    """
+    clauses, params = [], []
+    if connector_id:
+        clauses.append("p.connector_id = ?")
+        params.append(connector_id)
+    if pipeline_item_id:
+        clauses.append("p.pipeline_item_id = ?")
+        params.append(pipeline_item_id)
+    if clauses:
+        query += " WHERE " + " AND ".join(clauses)
+    query += " ORDER BY p.created_at DESC"
+    with get_conn() as conn:
+        rows = conn.execute(query, params).fetchall()
+        return [_schedule_row_to_dict(r) for r in rows]
+
+
+def get_pipeline_schedule(schedule_id):
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM pipeline_schedules WHERE id = ?", (schedule_id,)
+        ).fetchone()
+        return _schedule_row_to_dict(row) if row else None
+
+
+def update_pipeline_schedule(schedule_id, trigger_type=None, trigger_config=None,
+                              timezone_name=None, active=None):
+    with get_conn() as conn:
+        current = conn.execute(
+            "SELECT * FROM pipeline_schedules WHERE id = ?", (schedule_id,)
+        ).fetchone()
+        if not current:
+            return False
+        new_trigger_type = trigger_type if trigger_type is not None else current["trigger_type"]
+        new_trigger_config = json.dumps(trigger_config) if trigger_config is not None else current["trigger_config"]
+        new_tz = timezone_name if timezone_name is not None else current["timezone"]
+        new_active = (1 if active else 0) if active is not None else current["active"]
+        conn.execute("""
+            UPDATE pipeline_schedules
+            SET trigger_type = ?, trigger_config = ?, timezone = ?, active = ?
+            WHERE id = ?
+        """, (new_trigger_type, new_trigger_config, new_tz, new_active, schedule_id))
+    return True
+
+
+def delete_pipeline_schedule(schedule_id):
+    with get_conn() as conn:
+        conn.execute("DELETE FROM pipeline_schedules WHERE id = ?", (schedule_id,))
+
+
+def delete_pipeline_schedules_for_connector(connector_id):
+    """Ids of the rows removed, so the caller can deregister their live jobs."""
+    with get_conn() as conn:
+        ids = [r["id"] for r in conn.execute(
+            "SELECT id FROM pipeline_schedules WHERE connector_id = ?", (connector_id,)
+        ).fetchall()]
+        conn.execute("DELETE FROM pipeline_schedules WHERE connector_id = ?", (connector_id,))
+    return ids
+
+
+def delete_harvest_schedules_for_connector(connector_id):
+    """Ids of the rows removed, so the caller can deregister their live jobs."""
+    with get_conn() as conn:
+        ids = [r["id"] for r in conn.execute(
+            "SELECT id FROM harvest_schedules WHERE connector_id = ?", (connector_id,)
+        ).fetchall()]
+        conn.execute("DELETE FROM harvest_schedules WHERE connector_id = ?", (connector_id,))
+    return ids
+
+
+def touch_pipeline_schedule(schedule_id, last_status, last_run_id=None):
+    now = datetime.now(timezone.utc).isoformat()
+    with get_conn() as conn:
+        conn.execute("""
+            UPDATE pipeline_schedules
+            SET last_fired_at = ?, last_status = ?, last_run_id = COALESCE(?, last_run_id)
+            WHERE id = ?
+        """, (now, last_status, last_run_id, schedule_id))
 
 
 # Schedule events ------------------------------------------------------------

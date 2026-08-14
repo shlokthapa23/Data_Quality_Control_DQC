@@ -114,6 +114,15 @@ def test_connector_draft():
 
 @app.route('/api/connectors/<connector_id>', methods=['DELETE'])
 def delete_connector(connector_id):
+    # Deregister and delete this connector's schedules BEFORE dropping it.
+    # Previously they were left behind entirely, so a deleted connector kept a
+    # live APScheduler job firing forever - erroring on every tick against a
+    # connector that no longer existed. Same reasoning as delete_s2d_mapping,
+    # which already deregisters its suites' schedules.
+    for schedule_id in s2d_db.delete_harvest_schedules_for_connector(connector_id):
+        _scheduler.remove_harvest_schedule_job(schedule_id)
+    for schedule_id in s2d_db.delete_pipeline_schedules_for_connector(connector_id):
+        _scheduler.remove_pipeline_schedule_job(schedule_id)
     catalog_db.delete_connector_config(connector_id)
     return jsonify({"deleted": connector_id})
 
@@ -1694,17 +1703,124 @@ def list_harvest_schedule_events_route(schedule_id):
 
 # Cross-cutting --------------------------------------------------------------
 
+# --- Pipeline schedules -----------------------------------------------------
+# Note the URL shape: /api/connectors/<id>/schedules is already the harvest
+# schedule list, so pipelines get their own path rather than overloading it.
+
+@app.route('/api/connectors/<connector_id>/pipeline-schedules', methods=['GET'])
+def list_pipeline_schedules_route(connector_id):
+    item_id = request.args.get("pipeline_item_id")
+    schedules = s2d_db.list_pipeline_schedules(connector_id=connector_id, pipeline_item_id=item_id)
+    for s in schedules:
+        s["next_fires"] = _serialize_next_fires(
+            s["trigger_type"], s["trigger_config"], s.get("timezone")) if s.get("active") else []
+    return jsonify({"schedules": schedules})
+
+
+@app.route('/api/connectors/<connector_id>/pipeline-schedules', methods=['POST'])
+def create_pipeline_schedule_route(connector_id):
+    """Body: { pipeline_item_id, pipeline_name, trigger_type, trigger_config, timezone }"""
+    connector, error = _fabric_connector_or_error(connector_id)
+    if error:
+        return error
+
+    body = request.get_json(force=True) or {}
+    item_id = (body.get("pipeline_item_id") or "").strip()
+    if not item_id:
+        return jsonify({"error": "pipeline_item_id is required"}), 400
+
+    err, parsed = _validate_schedule_body(body)
+    if err:
+        return jsonify({"error": err}), 400
+    trigger_type, trigger_config, timezone_name = parsed
+
+    schedule_id = s2d_db.create_pipeline_schedule(
+        connector_id, item_id, body.get("pipeline_name"), trigger_type, trigger_config, timezone_name)
+    row = s2d_db.get_pipeline_schedule(schedule_id)
+    try:
+        _scheduler.add_pipeline_schedule_job(row)
+    except Exception as e:
+        # Roll the row back rather than leave a schedule that will never fire.
+        s2d_db.delete_pipeline_schedule(schedule_id)
+        return jsonify({"error": f"Failed to register schedule: {e}"}), 500
+    return jsonify({
+        "id": schedule_id,
+        "next_fires": _serialize_next_fires(trigger_type, trigger_config, timezone_name),
+    }), 201
+
+
+@app.route('/api/pipelines/schedules/<schedule_id>', methods=['PATCH'])
+def update_pipeline_schedule_route(schedule_id):
+    existing = s2d_db.get_pipeline_schedule(schedule_id)
+    if not existing:
+        return jsonify({"error": "Schedule not found"}), 404
+    body = request.get_json(force=True) or {}
+
+    if any(k in body for k in ("trigger_type", "trigger_config", "timezone")):
+        # Validate the MERGED trigger, so changing only the timezone still
+        # checks it against the stored cron expression.
+        merged = {
+            "trigger_type": body.get("trigger_type", existing["trigger_type"]),
+            "trigger_config": body.get("trigger_config", existing["trigger_config"]),
+            "timezone": body.get("timezone", existing.get("timezone") or "UTC"),
+        }
+        err, _ = _validate_schedule_body(merged)
+        if err:
+            return jsonify({"error": err}), 400
+
+    s2d_db.update_pipeline_schedule(
+        schedule_id,
+        trigger_type=body.get("trigger_type"),
+        trigger_config=body.get("trigger_config"),
+        timezone_name=body.get("timezone"),
+        active=body.get("active"),
+    )
+    updated = s2d_db.get_pipeline_schedule(schedule_id)
+    # Unconditional remove then conditional re-add is how the active toggle
+    # pauses a job without losing the row.
+    _scheduler.remove_pipeline_schedule_job(schedule_id)
+    if updated.get("active"):
+        try:
+            _scheduler.add_pipeline_schedule_job(updated)
+        except Exception as e:
+            return jsonify({"error": f"Failed to re-register schedule: {e}"}), 500
+    updated["next_fires"] = _serialize_next_fires(
+        updated["trigger_type"], updated["trigger_config"], updated.get("timezone")) if updated.get("active") else []
+    return jsonify(updated)
+
+
+@app.route('/api/pipelines/schedules/<schedule_id>', methods=['DELETE'])
+def delete_pipeline_schedule_route(schedule_id):
+    _scheduler.remove_pipeline_schedule_job(schedule_id)
+    s2d_db.delete_pipeline_schedule(schedule_id)
+    return jsonify({"ok": True})
+
+
+@app.route('/api/pipelines/schedules/<schedule_id>/events', methods=['GET'])
+def list_pipeline_schedule_events_route(schedule_id):
+    limit = request.args.get("limit", default=50, type=int)
+    return jsonify({"events": s2d_db.list_schedule_events("pipeline", schedule_id, limit=limit)})
+
+
 @app.route('/api/schedules', methods=['GET'])
 def list_all_schedules_route():
     suites = s2d_db.list_suite_schedules()
     harvests = s2d_db.list_harvest_schedules()
+    pipelines = s2d_db.list_pipeline_schedules()
     for s in suites:
         s["kind"] = "suite"
         s["next_fires"] = _serialize_next_fires(s["trigger_type"], s["trigger_config"], s.get("timezone")) if s.get("active") else []
     for h in harvests:
         h["kind"] = "harvest"
         h["next_fires"] = _serialize_next_fires(h["trigger_type"], h["trigger_config"], h.get("timezone")) if h.get("active") else []
-    return jsonify({"suite_schedules": suites, "harvest_schedules": harvests})
+    for p in pipelines:
+        p["kind"] = "pipeline"
+        p["next_fires"] = _serialize_next_fires(p["trigger_type"], p["trigger_config"], p.get("timezone")) if p.get("active") else []
+    return jsonify({
+        "suite_schedules": suites,
+        "harvest_schedules": harvests,
+        "pipeline_schedules": pipelines,
+    })
 
 
 @app.route('/api/schedules/preview', methods=['POST'])

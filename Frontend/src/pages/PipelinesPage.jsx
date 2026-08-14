@@ -1,11 +1,15 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   PlayCircle, Loader2, AlertCircle, CheckCircle2, XCircle, RefreshCw,
-  ArrowRight, Workflow,
+  ArrowRight, Workflow, CalendarClock,
 } from 'lucide-react';
 import {
-  fetchConnectors, fetchPipelines, runPipeline, fetchPipelineRun, fetchPipelineRuns,
+  fetchConnectors, fetchConnectorContainers, fetchContainerTables,
+  fetchPipelines, runPipeline, fetchPipelineRun, fetchPipelineRuns,
+  fetchPipelineSchedules, createPipelineSchedule, updatePipelineSchedule,
+  deletePipelineSchedule, fetchPipelineScheduleEvents,
 } from '../api';
+import SchedulesSection from '../components/schedules/SchedulesSection';
 
 // Fabric reports NotStarted/InProgress while a job is live; everything else
 // (Completed, Failed, Cancelled, Deduped) is terminal. The backend already
@@ -38,6 +42,69 @@ function formatTime(iso) {
   return Number.isNaN(d.getTime()) ? iso : d.toLocaleString();
 }
 
+/**
+ * "2m 14s" between two timestamps. Fabric stamps these without a timezone
+ * suffix (e.g. "2026-08-14T05:13:35.3166667"), which JS would read as LOCAL
+ * time - so a Z is appended when one is missing, otherwise the duration is off
+ * by the browser's UTC offset and can even come out negative.
+ */
+function parseUtc(iso) {
+  if (!iso) return null;
+  const normalized = /[Zz]|[+-]\d\d:?\d\d$/.test(iso) ? iso : `${iso}Z`;
+  const ms = Date.parse(normalized);
+  return Number.isNaN(ms) ? null : ms;
+}
+
+function formatDuration(fromIso, toIso) {
+  const start = parseUtc(fromIso);
+  const end = toIso ? parseUtc(toIso) : Date.now();
+  if (start === null || end === null) return null;
+  const seconds = Math.max(0, Math.round((end - start) / 1000));
+  if (seconds < 60) return `${seconds}s`;
+  const m = Math.floor(seconds / 60);
+  const s = seconds % 60;
+  if (m < 60) return s ? `${m}m ${s}s` : `${m}m`;
+  return `${Math.floor(m / 60)}h ${m % 60}m`;
+}
+
+/**
+ * What actually changed in the watched Lakehouse, by comparing table row counts
+ * taken before the run with the same taken after.
+ *
+ * Fabric exposes no per-activity detail - the activity-run endpoints don't
+ * exist - so measuring the effect is the only way to report which tables a run
+ * touched, and it works for every pipeline shape including the ones whose table
+ * list is decided at runtime.
+ *
+ * Returns only rows that MOVED. A rewrite that lands the same number of rows is
+ * invisible to this, which the UI says out loud rather than implying nothing
+ * happened.
+ */
+function diffSnapshots(before, after) {
+  if (!before || !after) return [];
+  const changes = [];
+  const names = new Set([...Object.keys(before), ...Object.keys(after)]);
+  for (const name of names) {
+    const from = before[name];
+    const to = after[name];
+    if (from === to) continue;
+    changes.push({
+      name,
+      from: from ?? null,
+      to: to ?? null,
+      added: from === undefined,
+      removed: to === undefined,
+      delta: (to ?? 0) - (from ?? 0),
+    });
+  }
+  return changes.sort((a, b) => Math.abs(b.delta) - Math.abs(a.delta));
+}
+
+/** Table name -> row count, from the tables endpoint's payload. */
+function snapshotOf(tables) {
+  return Object.fromEntries((tables || []).map((t) => [t.name, t.row_count]));
+}
+
 export default function PipelinesPage({ onGoToHarvest }) {
   const [connectors, setConnectors] = useState([]);
   const [connectorId, setConnectorId] = useState('');
@@ -52,6 +119,15 @@ export default function PipelinesPage({ onGoToHarvest }) {
   const [pollExpired, setPollExpired] = useState(false);
   const [history, setHistory] = useState([]);
 
+  // Which Lakehouse to measure for changes. The framework can't know which one
+  // a given pipeline writes to - Fabric doesn't say - so the tester picks.
+  const [containers, setContainers] = useState([]);
+  const [watchContainerId, setWatchContainerId] = useState('');
+  // { before, after, status } - snapshots are table name -> row count.
+  const [tableDiff, setTableDiff] = useState(null);
+  // Which pipeline's schedules are open, so SchedulesSection knows its parent.
+  const [schedulingFor, setSchedulingFor] = useState(null);
+
   // Which connector's pipelines we most recently asked for. Loading is driven by
   // actions (page load, changing the dropdown) rather than by an effect watching
   // connectorId, so nothing sets state synchronously during render. This ref is
@@ -63,6 +139,7 @@ export default function PipelinesPage({ onGoToHarvest }) {
     requestedConnectorRef.current = id;
     if (!id) {
       setPipelines([]);
+      setContainers([]);
       return;
     }
     setIsLoading(true);
@@ -79,7 +156,27 @@ export default function PipelinesPage({ onGoToHarvest }) {
         setPipelines([]);
         setIsLoading(false);
       });
+    // Lakehouses to offer as the "watch for changes" target.
+    fetchConnectorContainers(id)
+      .then((data) => {
+        if (requestedConnectorRef.current !== id) return;
+        const list = data.containers || [];
+        setContainers(list);
+        setWatchContainerId((cur) => cur || (list[0]?.id ?? ''));
+      })
+      .catch(() => { if (requestedConnectorRef.current === id) setContainers([]); });
   };
+
+  /** Row counts for every table in the watched Lakehouse, or null if unavailable. */
+  const snapshotWatched = useCallback(async () => {
+    if (!watchContainerId) return null;
+    try {
+      const data = await fetchContainerTables(connectorId, watchContainerId, { includeRowCounts: true });
+      return snapshotOf(data.tables);
+    } catch {
+      return null;  // never let a failed snapshot block the run itself
+    }
+  }, [connectorId, watchContainerId]);
 
   useEffect(() => {
     let cancelled = false;
@@ -136,21 +233,40 @@ export default function PipelinesPage({ onGoToHarvest }) {
           // Refresh history the moment it finishes, so the table below shows the
           // run that just completed. Done here rather than in another effect
           // watching is_running - a callback is exactly where this belongs.
-          if (!r.is_running) loadHistory(pipelineId);
+          if (!r.is_running) {
+            loadHistory(pipelineId);
+            // Take the "after" reading now that the pipeline has stopped
+            // writing, and diff it against the one taken before it started.
+            setTableDiff((prev) => (prev && prev.before ? { ...prev, status: 'measuring' } : prev));
+            snapshotWatched().then((after) => {
+              if (cancelled) return;
+              setTableDiff((prev) => (prev && prev.before
+                ? { ...prev, after, status: after ? 'done' : 'failed' }
+                : prev));
+            });
+          }
         })
         .catch(() => { /* transient - the next tick will try again */ });
     };
 
     timer = setInterval(poll, POLL_MS);
     return () => { cancelled = true; clearInterval(timer); };
-  }, [runId, runIsLive, pipelineId, connectorId, loadHistory]);
+  }, [runId, runIsLive, pipelineId, connectorId, loadHistory, snapshotWatched]);
 
   const handleRun = async (pipeline) => {
     setStartingId(pipeline.id);
     setRunError(null);
     setPollExpired(false);
+    setTableDiff(watchContainerId ? { before: null, after: null, status: 'measuring' } : null);
     try {
-      const { run_id } = await runPipeline(connectorId, pipeline.id);
+      // Read the "before" counts and start the pipeline together. Waiting for
+      // the snapshot first would delay the run by ~10s on Fabric; the pipeline
+      // takes far longer to touch anything than the snapshot takes to finish.
+      const [{ run_id }, before] = await Promise.all([
+        runPipeline(connectorId, pipeline.id),
+        snapshotWatched(),
+      ]);
+      setTableDiff(before ? { before, after: null, status: 'waiting' } : null);
       setActiveRun({
         pipelineId: pipeline.id,
         pipelineName: pipeline.name,
@@ -161,6 +277,7 @@ export default function PipelinesPage({ onGoToHarvest }) {
       loadHistory(pipeline.id);
     } catch (err) {
       setRunError(err.message);
+      setTableDiff(null);
     } finally {
       setStartingId(null);
     }
@@ -209,6 +326,30 @@ export default function PipelinesPage({ onGoToHarvest }) {
           </select>
         </label>
 
+        {containers.length > 0 && (
+          <label className="flex items-center gap-3 max-w-xl">
+            <span className="text-xs font-bold text-slate-400 uppercase tracking-wider shrink-0">
+              Watch
+            </span>
+            <select
+              value={watchContainerId}
+              onChange={(e) => { setWatchContainerId(e.target.value); setTableDiff(null); }}
+              className="flex-1 px-2.5 py-1.5 text-sm border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-mastek-accent"
+            >
+              <option value="">Don&rsquo;t measure table changes</option>
+              {containers.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
+            </select>
+          </label>
+        )}
+        {watchContainerId && (
+          <p className="text-xs text-slate-400">
+            Row counts are read from this Lakehouse just before and just after the run, and the
+            difference is shown below. Fabric doesn&rsquo;t report which tables a pipeline touched, so
+            this measures the effect instead &mdash; a rewrite that lands the same number of rows
+            won&rsquo;t show up.
+          </p>
+        )}
+
         {isLoading && (
           <p className="flex items-center gap-2 text-sm text-slate-500">
             <Loader2 className="w-4 h-4 animate-spin" /> Loading pipelines...
@@ -232,10 +373,21 @@ export default function PipelinesPage({ onGoToHarvest }) {
                   <p className="text-[11px] text-slate-400 font-mono truncate">{p.id}</p>
                 </div>
                 <button
+                  onClick={() => setSchedulingFor((cur) => (cur?.id === p.id ? null : p))}
+                  title="Run this pipeline on a schedule"
+                  className={`ml-auto flex items-center gap-1.5 px-3 py-2 text-sm font-medium rounded-lg border shrink-0 ${
+                    schedulingFor?.id === p.id
+                      ? 'text-mastek-primary bg-mastek-primary/10 border-mastek-primary/40'
+                      : 'text-slate-500 border-slate-300 hover:bg-slate-50'
+                  }`}
+                >
+                  <CalendarClock className="w-4 h-4" /> Schedule
+                </button>
+                <button
                   onClick={() => handleRun(p)}
                   disabled={startingId === p.id || (activeRun?.is_running ?? false)}
                   title={activeRun?.is_running ? 'Wait for the running pipeline to finish' : 'Start this pipeline now'}
-                  className="ml-auto flex items-center gap-2 px-4 py-2 text-sm font-medium text-white bg-mastek-primary rounded-lg hover:brightness-110 disabled:opacity-50 disabled:cursor-not-allowed shrink-0"
+                  className="flex items-center gap-2 px-4 py-2 text-sm font-medium text-white bg-mastek-primary rounded-lg hover:brightness-110 disabled:opacity-50 disabled:cursor-not-allowed shrink-0"
                 >
                   {startingId === p.id
                     ? <Loader2 className="w-4 h-4 animate-spin" />
@@ -280,6 +432,11 @@ export default function PipelinesPage({ onGoToHarvest }) {
             <span className="text-slate-600">{formatTime(activeRun.started_at)}</span>
             <span className="text-slate-400">Finished</span>
             <span className="text-slate-600">{formatTime(activeRun.finished_at)}</span>
+            <span className="text-slate-400">{activeRun.is_running ? 'Running for' : 'Took'}</span>
+            {/* While live this re-renders on each 5s poll, so it ticks along. */}
+            <span className="text-slate-600 font-medium">
+              {formatDuration(activeRun.started_at, activeRun.finished_at) || '--'}
+            </span>
           </div>
 
           {activeRun.failure_reason && (
@@ -312,6 +469,64 @@ export default function PipelinesPage({ onGoToHarvest }) {
         </div>
       )}
 
+      {tableDiff && (
+        <div className="bg-white border border-slate-200 rounded-xl shadow-sm p-4 space-y-2">
+          <h4 className="text-xs font-bold text-slate-400 uppercase tracking-wider">
+            Tables changed
+          </h4>
+          {tableDiff.status !== 'done' && (
+            <p className="flex items-center gap-2 text-sm text-slate-500">
+              {tableDiff.status === 'failed'
+                ? <><AlertCircle className="w-4 h-4 text-amber-600" /> Couldn&rsquo;t read the row counts, so
+                   there&rsquo;s nothing to compare. The run itself is unaffected.</>
+                : <><Loader2 className="w-4 h-4 animate-spin" />
+                   {tableDiff.status === 'waiting'
+                     ? 'Counts recorded. Waiting for the run to finish before measuring again...'
+                     : 'Reading row counts...'}</>}
+            </p>
+          )}
+          {tableDiff.status === 'done' && (() => {
+            const changes = diffSnapshots(tableDiff.before, tableDiff.after);
+            if (changes.length === 0) {
+              return (
+                <p className="text-sm text-slate-500">
+                  No table in this Lakehouse changed row count. Either the run wrote nothing here, or
+                  it replaced rows without changing how many there are.
+                </p>
+              );
+            }
+            return (
+              <table className="w-full text-sm">
+                <thead className="text-left text-xs font-medium text-slate-400 border-b border-slate-100">
+                  <tr>
+                    <th className="px-2 py-2">Table</th>
+                    <th className="px-2 py-2">Before</th>
+                    <th className="px-2 py-2">After</th>
+                    <th className="px-2 py-2">Change</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-100">
+                  {changes.map((c) => (
+                    <tr key={c.name}>
+                      <td className="px-2 py-2 font-mono text-xs text-slate-700 truncate">
+                        {c.name}
+                        {c.added && <span className="ml-2 text-[10px] text-emerald-700 bg-emerald-50 px-1.5 py-0.5 rounded">new</span>}
+                        {c.removed && <span className="ml-2 text-[10px] text-red-600 bg-red-50 px-1.5 py-0.5 rounded">gone</span>}
+                      </td>
+                      <td className="px-2 py-2 text-xs text-slate-500">{c.from === null ? '--' : c.from.toLocaleString()}</td>
+                      <td className="px-2 py-2 text-xs text-slate-500">{c.to === null ? '--' : c.to.toLocaleString()}</td>
+                      <td className={`px-2 py-2 text-xs font-medium ${c.delta >= 0 ? 'text-emerald-700' : 'text-red-600'}`}>
+                        {c.delta >= 0 ? '+' : ''}{c.delta.toLocaleString()}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            );
+          })()}
+        </div>
+      )}
+
       {history.length > 0 && (
         <div className="bg-white border border-slate-200 rounded-xl shadow-sm p-4">
           <h4 className="text-xs font-bold text-slate-400 uppercase tracking-wider mb-2">
@@ -323,6 +538,7 @@ export default function PipelinesPage({ onGoToHarvest }) {
                 <th className="px-2 py-2">Status</th>
                 <th className="px-2 py-2">Started</th>
                 <th className="px-2 py-2">Finished</th>
+                <th className="px-2 py-2">Took</th>
                 <th className="px-2 py-2">Trigger</th>
               </tr>
             </thead>
@@ -332,11 +548,42 @@ export default function PipelinesPage({ onGoToHarvest }) {
                   <td className="px-2 py-2"><StatusBadge status={r.status} /></td>
                   <td className="px-2 py-2 text-slate-600 text-xs">{formatTime(r.started_at)}</td>
                   <td className="px-2 py-2 text-slate-600 text-xs">{formatTime(r.finished_at)}</td>
+                  <td className="px-2 py-2 text-slate-600 text-xs">
+                    {formatDuration(r.started_at, r.finished_at) || '--'}
+                  </td>
                   <td className="px-2 py-2 text-slate-400 text-xs">{r.invoke_type || '--'}</td>
                 </tr>
               ))}
             </tbody>
           </table>
+        </div>
+      )}
+
+      {schedulingFor && (
+        <div className="bg-white border border-slate-200 rounded-xl shadow-sm p-4">
+          <div className="flex items-center gap-2 mb-3">
+            <h4 className="text-xs font-bold text-slate-400 uppercase tracking-wider">
+              Schedules for <span className="font-mono text-slate-600 normal-case">{schedulingFor.name}</span>
+            </h4>
+            <button
+              onClick={() => setSchedulingFor(null)}
+              className="ml-auto text-xs text-slate-400 hover:text-slate-600"
+            >
+              Close
+            </button>
+          </div>
+          {/* SchedulesSection takes its whole API surface as callbacks and knows
+              nothing about schedule kinds, so it drops straight in. */}
+          <SchedulesSection
+            parentId={connectorId}
+            createExtras={{ pipeline_item_id: schedulingFor.id, pipeline_name: schedulingFor.name }}
+            headerHint="Runs this pipeline on a timer. The scheduler waits for each run to finish, so the recorded status is the real outcome."
+            fetchList={(cid) => fetchPipelineSchedules(cid, schedulingFor.id).then((d) => d.schedules || [])}
+            create={createPipelineSchedule}
+            update={updatePipelineSchedule}
+            remove={deletePipelineSchedule}
+            fetchEvents={fetchPipelineScheduleEvents}
+          />
         </div>
       )}
     </div>

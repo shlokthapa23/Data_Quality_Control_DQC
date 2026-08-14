@@ -19,6 +19,7 @@ misfire listener can figure out which schedule to bump.
 
 import logging
 import threading
+import time
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
@@ -106,6 +107,15 @@ def init_scheduler():
                 add_harvest_schedule_job(row)
             except Exception as e:
                 log.error("Failed to register harvest schedule %s: %s", row["id"], e)
+    # Miss a kind here and its schedules survive in the DB, still read as active
+    # in the UI, and simply never fire again after a restart - with nothing
+    # logged. Any new kind MUST get a loop.
+    for row in s2d_db.list_pipeline_schedules():
+        if row.get("active"):
+            try:
+                add_pipeline_schedule_job(row)
+            except Exception as e:
+                log.error("Failed to register pipeline schedule %s: %s", row["id"], e)
 
     log.info("Scheduler started with %d jobs", len(_scheduler.get_jobs()))
     return _scheduler
@@ -264,6 +274,113 @@ def _run_harvest_job(schedule_id):
         s2d_db.record_schedule_event("harvest", schedule_id, "errored", message=str(e))
 
 
+# --- Pipeline jobs ----------------------------------------------------------
+
+# A pipeline run is started remotely and keeps going after the call returns, so
+# the job waits for it rather than firing and forgetting. Two reasons: a fire-
+# and-forget job would record "ran" for a pipeline that fails two minutes later,
+# and max_instances=1 could no longer stop overlapping runs of the same
+# pipeline, because the job would always finish instantly.
+PIPELINE_POLL_SECONDS = 15
+PIPELINE_MAX_WAIT_SECONDS = 30 * 60
+
+
+def _pipeline_job_id(schedule_id):
+    return f"pipeline:{schedule_id}"
+
+
+def add_pipeline_schedule_job(schedule_row):
+    if _scheduler is None:
+        return
+    trigger = _build_trigger(
+        schedule_row["trigger_type"], schedule_row["trigger_config"], schedule_row.get("timezone") or "UTC"
+    )
+    _scheduler.add_job(
+        _run_pipeline_job,
+        trigger=trigger,
+        id=_pipeline_job_id(schedule_row["id"]),
+        args=[schedule_row["id"]],
+        replace_existing=True,
+    )
+
+
+def remove_pipeline_schedule_job(schedule_id):
+    if _scheduler is None:
+        return
+    try:
+        _scheduler.remove_job(_pipeline_job_id(schedule_id))
+    except Exception:
+        pass
+
+
+def _run_pipeline_job(schedule_id):
+    """Fires when a pipeline schedule is due. Same call the Run button makes."""
+    schedule = s2d_db.get_pipeline_schedule(schedule_id)
+    if not schedule:
+        log.warning("Pipeline schedule %s vanished before firing", schedule_id)
+        return
+
+    item_id = schedule["pipeline_item_id"]
+    try:
+        config = catalog_db.get_connector_config(schedule["connector_id"])
+        if not config:
+            raise KeyError("Connector config missing")
+        if config["type"] != "fabric":
+            raise ValueError("Pipelines can only run on a fabric connector")
+        connector = build_connector(config)
+
+        run_id = connector.run_pipeline(item_id)
+        if not run_id:
+            # Fabric accepted it but didn't hand back an id, so there's nothing
+            # to follow. Say that rather than claiming a clean run.
+            msg = "Pipeline started but Fabric returned no run id, so its outcome is unknown"
+            s2d_db.touch_pipeline_schedule(schedule_id, "errored")
+            s2d_db.record_schedule_event("pipeline", schedule_id, "errored", message=msg)
+            return
+
+        status, failure = _await_pipeline_run(connector, item_id, run_id)
+        if status == "Completed":
+            s2d_db.touch_pipeline_schedule(schedule_id, "ran", last_run_id=run_id)
+            s2d_db.record_schedule_event("pipeline", schedule_id, "ran", run_id=run_id,
+                                         message=f"{schedule.get('pipeline_name') or item_id}: Completed")
+            return
+
+        # Anything that isn't Completed - Failed, Cancelled, or still going when
+        # the wait ran out - is recorded as an error. Reporting success for a
+        # failed load would be worse than reporting nothing.
+        message = f"finished as {status}" if status else "still running when the scheduler stopped waiting"
+        if failure:
+            message += f": {failure}"
+        s2d_db.touch_pipeline_schedule(schedule_id, "errored", last_run_id=run_id)
+        s2d_db.record_schedule_event("pipeline", schedule_id, "errored", run_id=run_id, message=message)
+    except Exception as e:
+        log.exception("Pipeline schedule %s errored", schedule_id)
+        s2d_db.touch_pipeline_schedule(schedule_id, "errored")
+        s2d_db.record_schedule_event("pipeline", schedule_id, "errored", message=str(e))
+
+
+def _await_pipeline_run(connector, item_id, run_id):
+    """
+    Blocks until the run reaches a terminal state or the wait cap is hit.
+    Returns (status, failure_reason) - status is None if it never finished.
+
+    A transient read failure doesn't abort the wait: the run is still going, and
+    giving up on one bad poll would report a false outcome.
+    """
+    deadline = time.monotonic() + PIPELINE_MAX_WAIT_SECONDS
+    last = None
+    while time.monotonic() < deadline:
+        time.sleep(PIPELINE_POLL_SECONDS)
+        try:
+            last = connector.get_pipeline_run(item_id, run_id)
+        except Exception as e:
+            log.warning("Could not read pipeline run %s (will retry): %s", run_id, e)
+            continue
+        if not last.get("is_running"):
+            return last.get("status"), last.get("failure_reason")
+    return None, (last or {}).get("failure_reason")
+
+
 # --- Misfire listener -------------------------------------------------------
 
 def _on_job_missed(event):
@@ -272,7 +389,9 @@ def _on_job_missed(event):
     if ":" not in job_id:
         return
     kind, _, schedule_id = job_id.partition(":")
-    if kind not in ("suite", "harvest"):
+    # Miss a kind here and its dropped fires record nothing at all - no event,
+    # no misfire counter, no log.
+    if kind not in s2d_db.SCHEDULE_TABLES:
         return
     try:
         s2d_db.bump_schedule_misfire(kind, schedule_id)
