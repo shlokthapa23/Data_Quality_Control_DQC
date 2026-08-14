@@ -1,3 +1,15 @@
 claude.md
 HANDOFF.md
-README.md 
+README.md
+
+# Python bytecode - regenerated on import, and it dirtied every diff
+__pycache__/
+*.pyc
+
+# Runtime data, not code. catalog.db holds the real connector/validation
+# state and the .duckdb files hold uploaded local data; both change on every
+# run, so tracking them meant the tree was never clean. The schema is
+# recreated by init_s2d_tables() / init_catalog_tables() on first start,
+# so a fresh clone comes up empty rather than broken.
+catalog.db
+local_data_*.duckdb

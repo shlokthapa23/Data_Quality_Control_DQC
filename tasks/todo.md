@@ -1,25 +1,128 @@
 # Todo
 
-**Current state: clean checkpoint.** All features below are shipped and verified (backend compiles, frontend lints at the 13-problem baseline, each feature checked against real data in the browser or via curl). Nothing is broken or half-finished. The one open item is that **none of this session's work is committed to git yet** — see "Uncommitted changes" below.
+**Current state (2026-08-14): everything works, nothing is half-finished, and everything is committed.**
 
-Read `tasks/lessons.md` before touching anything — several of its entries (StrictMode focus-clearing, migration races, no-use-before-define) will save you from re-discovering the same bugs.
+Backend imports clean, frontend lints at its **9-problem baseline** (all pre-existing), and every feature below was verified against the real Fabric workspace and local DuckDB, not just compiled.
 
-## Uncommitted changes (as of 2026-08-07, second session)
+> ### Committed 2026-08-14
+> The ~936 uncommitted lines on top of `467dd88` went in as four commits, split along the dated headings below:
+>
+> | Commit | Heading |
+> |---|---|
+> | `ad5ce32` | Custom SQL: `passed`/`value` optional (08-13) |
+> | `6540175` | Syntax checker suggests the fix; row counts colour-coded (08-13) |
+> | `5f15fd5` | Pipelines: duration, measured table changes, scheduling (08-14) |
+> | *(this one)* | Docs + repo hygiene |
+>
+> `Backend/app.py` and `TestCasePanel.jsx` each carried hunks for two different features, so they were staged hunk-by-hunk rather than whole-file. The cumulative `467dd88..HEAD` diff was checked line-for-line against the original working-tree diff — nothing was dropped or invented in the split.
+>
+> **Hygiene, settled in the same pass**: `__pycache__/*.pyc`, `catalog.db` and `local_data_*.duckdb` are no longer tracked (`git rm --cached`, added to `.gitignore`). The files stay on disk untouched — Python regenerates the `.pyc`s and `init_s2d_tables()` recreates the schema — but the tree is finally clean, and real workspace data stays out of git history. **A fresh clone therefore starts with no catalog and no connectors.**
 
-Everything through the "AI-suggested rule dedup" entry below **is committed** (`16213cf`). The older note claiming a large uncommitted working tree was stale and has been removed.
+**Read `tasks/lessons.md` first.** Beyond the older React/migration entries, the 2026-08-12→14 section records verified platform constraints that are expensive to rediscover — above all that **DuckDB's mssql extension returns silently wrong numbers for multiple aggregates in one statement**, and that this workspace changes underneath you while you test.
 
-Currently uncommitted: the **Column map** feature, the **8-metric column parity** rework, and **Custom SQL across both sides** (top three entries below). They touch overlapping files, so consider three commits split along the changelog headings.
+### Known small items, none blocking
+
+- The `Row count match` test case is stored with `validation_type = 'Null Value Constraint'`, so the Results table mislabels it. The pinning fix corrects it on next save.
+- A 29-column checksum SQL for the "all data arrived perfectly" proof was offered and never generated.
+- `Isolate Bad Rows`, Trends and Scorecard are disabled stubs — they read as broken features on screen during a demo.
+- **There are no automated tests.** Everything has been verified by hand. The throwaway verification scripts written this session (parity metric matrix, sqlLint cases, SELECT-guard accept/reject table, schedule CRUD + the three silent spots) already encode the hard parts and would convert to pytest cheaply. Recommended next investment after committing.
+
+## What went into which commit
+
+Everything from **"Custom SQL now shows the numbers your query computed"** downward in the changelog was already in `467dd88` or earlier — including the row-count *connector* work; only the colour helpers' extraction into `src/rowCount.js` was still outstanding.
+
+- `ad5ce32` — optional `passed`/`value` — `s2d/engine.py`, `sqlLint.js`, `TestCasePanel.jsx`
+- `6540175` — syntax-checker fix suggestions + row-count colours — `sql_guard.py`, `app.py`, `TestCasePanel.jsx`, `MappingsPage.jsx`, new `src/rowCount.js`
+- `5f15fd5` — pipeline duration, table diff, schedules — `s2d/db.py`, `scheduler.py`, `app.py`, `api.js`, `PipelinesPage.jsx`, `SchedulesDashboard.jsx`
+- Docs + hygiene — `claude.md`, `tasks/lessons.md`, `tasks/todo.md`, `.gitignore`
 
 - **Backend, modified**: `app.py`, `ai_service.py`, `s2d/db.py`, `s2d/engine.py`. **New**: `s2d/column_map.py`.
 - **Frontend, modified**: `api.js`, `pages/S2DPage.jsx`, `pages/MappingsPage.jsx`, `pages/AnalyticsPage.jsx`, `components/s2d/TestCasePanel.jsx`. **New**: `columnMap.js`, `sqlLint.js`, `components/s2d/ColumnMapModal.jsx`.
 - Also modified for the syntax checker: `connectors/base.py`, `connectors/sql_guard.py`, `connectors/fabric_connector.py`, `connectors/local_connector.py`, `local_files/db.py`.
 - Pipelines tab: `connectors/base.py`, `connectors/fabric_connector.py`, `app.py`, `App.jsx`, `api.js`. **New**: `pages/PipelinesPage.jsx`.
-- Row counts: `connectors/base.py`, `connectors/fabric_connector.py`, `connectors/local_connector.py`, `app.py`, `api.js`, `components/s2d/TestCasePanel.jsx`, `pages/MappingsPage.jsx`.
+- Row counts: `connectors/base.py`, `connectors/fabric_connector.py`, `connectors/local_connector.py`, `app.py`, `api.js`, `components/s2d/TestCasePanel.jsx`, `pages/MappingsPage.jsx`. **New**: `src/rowCount.js`.
+- Pipeline duration/diff/schedules: `s2d/db.py`, `scheduler.py`, `app.py`, `api.js`, `pages/PipelinesPage.jsx`, `pages/SchedulesDashboard.jsx`.
 - `components/connect/ConnectorForm.jsx` also shows as modified — that's a user edit, not part of this work.
 - **New**: `.claude/launch.json` (dev-server config for the browser preview — backend on 5000, frontend on 5173).
-- `catalog.db` and `local_data_*.duckdb` show as modified: real runtime data, not code.
+- `catalog.db` and `local_data_*.duckdb` are no longer tracked — real runtime data, not code.
 
 ## Feature changelog (newest first)
+
+### Pipelines: duration, measured table changes, and scheduling — 2026-08-14
+
+*(The tab has since been renamed **Test Data Preparation** and moved between Validation Layer Setup and S2D Validation — same `PipelinesPage` component and `pipelines` route id.)*
+
+**Duration.** `startTimeUtc`/`endTimeUtc` were already fetched and discarded. Now shown as "Took 3m 14s" on the run card and in Recent runs, and as a live "Running for …" that ticks with the existing 5s poll. Fabric stamps these **without a timezone suffix** (`2026-08-14T05:13:35.3166667`), which JS reads as local time — `parseUtc` appends the `Z`, without which every duration would be wrong by the browser's UTC offset and could come out negative.
+
+**Tables changed — measured, not declared.** Confirmed against the live workspace that Fabric exposes no per-activity detail: `queryactivityruns` and `activityruns` both 404, and a job instance carries only status/times/failureReason. Pipeline *definitions* are readable via `getDefinition`, but decoding all five showed it would be blind for three — `PL_SQLServer_To_Lakehouse` picks its tables from a config table at runtime, one is just a notebook, one delegates to a Copy Job item.
+
+So the tab snapshots the watched Lakehouse's row counts immediately before the run and again on completion, and shows the diff (table, before, after, ±, with **new**/**gone** badges). Needed **no new backend** — `fetchContainerTables(..., { includeRowCounts: true })` already returns exactly this. The before-snapshot and the trigger fire in parallel, so measuring doesn't delay the run. Two limits stated in the UI rather than hidden: a rewrite landing an identical row count is invisible, and navigating away mid-run loses the snapshot (the run still completes; only the diff is lost).
+
+**Pipeline schedules** — a third schedule kind, mirroring the suite kind. `SchedulePicker` and `SchedulesSection` were already fully generic, so the UI is a mount with injected callbacks, not new components. New: `pipeline_schedules` table + CRUD, `_pipeline_job_id`/`add_`/`remove_`/`_run_pipeline_job` in `scheduler.py`, routes under `/api/connectors/<id>/pipeline-schedules` and `/api/pipelines/schedules/<id>` (`/connectors/<id>/schedules` is already harvest's), five `api.js` helpers, a Schedule button per pipeline row, and a third table on the Schedules dashboard.
+
+**The scheduled job waits for the run to finish.** `run_pipeline` returns as soon as Fabric accepts the job. Returning there would record `"ran"` for a pipeline that fails two minutes later — not hypothetical, `DataQA_test_shlok` currently fails on a Parquet type mismatch — and would defeat `max_instances=1`, since the job would always end instantly. So it polls to a terminal state (cap 30 min) and records the true outcome; a run still going at the cap records **errored**, not success.
+
+> **Three silent-failure spots had to be updated. There is no central list of schedule kinds.**
+> 1. `bump_schedule_misfire` was `'s2d_suite_schedules' if kind == 'suite' else 'harvest_schedules'` — any third kind silently UPDATEd the **wrong table**, no exception, no log. Replaced with the `SCHEDULE_TABLES` dict so an unknown kind raises.
+> 2. `_on_job_missed` filtered on a hardcoded `("suite", "harvest")` tuple — now keyed off the same dict.
+> 3. `init_scheduler`'s re-registration loops — miss one and those schedules survive in the DB, still read as active, and **never fire again after a restart**.
+
+**Also fixed a pre-existing bug**: `delete_connector` dropped a connector without deregistering its harvest schedules, leaving a live APScheduler job firing and erroring forever. Now deregisters and deletes both harvest and pipeline schedules first, mirroring `delete_s2d_mapping`.
+
+**Verified** (nothing real was triggered — the user asked that no pipeline be started, and the network log confirms zero `/run` POSTs left the app):
+1. Migration clean; `pipeline_schedules` columns as designed.
+2. Full CRUD against the real Fabric connector: create → row **and** APScheduler job; PATCH trigger → re-registered; toggle inactive → job removed, row kept, `next_fires` empty; reactivate → re-registered; delete → both gone.
+3. **The three silent spots explicitly**: the misfire bump hits the pipeline table and an unknown kind raises `KeyError`; the listener accepts a `pipeline:<id>` job id; and after a **faithful restart simulation** the job is re-registered. That last one initially "failed" — because `init_scheduler` early-returns when already started, so calling it twice proves nothing. **My test was wrong, not the code**; fixed to tear the scheduler down first.
+4. `_run_pipeline_job` with a stubbed connector: Completed → `ran`; Failed → `errored` carrying Fabric's reason; never-finishes → `errored` saying it was still running, **not** success.
+5. **Browser**: duration renders live (12s → 22s ticking) and final (3m 14s); the diff shows changed/new/gone correctly; the picker's live NEXT FIRES preview works for the new kind; a saved weekly schedule appears on the dashboard and deletes cleanly from there.
+6. Lint at the 9-problem baseline. Throwaway schedule deleted; orphaned test events removed.
+
+### Syntax checker suggests the fix; row counts colour-coded — 2026-08-13
+
+**Fix suggestions.** The database says what's *wrong*; it rarely says what to *change* — `syntax error at or near "FROM"` doesn't tell a tester their clauses are the wrong way round. `suggest_fix(sql, error)` in `connectors/sql_guard.py` turns each common failure into an instruction, returned as a `hint` alongside the error and shown under it in the editor. Built from the error text and the script alone, so it costs **no extra queries** on a connection that's already expensive to open.
+
+| Failure | What the hint says |
+|---|---|
+| WHERE before FROM | "Put FROM before WHERE - the order is SELECT ... FROM ... WHERE ..." |
+| Misspelled column | "Did you mean one of: `"Gender"`, `"OfferDate"`, …" — lifted from DuckDB's own candidate bindings |
+| Missing table | "Copy it exactly from the table list - Fabric tables need the full quoted form, e.g. `"dbo"."my_table"`" |
+| Not a SELECT | "Only a plain SELECT can run here… never allowed to modify data" |
+| Extra `;` | "Remove the ';' and everything after it" |
+| Unbalanced brackets / quotes | Names which one, by counting them in the script |
+| T-SQL function (`GETDATE()`) | Explains DuckDB is the dialect, and that `\|\|` not `+` joins text |
+
+Deliberately returns `None` when there's nothing more useful to say than the error itself, rather than padding every failure with filler.
+
+**Row count colours.** Populated tables now read dark green on very light green (`emerald-700` on `emerald-50`); **0 rows is red**. An empty table is worth noticing *before* writing a check against it — a rule over 0 rows passes trivially and proves nothing, so it earns a warning colour rather than blending in. A count that couldn't be read stays neutral grey, since that's neither good nor bad. Moved into `src/rowCount.js` (with `formatRowCount` / `rowCountTitle`) rather than exported from `TestCasePanel`, which would have pulled that 90KB component into `MappingsPage`'s bundle for two helpers.
+
+**Verified**:
+1. All 7 failure classes through the real `validate-sql` route against a live Fabric container, each returning a useful hint; a valid query returns **no** hint.
+2. **Browser**: the misspelled-column case shows the DuckDB error *and* `Did you mean one of: "Gender", …` beneath it. Confirmed the hint renders for the table-not-found case too.
+3. **Colours read from computed style**, not class names: populated = `oklch(0.508 0.118 165.612)` (emerald-700) on emerald-50; empty = `oklch(0.577 0.245 27.325)` (red-600) on red-50.
+4. Lint at the 9-problem baseline; throwaway empty table removed.
+
+### Custom SQL boilerplate is no longer required — 2026-08-13
+
+Reported as "headache inducing": having to write `TRUE AS passed` just to see a number, and `AS value` on every dual-script query.
+
+**Both contract columns are now optional.**
+
+- **`passed`** — a single-side script without it runs as a **measurement**: it reports what the query computed and PASSes, with the details leading `Measured only - the script has no "passed" column, so nothing was asserted`. The label matters and was a deliberate choice over silence: a screen of measurements would otherwise read as a wall of verified passes. (Considered a separate `MEASURED` status counted apart from Passed/Failed — more honest about pass rate, but more UI work; parked as a follow-up if pass rates get shown to management.)
+- **`value`** — a dual-script side returning **exactly one column** uses that column, so `SELECT COUNT(*) FROM t` just works. Verified both connectors name an un-aliased count `count_star()`, but the name is irrelevant — being the only column is what makes it unambiguous. **Two or more columns with no `value` remains a loud ERROR**, because guessing which to compare could silently compare the wrong numbers and still look healthy.
+
+Also fixed: the column supplying the value was being repeated in the extras (`source value = 1000 … (source: count_star() = 1000)`); `_interpret_value_row` now reports which column it used so the caller can leave it out.
+
+`sqlLint.js` relaxed to match, or it would have kept demanding aliases the engine no longer needs: the `value` hint now fires **only** when the select list has more than one expression (counting commas outside brackets and literals, so `COUNT(*)` isn't read as two), and the `passed` hint became advisory — "this will run as a measurement" rather than "you must add this". Placeholders and the check-type descriptions updated. The `SQL_PLACEHOLDER` example also had its T-SQL `+` string concat corrected to `||`, which **fails in DuckDB** — the example testers are most likely to copy didn't run.
+
+**Verified against the real Fabric table**:
+1. `SELECT COUNT(*) FROM t WHERE ExperienceYears > 2.2` → PASS, `count_star() = 695`, labelled as measured.
+2. **A real assertion still asserts**: explicit `passed = 0` FAILs; template shape returns exactly `0 nulls`, untouched.
+3. **A script claiming to assert can never silently pass**: junk in `passed` FAILs and is never treated as a measurement.
+4. Un-aliased dual script → `source value = 1000 | destination value = 1000`, no duplication.
+5. Two columns with no `value` → clear ERROR naming the columns.
+6. Explicit `AS value` still wins over other columns.
+7. `sqlLint` over 8 cases including `COUNT(*)` not being miscounted as two columns.
+8. **Browser**: Both-sides shows **no hints** for plain SQL; single-side shows the advisory note, and Save stays enabled — hints never block. Lint at the 9-problem baseline.
 
 ### Custom SQL now shows the numbers your query computed — 2026-08-13
 
