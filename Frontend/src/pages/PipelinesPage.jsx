@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   PlayCircle, Loader2, AlertCircle, CheckCircle2, XCircle, RefreshCw,
-  ArrowRight, Workflow, CalendarClock,
+  ArrowRight, Workflow, CalendarClock, Table2,
 } from 'lucide-react';
 import {
   fetchConnectors, fetchConnectorContainers, fetchContainerTables,
@@ -9,6 +9,7 @@ import {
   fetchPipelineSchedules, createPipelineSchedule, updatePipelineSchedule,
   deletePipelineSchedule, fetchPipelineScheduleEvents,
 } from '../api';
+import { formatRowCount, rowCountStyle, rowCountTitle } from '../rowCount';
 import SchedulesSection from '../components/schedules/SchedulesSection';
 
 // Fabric reports NotStarted/InProgress while a job is live; everything else
@@ -105,6 +106,90 @@ function snapshotOf(tables) {
   return Object.fromEntries((tables || []).map((t) => [t.name, t.row_count]));
 }
 
+/**
+ * What's in the selected Lakehouse right now, with row counts.
+ *
+ * Shown before anything is run, because that's when it's most useful: a tester
+ * preparing test data needs to know which tables already exist and how big they
+ * are in order to tell whether a pipeline needs running at all - and afterwards,
+ * whether it did what they expected.
+ *
+ * Uses the same count badges as the S2D and Validation Setup pickers, so an
+ * empty table reads the same red everywhere. That matters here more than
+ * anywhere else: this is the page where a tester is about to load data into it.
+ */
+function LakehouseTables({ containerName, tables, status, onRefresh }) {
+  const rows = [...(tables || [])].sort((a, b) => a.name.localeCompare(b.name));
+  // ?? not ||: 0 is a perfectly good reading, and it's the one worth noticing.
+  const readable = rows.filter((t) => (t.row_count ?? null) !== null);
+  const total = readable.reduce((sum, t) => sum + t.row_count, 0);
+  const unreadable = rows.length - readable.length;
+  const emptyCount = readable.filter((t) => t.row_count === 0).length;
+
+  return (
+    <div className="bg-white border border-slate-200 rounded-xl shadow-sm p-4 space-y-2">
+      <div className="flex items-center gap-2 flex-wrap">
+        <h4 className="text-xs font-bold text-slate-400 uppercase tracking-wider flex items-center gap-1.5">
+          <Table2 className="w-3.5 h-3.5" /> Tables in
+          <span className="font-mono text-slate-600 normal-case tracking-normal">{containerName}</span>
+        </h4>
+        {status === 'loading' && <Loader2 className="w-3.5 h-3.5 animate-spin text-mastek-primary" />}
+        <button
+          onClick={onRefresh}
+          disabled={status === 'loading'}
+          title="Read the tables and row counts again"
+          className="ml-auto flex items-center gap-1.5 px-2 py-1 text-xs font-medium text-mastek-primary border border-mastek-primary/40 rounded-md hover:bg-mastek-primary/10 disabled:opacity-50"
+        >
+          <RefreshCw className="w-3 h-3" /> Refresh
+        </button>
+      </div>
+
+      {rows.length > 0 && (
+        <p className="text-xs text-slate-500">
+          {rows.length} {rows.length === 1 ? 'table' : 'tables'}
+          {' · '}{total.toLocaleString()} rows in total
+          {emptyCount > 0 && <span className="text-red-600">{' · '}{emptyCount} empty</span>}
+          {unreadable > 0 && <span className="text-slate-400">{' · '}{unreadable} unreadable</span>}
+        </p>
+      )}
+
+      {status === 'error' && (
+        <p className="flex items-start gap-2 text-sm text-amber-700 bg-amber-50 border border-amber-200 rounded px-2.5 py-2">
+          <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
+          Couldn&rsquo;t read this Lakehouse&rsquo;s tables. Running a pipeline still works &mdash; only
+          the listing and the before/after measurement need this.
+        </p>
+      )}
+      {status === 'loading' && rows.length === 0 && (
+        <p className="text-sm text-slate-500">
+          Reading tables and row counts... opening the Fabric connection takes a few seconds.
+        </p>
+      )}
+      {status === 'idle' && rows.length === 0 && (
+        <p className="text-sm text-slate-400 italic">
+          No tables in this Lakehouse yet &mdash; run a pipeline to load some.
+        </p>
+      )}
+
+      {rows.length > 0 && (
+        <div className="border border-slate-200 rounded-lg divide-y divide-slate-100 max-h-80 overflow-y-auto">
+          {rows.map((t) => (
+            <div key={t.name} className="flex items-center gap-3 px-3 py-1.5">
+              <span className="font-mono text-xs text-slate-700 truncate">{t.name}</span>
+              <span
+                className={`ml-auto shrink-0 text-[11px] px-1.5 py-0.5 rounded ${rowCountStyle(t.row_count)}`}
+                title={rowCountTitle(t.row_count)}
+              >
+                {formatRowCount(t.row_count)}
+              </span>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 export default function PipelinesPage({ onGoToHarvest }) {
   const [connectors, setConnectors] = useState([]);
   const [connectorId, setConnectorId] = useState('');
@@ -119,10 +204,13 @@ export default function PipelinesPage({ onGoToHarvest }) {
   const [pollExpired, setPollExpired] = useState(false);
   const [history, setHistory] = useState([]);
 
-  // Which Lakehouse to measure for changes. The framework can't know which one
-  // a given pipeline writes to - Fabric doesn't say - so the tester picks.
+  // Which Lakehouse to list and to measure for changes. The framework can't know
+  // which one a given pipeline writes to - Fabric doesn't say - so the tester picks.
   const [containers, setContainers] = useState([]);
   const [watchContainerId, setWatchContainerId] = useState('');
+  // What's in that Lakehouse right now: [{ name, kind, row_count }] | null.
+  const [tables, setTables] = useState(null);
+  const [tablesStatus, setTablesStatus] = useState('idle'); // 'idle' | 'loading' | 'error'
   // { before, after, status } - snapshots are table name -> row count.
   const [tableDiff, setTableDiff] = useState(null);
   // Which pipeline's schedules are open, so SchedulesSection knows its parent.
@@ -134,12 +222,63 @@ export default function PipelinesPage({ onGoToHarvest }) {
   // what a useEffect cleanup would otherwise give us: a way to drop a slow
   // response for a connector the tester has already switched away from.
   const requestedConnectorRef = useRef('');
+  // Same idea for the table listing, which is the slowest call on this page:
+  // a reading for a Lakehouse the tester has already switched away from must
+  // never overwrite the one they're now looking at.
+  const tablesRequestRef = useRef(0);
 
-  const loadPipelines = (id) => {
+  /**
+   * Load the watched Lakehouse's tables WITH row counts, and return them as a
+   * { name: row_count } snapshot.
+   *
+   * One fetch serves both jobs on this page - what the tester is looking at,
+   * and the before/after readings the run diff is built from - because they are
+   * the same question asked at different moments. Splitting them would double
+   * the round trips, and on Fabric the expensive part is opening the DuckDB
+   * attach (~9s), not the counting (+0.44s).
+   *
+   * Counts are deliberately never cached: pipeline runs change them constantly,
+   * so a remembered number would actively mislead.
+   */
+  const loadTables = useCallback(async (cid, containerId) => {
+    if (!cid || !containerId) {
+      tablesRequestRef.current += 1;  // cancel anything in flight
+      setTables(null);
+      setTablesStatus('idle');
+      return null;
+    }
+    const seq = ++tablesRequestRef.current;
+    setTablesStatus('loading');
+    try {
+      const data = await fetchContainerTables(cid, containerId, { includeRowCounts: true });
+      const list = data.tables || [];
+      // A stale response still answers the caller's question about the moment it
+      // was taken, so it's returned - it just doesn't get to redraw the screen.
+      if (seq === tablesRequestRef.current) {
+        setTables(list);
+        setTablesStatus('idle');
+      }
+      return snapshotOf(list);
+    } catch {
+      if (seq === tablesRequestRef.current) {
+        setTables(null);
+        setTablesStatus('error');
+      }
+      return null;  // never let a failed reading block the run itself
+    }
+  }, []);
+
+  // Wrapped so it's a stable reference the mount effect can legitimately depend
+  // on: everything it closes over is either a ref, a setState, or loadTables,
+  // all of which are stable, so this is created once and the effect still runs
+  // exactly once.
+  const loadPipelines = useCallback((id) => {
     requestedConnectorRef.current = id;
     if (!id) {
       setPipelines([]);
       setContainers([]);
+      setWatchContainerId('');
+      loadTables('', '');
       return;
     }
     setIsLoading(true);
@@ -156,27 +295,37 @@ export default function PipelinesPage({ onGoToHarvest }) {
         setPipelines([]);
         setIsLoading(false);
       });
-    // Lakehouses to offer as the "watch for changes" target.
+    // Lakehouses to list, and to watch for changes.
     fetchConnectorContainers(id)
       .then((data) => {
         if (requestedConnectorRef.current !== id) return;
         const list = data.containers || [];
         setContainers(list);
-        setWatchContainerId((cur) => cur || (list[0]?.id ?? ''));
+        // Always resolve from THIS connector's list. Keeping a previous
+        // selection would point at a Lakehouse in another workspace, which
+        // exists in no dropdown and fails on the next read.
+        const first = list[0]?.id ?? '';
+        setWatchContainerId(first);
+        setTableDiff(null);
+        loadTables(id, first);
       })
-      .catch(() => { if (requestedConnectorRef.current === id) setContainers([]); });
-  };
+      .catch(() => {
+        if (requestedConnectorRef.current !== id) return;
+        setContainers([]);
+        setWatchContainerId('');
+        loadTables('', '');
+      });
+  }, [loadTables]);
 
-  /** Row counts for every table in the watched Lakehouse, or null if unavailable. */
-  const snapshotWatched = useCallback(async () => {
-    if (!watchContainerId) return null;
-    try {
-      const data = await fetchContainerTables(connectorId, watchContainerId, { includeRowCounts: true });
-      return snapshotOf(data.tables);
-    } catch {
-      return null;  // never let a failed snapshot block the run itself
-    }
-  }, [connectorId, watchContainerId]);
+  /**
+   * Row counts for every table in the watched Lakehouse, or null if unavailable.
+   * Taking a reading also refreshes the list on screen, so what the tester sees
+   * is exactly what the diff was computed from - never two different moments.
+   */
+  const snapshotWatched = useCallback(
+    () => loadTables(connectorId, watchContainerId),
+    [connectorId, watchContainerId, loadTables],
+  );
 
   useEffect(() => {
     let cancelled = false;
@@ -194,7 +343,7 @@ export default function PipelinesPage({ onGoToHarvest }) {
       })
       .catch((err) => { if (!cancelled) setLoadError(err.message); });
     return () => { cancelled = true; };
-  }, []);
+  }, [loadPipelines]);
 
   const loadHistory = useCallback((pipelineId) => {
     fetchPipelineRuns(connectorId, pipelineId)
@@ -295,7 +444,7 @@ export default function PipelinesPage({ onGoToHarvest }) {
   const failed = activeRun && !activeRun.is_running && activeRun.status !== 'Completed';
 
   return (
-    <div className="max-w-5xl mx-auto space-y-6">
+    <div className="max-w-7xl mx-auto space-y-6">
       <div>
         <h2 className="text-xl font-bold tracking-tight text-slate-800 flex items-center gap-2">
           <Workflow className="w-5 h-5 text-mastek-primary" /> Data Pipelines
@@ -306,103 +455,123 @@ export default function PipelinesPage({ onGoToHarvest }) {
         </p>
       </div>
 
-      <div className="bg-white border border-slate-200 rounded-xl shadow-sm p-4 space-y-3">
-        <label className="flex items-center gap-3 max-w-xl">
-          <span className="text-xs font-bold text-slate-400 uppercase tracking-wider shrink-0">
-            Connector
-          </span>
-          <select
-            value={connectorId}
-            onChange={(e) => {
-              setConnectorId(e.target.value);
-              setActiveRun(null);
-              setHistory([]);
-              loadPipelines(e.target.value);
-            }}
-            className="flex-1 px-2.5 py-1.5 text-sm border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-mastek-accent"
-          >
-            {connectors.length === 0 && <option value="">No Fabric connector yet — add one on Connect</option>}
-            {connectors.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
-          </select>
-        </label>
-
-        {containers.length > 0 && (
+      {/* Two columns: the pipelines that load data, beside what is actually
+          in the Lakehouse right now. The tester is comparing the two, so
+          stacking them would put the answer off screen while they read the
+          question. Collapses to one column below lg, where side-by-side would
+          squeeze both. */}
+      <div className={`grid gap-6 items-start ${watchContainerId ? 'lg:grid-cols-2' : ''}`}>
+        <div className="bg-white border border-slate-200 rounded-xl shadow-sm p-4 space-y-3">
           <label className="flex items-center gap-3 max-w-xl">
             <span className="text-xs font-bold text-slate-400 uppercase tracking-wider shrink-0">
-              Watch
+              Connector
             </span>
             <select
-              value={watchContainerId}
-              onChange={(e) => { setWatchContainerId(e.target.value); setTableDiff(null); }}
+              value={connectorId}
+              onChange={(e) => {
+                setConnectorId(e.target.value);
+                setActiveRun(null);
+                setHistory([]);
+                loadPipelines(e.target.value);
+              }}
               className="flex-1 px-2.5 py-1.5 text-sm border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-mastek-accent"
             >
-              <option value="">Don&rsquo;t measure table changes</option>
-              {containers.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
+              {connectors.length === 0 && <option value="">No Fabric connector yet — add one on Connect</option>}
+              {connectors.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
             </select>
           </label>
-        )}
-        {watchContainerId && (
-          <p className="text-xs text-slate-400">
-            Row counts are read from this Lakehouse just before and just after the run, and the
-            difference is shown below. Fabric doesn&rsquo;t report which tables a pipeline touched, so
-            this measures the effect instead &mdash; a rewrite that lands the same number of rows
-            won&rsquo;t show up.
-          </p>
-        )}
 
-        {isLoading && (
-          <p className="flex items-center gap-2 text-sm text-slate-500">
-            <Loader2 className="w-4 h-4 animate-spin" /> Loading pipelines...
-          </p>
-        )}
-        {loadError && (
-          <p className="flex items-start gap-2 text-sm text-red-600">
-            <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" /> {loadError}
-          </p>
-        )}
-        {!isLoading && !loadError && pipelines.length === 0 && connectorId && (
-          <p className="text-sm text-slate-400 italic">No Data Pipelines in this workspace.</p>
-        )}
+          {containers.length > 0 && (
+            <label className="flex items-center gap-3 max-w-xl">
+              <span className="text-xs font-bold text-slate-400 uppercase tracking-wider shrink-0">
+                Lakehouse
+              </span>
+              <select
+                value={watchContainerId}
+                onChange={(e) => {
+                  setWatchContainerId(e.target.value);
+                  setTableDiff(null);
+                  loadTables(connectorId, e.target.value);
+                }}
+                className="flex-1 px-2.5 py-1.5 text-sm border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-mastek-accent"
+              >
+                <option value="">Don&rsquo;t list or measure tables</option>
+                {containers.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
+              </select>
+            </label>
+          )}
+          {watchContainerId && (
+            <p className="text-xs text-slate-400">
+              This Lakehouse&rsquo;s tables are listed below with their current row counts. The same
+              counts are read again just before and just after a run, and the difference is shown.
+              Fabric doesn&rsquo;t report which tables a pipeline touched, so this measures the effect
+              instead &mdash; a rewrite that lands the same number of rows won&rsquo;t show up.
+            </p>
+          )}
 
-        {pipelines.length > 0 && (
-          <div className="border border-slate-200 rounded-lg divide-y divide-slate-100">
-            {pipelines.map((p) => (
-              <div key={p.id} className="flex items-center gap-3 px-3 py-2.5">
-                <div className="min-w-0">
-                  <p className="text-sm font-medium text-slate-700 truncate">{p.name}</p>
-                  <p className="text-[11px] text-slate-400 font-mono truncate">{p.id}</p>
+          {isLoading && (
+            <p className="flex items-center gap-2 text-sm text-slate-500">
+              <Loader2 className="w-4 h-4 animate-spin" /> Loading pipelines...
+            </p>
+          )}
+          {loadError && (
+            <p className="flex items-start gap-2 text-sm text-red-600">
+              <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" /> {loadError}
+            </p>
+          )}
+          {!isLoading && !loadError && pipelines.length === 0 && connectorId && (
+            <p className="text-sm text-slate-400 italic">No Data Pipelines in this workspace.</p>
+          )}
+
+          {pipelines.length > 0 && (
+            <div className="border border-slate-200 rounded-lg divide-y divide-slate-100">
+              {pipelines.map((p) => (
+                <div key={p.id} className="flex items-center gap-3 px-3 py-2.5">
+                  <div className="min-w-0">
+                    <p className="text-sm font-medium text-slate-700 truncate">{p.name}</p>
+                    <p className="text-[11px] text-slate-400 font-mono truncate">{p.id}</p>
+                  </div>
+                  <button
+                    onClick={() => setSchedulingFor((cur) => (cur?.id === p.id ? null : p))}
+                    title="Run this pipeline on a schedule"
+                    className={`ml-auto flex items-center gap-1.5 px-3 py-2 text-sm font-medium rounded-lg border shrink-0 ${
+                      schedulingFor?.id === p.id
+                        ? 'text-mastek-primary bg-mastek-primary/10 border-mastek-primary/40'
+                        : 'text-slate-500 border-slate-300 hover:bg-slate-50'
+                    }`}
+                  >
+                    <CalendarClock className="w-4 h-4" /> Schedule
+                  </button>
+                  <button
+                    onClick={() => handleRun(p)}
+                    disabled={startingId === p.id || (activeRun?.is_running ?? false)}
+                    title={activeRun?.is_running ? 'Wait for the running pipeline to finish' : 'Start this pipeline now'}
+                    className="flex items-center gap-2 px-4 py-2 text-sm font-medium text-white bg-mastek-primary rounded-lg hover:brightness-110 disabled:opacity-50 disabled:cursor-not-allowed shrink-0"
+                  >
+                    {startingId === p.id
+                      ? <Loader2 className="w-4 h-4 animate-spin" />
+                      : <PlayCircle className="w-4 h-4" />}
+                    {startingId === p.id ? 'Starting...' : 'Run'}
+                  </button>
                 </div>
-                <button
-                  onClick={() => setSchedulingFor((cur) => (cur?.id === p.id ? null : p))}
-                  title="Run this pipeline on a schedule"
-                  className={`ml-auto flex items-center gap-1.5 px-3 py-2 text-sm font-medium rounded-lg border shrink-0 ${
-                    schedulingFor?.id === p.id
-                      ? 'text-mastek-primary bg-mastek-primary/10 border-mastek-primary/40'
-                      : 'text-slate-500 border-slate-300 hover:bg-slate-50'
-                  }`}
-                >
-                  <CalendarClock className="w-4 h-4" /> Schedule
-                </button>
-                <button
-                  onClick={() => handleRun(p)}
-                  disabled={startingId === p.id || (activeRun?.is_running ?? false)}
-                  title={activeRun?.is_running ? 'Wait for the running pipeline to finish' : 'Start this pipeline now'}
-                  className="flex items-center gap-2 px-4 py-2 text-sm font-medium text-white bg-mastek-primary rounded-lg hover:brightness-110 disabled:opacity-50 disabled:cursor-not-allowed shrink-0"
-                >
-                  {startingId === p.id
-                    ? <Loader2 className="w-4 h-4 animate-spin" />
-                    : <PlayCircle className="w-4 h-4" />}
-                  {startingId === p.id ? 'Starting...' : 'Run'}
-                </button>
-              </div>
-            ))}
-          </div>
-        )}
+              ))}
+            </div>
+          )}
 
-        {runError && (
-          <p className="flex items-start gap-2 text-sm text-red-600 bg-red-50 border border-red-200 rounded-lg px-3 py-2">
-            <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" /> {runError}
-          </p>
+          {runError && (
+            <p className="flex items-start gap-2 text-sm text-red-600 bg-red-50 border border-red-200 rounded-lg px-3 py-2">
+              <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" /> {runError}
+            </p>
+          )}
+        </div>
+
+        {watchContainerId && (
+          <LakehouseTables
+            containerName={containers.find((c) => c.id === watchContainerId)?.name || 'this Lakehouse'}
+            tables={tables}
+            status={tablesStatus}
+            onRefresh={() => loadTables(connectorId, watchContainerId)}
+          />
         )}
       </div>
 
