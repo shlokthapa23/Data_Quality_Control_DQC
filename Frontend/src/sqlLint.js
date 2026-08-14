@@ -13,9 +13,33 @@
  * the one the check compares.
  */
 
-/** The output column each check scope compares. */
+/**
+ * The output column each check scope looks for. Neither is mandatory any more -
+ * a single-side script without `passed` runs as a measurement, and a
+ * dual_script returning one column doesn't need an `AS value` alias - so this
+ * drives an advisory note, not an error.
+ */
 export function requiredColumnFor(checkScope) {
   return checkScope === 'dual_script' ? 'value' : 'passed';
+}
+
+/**
+ * Roughly how many expressions the SELECT list has, by counting commas outside
+ * brackets and string literals - so `COUNT(*)` and `'a,b'` don't read as two.
+ * Only used to decide whether a missing `value` alias is ambiguous: with one
+ * column the engine knows what to compare, with several it can't.
+ */
+function selectListSize(code) {
+  const list = selectList(code);
+  if (!list.trim()) return 0;
+  let depth = 0;
+  let count = 1;
+  for (const ch of list) {
+    if (ch === '(') depth += 1;
+    else if (ch === ')') depth -= 1;
+    else if (ch === ',' && depth === 0) count += 1;
+  }
+  return count;
 }
 
 /**
@@ -91,7 +115,7 @@ function mentionsColumn(list, column) {
  * Returns an array of hint strings - empty means nothing obviously wrong (which
  * is NOT the same as "valid"; only the database can say that).
  */
-export function lintSql(sql, { requiredColumn } = {}) {
+export function lintSql(sql, { scope } = {}) {
   const raw = (sql || '').trim();
   if (!raw) return [];
 
@@ -125,10 +149,24 @@ export function lintSql(sql, { requiredColumn } = {}) {
     hints.push('WHERE must come after FROM — the order is SELECT … FROM … WHERE ….');
   }
 
-  if (requiredColumn && !mentionsColumn(selectList(code), requiredColumn)) {
+  // Neither alias is mandatory any more, so these are advisory rather than
+  // "you must". They only fire where the engine genuinely can't proceed or
+  // where the tester would otherwise be surprised by the verdict.
+  if (scope === 'dual_script' && !mentionsColumn(selectList(code), 'value')) {
+    // One column is unambiguous and the engine just uses it. Several columns
+    // with no `value` is the case it can't resolve.
+    if (selectListSize(code) > 1) {
+      hints.push(
+        'Several columns and none named "value" — the check won\'t know which to '
+        + 'compare. Add AS value to the one you mean.'
+      );
+    }
+  }
+
+  if (scope === 'single_side' && !mentionsColumn(selectList(code), 'passed')) {
     hints.push(
-      `This check reads a column named "${requiredColumn}" — add AS ${requiredColumn} `
-      + 'to the value you want it to use.'
+      'No "passed" column — this will run as a measurement and report its value, '
+      + 'but won\'t assert anything. Add AS passed to make it pass/fail.'
     );
   }
 

@@ -7,16 +7,25 @@ from s2d import db as s2d_db
 
 def _interpret_row(row):
     """
-    A 'sql' test-case script must return one row with a 'passed' column
-    (any of 1/0, True/False, 'true'/'false') and optionally a 'details'
-    column. Anything else is treated as a malformed test case, not a
-    silent pass - we'd rather surface that loudly than guess.
+    A 'sql' test-case script may return a 'passed' column (any of 1/0,
+    True/False, 'true'/'false') and optionally a 'details' column.
+
+    Returns (passed, details, asserted).
+
+    'passed' is OPTIONAL. A script without it - `SELECT COUNT(*) FROM t WHERE
+    ...` - isn't asserting anything, it's asking a question, and answering it
+    beats failing over missing boilerplate. Such a run reports asserted=False so
+    the caller can say plainly that nothing was verified; that label matters,
+    because otherwise a screen of measurements would read as a wall of passes.
+
+    A malformed 'passed' value is still surfaced loudly rather than guessed at -
+    if the script says it's asserting, it has to be interpretable.
     """
     if row is None:
-        return False, "Query returned no rows - expected exactly one row with a 'passed' column"
+        return False, "Query returned no rows - expected exactly one row", True
 
     if "passed" not in row:
-        return False, f"Query result has no 'passed' column (columns returned: {list(row.keys())})"
+        return True, None, False
 
     raw = row["passed"]
     if isinstance(raw, bool):
@@ -26,10 +35,9 @@ def _interpret_row(row):
     elif isinstance(raw, str):
         passed = raw.strip().lower() in ("1", "true", "yes")
     else:
-        return False, f"Could not interpret 'passed' value: {raw!r}"
+        return False, f"Could not interpret 'passed' value: {raw!r}", True
 
-    details = row.get("details")
-    return passed, details
+    return passed, row.get("details"), True
 
 
 def shares_connection(mapping):
@@ -71,18 +79,33 @@ def _describe_extra_columns(row, reserved):
 
 def _interpret_value_row(row, side):
     """
-    A 'dual_script' side must return one row with a 'value' column. Same stance
-    as _interpret_row: a malformed script is surfaced loudly rather than guessed
-    into a pass, because silently comparing None to None would look like a
-    healthy PASS.
-    Returns (value, error_message) - error_message is None when valid.
+    Pulls the number a 'dual_script' side is contributing to the comparison.
+    Returns (value, error_message, column_used) - error_message is None when
+    valid. column_used lets the caller avoid repeating that column in the
+    "extra columns" detail, which would otherwise print the same number twice.
+
+    A 'value' column is used when present, but is NOT required: a script
+    returning exactly one column is unambiguous, so `SELECT COUNT(*) FROM t`
+    works as-is rather than forcing an `AS value` alias onto every query. (Both
+    connectors name that column count_star(), but the name is irrelevant - being
+    the only column is what makes it unambiguous.)
+
+    Two or more columns with no 'value' among them IS ambiguous, and that stays
+    a loud error: guessing which one to compare could silently compare the wrong
+    numbers and still look like a healthy PASS.
     """
     if row is None:
-        return None, f"The {side} script returned no rows - expected exactly one row with a 'value' column"
-    if "value" not in row:
-        return None, (f"The {side} script's result has no 'value' column "
-                      f"(columns returned: {list(row.keys())})")
-    return row["value"], None
+        return None, f"The {side} script returned no rows - expected exactly one row", None
+    if "value" in row:
+        return row["value"], None, "value"
+    if len(row) == 1:
+        only_column = next(iter(row))
+        return row[only_column], None, only_column
+    return None, (
+        f"The {side} script returns {len(row)} columns and none is named 'value', so there's no "
+        f"way to tell which to compare - alias one of them, e.g. ... AS value "
+        f"(columns returned: {list(row.keys())})"
+    ), None
 
 
 def _build_summed_count_query(tables):
@@ -119,7 +142,7 @@ def _run_sql_check(tc, mapping, source_connector, destination_connector):
 
     try:
         row = connector.run_query(container_id, tc["script_text"])
-        passed, details = _interpret_row(row)
+        passed, details, asserted = _interpret_row(row)
         # Optional - a script can additionally return "violations"/"total_rows"
         # columns to populate the Results table's row-level counts; scripts
         # written before this existed simply don't have them, so both fall
@@ -132,6 +155,12 @@ def _run_sql_check(tc, mapping, source_connector, destination_connector):
         extras = _describe_extra_columns(row, _SQL_CHECK_RESERVED)
         if extras:
             details = f"{details} | {extras}" if details else extras
+        if not asserted:
+            # Lead with the caveat: this run proves nothing, it only reports a
+            # number, and a green PASS beside it would otherwise overstate what
+            # happened.
+            note = 'Measured only - the script has no "passed" column, so nothing was asserted'
+            details = f"{note}: {details}" if details else note
         return ("PASS" if passed else "FAIL"), tc["script_text"], details, None, rule_target, violations, total_rows
     except Exception as e:
         return "ERROR", tc["script_text"], None, str(e), rule_target, None, None
@@ -177,10 +206,10 @@ def _run_dual_script_check(tc, mapping, source_connector, destination_connector)
     except Exception as e:
         return "ERROR", evaluated_query, None, f"Destination script failed: {e}", rule_target, None, None
 
-    source_value, error = _interpret_value_row(source_row, "source")
+    source_value, error, source_column = _interpret_value_row(source_row, "source")
     if error:
         return "ERROR", evaluated_query, None, error, rule_target, None, None
-    destination_value, error = _interpret_value_row(destination_row, "destination")
+    destination_value, error, destination_column = _interpret_value_row(destination_row, "destination")
     if error:
         return "ERROR", evaluated_query, None, error, rule_target, None, None
 
@@ -190,8 +219,12 @@ def _run_dual_script_check(tc, mapping, source_connector, destination_connector)
     # anything else it selected is surfaced too - same reasoning as the
     # single-side path, so the two Custom SQL modes don't behave differently.
     extra = []
-    for side, r in (("source", source_row), ("destination", destination_row)):
-        parts = [p for p in (r.get("details"), _describe_extra_columns(r, _DUAL_SCRIPT_RESERVED)) if p]
+    for side, r, used in (("source", source_row, source_column),
+                          ("destination", destination_row, destination_column)):
+        # The column that supplied the value is already reported above, so leave
+        # it out here rather than printing the same number twice.
+        reserved = _DUAL_SCRIPT_RESERVED + ((used,) if used else ())
+        parts = [p for p in (r.get("details"), _describe_extra_columns(r, reserved)) if p]
         if parts:
             extra.append(f"{side}: " + ", ".join(str(p) for p in parts))
     if extra:

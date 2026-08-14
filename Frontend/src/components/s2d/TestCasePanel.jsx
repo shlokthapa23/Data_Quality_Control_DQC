@@ -12,7 +12,7 @@ import {
   fetchTestSuitesForMapping, fetchTestSuite, updateTestSuite,
 } from '../../api';
 import { commonNamesFor } from '../../columnMap';
-import { lintSql, requiredColumnFor } from '../../sqlLint';
+import { lintSql } from '../../sqlLint';
 import ColumnMapModal from './ColumnMapModal';
 
 const SEVERITY_STYLES = {
@@ -268,11 +268,14 @@ function renderTemplateSql(templateKey, vars) {
   return sql;
 }
 
-const SQL_PLACEHOLDER = `-- Must return exactly one row with a "passed" column (0/1)
--- and optionally a "details" column shown in the error trace.
+// Note || for string concat, not + : everything is parsed by DuckDB (Local runs
+// it directly, Fabric through the mssql extension), and T-SQL's + on strings
+// fails there. This example is the one testers copy, so it has to actually run.
+const SQL_PLACEHOLDER = `-- Return "passed" (0/1) for a pass/fail check, plus an
+-- optional "details". Or just SELECT a value to measure it.
 SELECT
   CASE WHEN COUNT(*) = 0 THEN 1 ELSE 0 END AS passed,
-  CAST(COUNT(*) AS VARCHAR) + ' null student_id rows found' AS details
+  CAST(COUNT(*) AS VARCHAR) || ' null student_id rows found' AS details
 FROM students_info
 WHERE student_id IS NULL`;
 
@@ -281,14 +284,14 @@ WHERE student_id IS NULL`;
 // reports its own side's number and the verdict comes from comparing them,
 // which is what lets the two sides live on completely different systems.
 const DUAL_SCRIPT_PLACEHOLDER_SOURCE = `-- Runs on the SOURCE connection.
--- Must return one row with a "value" column.
-SELECT COUNT(DISTINCT customer_id) AS value
+-- Return one row, one column - no alias needed.
+SELECT COUNT(DISTINCT customer_id)
 FROM source_customers
 WHERE status = 'ACTIVE'`;
 
 const DUAL_SCRIPT_PLACEHOLDER_DESTINATION = `-- Runs on the DESTINATION connection.
 -- Write it in the destination's own column names - they don't have to match.
-SELECT COUNT(DISTINCT "CustomerKey") AS value
+SELECT COUNT(DISTINCT "CustomerKey")
 FROM "dbo"."dim_customer"
 WHERE "Status" = 'ACTIVE'`;
 
@@ -792,9 +795,8 @@ const [tab, setTab] = useState('ai'); // 'ai' | 'manual'
   // Per-editor "Check syntax" verdicts, keyed 'source' | 'destination' | 'single'.
   const [sqlCheck, setSqlCheck] = useState({});
 
-  const requiredColumn = requiredColumnFor(form.checkScope);
-  const sourceHints = lintSql(form.scriptText, { requiredColumn });
-  const destinationHints = lintSql(form.destinationScriptText, { requiredColumn: 'value' });
+  const sourceHints = lintSql(form.scriptText, { scope: form.checkScope });
+  const destinationHints = lintSql(form.destinationScriptText, { scope: 'dual_script' });
 
   const setScript = (editorKey, value) => {
     setForm((f) => (editorKey === 'destination'
@@ -1570,9 +1572,9 @@ const [tab, setTab] = useState('ai'); // 'ai' | 'manual'
                 <div className="min-w-0">
                   <div className="text-sm font-medium text-slate-800">Custom SQL script</div>
                   <div className="text-xs text-slate-500 mt-0.5">
-                    Write your own SQL against one side (returning <code className="font-mono">passed</code>), or
-                    against <strong>both</strong> sides &mdash; one script each returning
-                    a <code className="font-mono">value</code>, which get compared.
+                    Write your own SQL against one side &mdash; return <code className="font-mono">passed</code>
+                    {' '}for a pass/fail check, or just select a value to measure it. Or run it against
+                    {' '}<strong>both</strong> sides and have the two results compared.
                   </div>
                 </div>
               </label>
@@ -1839,10 +1841,10 @@ const [tab, setTab] = useState('ai'); // 'ai' | 'manual'
               {isDualScript ? (
               <div className="space-y-3">
                 <p className="text-sm text-slate-500">
-                  Each script runs on its own side&rsquo;s connection and must return <strong>one row</strong> with
-                  a column named <code className="font-mono text-xs">value</code>. The check passes when the two
-                  values are equal. Optionally return a <code className="font-mono text-xs">details</code> column
-                  to explain your number.
+                  Each script runs on its own side&rsquo;s connection and returns <strong>one row</strong>. If it
+                  selects a single column that column is compared &mdash; no alias needed; with several columns,
+                  name the one to compare <code className="font-mono text-xs">value</code>. The check passes when
+                  the two sides are equal.
                   {!sharesConnection && (
                     <> Source and destination are on different connections here, which is exactly why this is two
                     scripts rather than one &mdash; a single SQL statement can&rsquo;t reach both.</>
