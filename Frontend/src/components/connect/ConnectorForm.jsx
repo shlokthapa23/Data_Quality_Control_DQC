@@ -76,7 +76,7 @@ export default function ConnectorForm({ onCreated }) {
             type === 'local' ? 'bg-white shadow text-mastek-primary' : 'text-slate-500'
           }`}
         >
-          <HardDrive className="w-3.5 h-3.5" /> Local Files
+          <HardDrive className="w-3.5 h-3.5" /> Upload Local Files
         </button>
       </div>
 
@@ -92,7 +92,7 @@ export default function ConnectorForm({ onCreated }) {
 
       {type === 'local' && (
         <div className="space-y-3">
-          <Field label="Connector Name" value={localName} onChange={(e) => { setLocalName(e.target.value); setTestResult(null); }} placeholder="My Local Files" />
+          <Field label="Folder Name " value={localName} onChange={(e) => { setLocalName(e.target.value); setTestResult(null); }} placeholder="Folder Name" />
           <p className="text-xs text-slate-400">
             No credentials needed - you'll upload CSV/Parquet files directly after creating this.
           </p>

@@ -1,0 +1,19 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "backend",
+      "runtimeExecutable": "D:\\Fabrics_analytics_app\\Backend\\.venv\\Scripts\\python.exe",
+      "runtimeArgs": ["app.py"],
+      "cwd": "D:\\Fabrics_analytics_app\\Backend",
+      "port": 5000
+    },
+    {
+      "name": "frontend",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["run", "dev"],
+      "cwd": "D:\\Fabrics_analytics_app\\Frontend",
+      "port": 5173
+    }
+  ]
+}

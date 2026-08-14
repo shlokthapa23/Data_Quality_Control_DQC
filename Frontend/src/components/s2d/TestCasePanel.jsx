@@ -1,15 +1,19 @@
 import { useEffect, useState } from 'react';
 import {
   Sparkles, Code2, Plus, Trash2, Loader2, AlertCircle, GitCompareArrows,
-  Pencil, Play, X, FileCode2, Wand2, User, ListChecks, CheckCircle2,
+  Pencil, Play, X, FileCode2, Wand2, User, ListChecks, CheckCircle2, Columns3,
+  Search, ArrowRight, ArrowLeft,
 } from 'lucide-react';
 import {
   fetchS2DTestCases, createS2DTestCase, updateS2DTestCase, deleteS2DTestCase,
-  runSingleS2DTestCase, fetchContainerTables, generateAITestCase,
+  runSingleS2DTestCase, fetchContainerTables, generateAITestCase, validateS2DSql,
   generateAISuggestedRules, generateAISuggestedParityRules, generateKeyColumnSuggestion,
   generateAISuggestedCrossTableParityRules, setS2DTestCaseActive,
   fetchTestSuitesForMapping, fetchTestSuite, updateTestSuite,
 } from '../../api';
+import { commonNamesFor } from '../../columnMap';
+import { lintSql, requiredColumnFor } from '../../sqlLint';
+import ColumnMapModal from './ColumnMapModal';
 
 const SEVERITY_STYLES = {
   critical: 'bg-red-100 text-red-700',
@@ -30,9 +34,43 @@ const VALIDATION_TYPES = [
   'Custom',
 ];
 
-// column_parity only supports metrics that can be computed independently on
-// each side and compared - null count, distinct count, min/max range.
-const PARITY_VALIDATION_TYPES = ['Null Value Constraint', 'Uniqueness Constraint', 'Boundary Range Constraint'];
+// column_parity supports metrics that can be computed independently on each
+// side and then compared. Must stay in step with the backend's authoritative
+// registry, s2d/engine.py's PARITY_METRICS - the API validates against that, so
+// anything listed here but missing there is rejected on save.
+// Referential Integrity and Custom are deliberately absent: the first is a join
+// within one side (use the referential_check template in Custom SQL mode), the
+// second has no defined metric.
+const PARITY_VALIDATION_TYPES = [
+  'Null Value Constraint',
+  'Uniqueness Constraint',
+  'Boundary Range Constraint',
+  'Record Volume Integrity',
+  'Length Constraint',
+  'Regex Pattern Check',
+  'Data Freshness',
+  'Categorical Constraint',
+];
+
+// The one parity metric that takes a parameter.
+const PARITY_PATTERN_TYPE = 'Regex Pattern Check';
+
+// row_count_match has no metric to choose - the engine never reads
+// validation_type for it - so the label is fixed rather than asked for.
+const ROW_COUNT_VALIDATION_TYPE = 'Record Volume Integrity';
+
+// What each metric compares, shown under the picker so the tester doesn't have
+// to guess. Mirrors ai_service.py's PARITY_METRIC_GUIDE.
+const PARITY_METRIC_HINTS = {
+  'Null Value Constraint': 'Compares how many NULLs each side has.',
+  'Uniqueness Constraint': 'Compares how many DISTINCT values each side has.',
+  'Boundary Range Constraint': 'Compares MIN and MAX on each side.',
+  'Record Volume Integrity': 'Compares total row count and non-null count.',
+  'Length Constraint': 'Compares shortest and longest value length — catches a destination that truncates.',
+  'Regex Pattern Check': 'Compares how many values match your regex on each side.',
+  'Data Freshness': 'Compares the MAX value — proves the destination is as up to date as the source.',
+  'Categorical Constraint': 'Compares the exact SET of distinct values. Use for low-cardinality columns (status codes, flags) — it transports the values themselves, not a count.',
+};
 
 // One dialect for everything now: Local runs on DuckDB directly, and
 // Fabric connects through DuckDB's mssql extension (attached to the same
@@ -238,6 +276,22 @@ SELECT
 FROM students_info
 WHERE student_id IS NULL`;
 
+// dual_script contract: each side returns ONE row with a "value" column, and
+// the engine compares the two values. Deliberately not "passed" - each script
+// reports its own side's number and the verdict comes from comparing them,
+// which is what lets the two sides live on completely different systems.
+const DUAL_SCRIPT_PLACEHOLDER_SOURCE = `-- Runs on the SOURCE connection.
+-- Must return one row with a "value" column.
+SELECT COUNT(DISTINCT customer_id) AS value
+FROM source_customers
+WHERE status = 'ACTIVE'`;
+
+const DUAL_SCRIPT_PLACEHOLDER_DESTINATION = `-- Runs on the DESTINATION connection.
+-- Write it in the destination's own column names - they don't have to match.
+SELECT COUNT(DISTINCT "CustomerKey") AS value
+FROM "dbo"."dim_customer"
+WHERE "Status" = 'ACTIVE'`;
+
 const EMPTY_FORM = {
   name: '', validationType: VALIDATION_TYPES[0], checkType: 'sql', checkScope: 'single_side',
   target: 'source', targetTable: '', targetTables: [], scriptType: 'sql', scriptText: '',
@@ -245,6 +299,8 @@ const EMPTY_FORM = {
   rowCountSourceTables: [], rowCountDestinationTables: [],
   sourceTables: [], sourceColumn: '', destinationTables: [], destinationColumn: '',
   sourceTargetTables: [], destinationTargetTables: [], keyColumn: '',
+  parityPattern: '', // Regex Pattern Check only - sent as parity_config.pattern
+  destinationScriptText: '', // dual_script only - scriptText holds the source side
 };
 
 // Columns present on every one of the given table names - so the picker
@@ -260,27 +316,101 @@ function commonColumns(schema, tableNames) {
   return first.filter((c) => rest.every((cols) => cols.some((c2) => c2.name === c.name)));
 }
 
-function TableCheckboxList({ tables, selected, onToggle }) {
+// Appends the validation's opt-in common names to a list of real columns as
+// pseudo-columns, so both drop into the same <select>. A common name is only
+// ever passed in here once it covers every selected table (see
+// columnMap.js's commonNamesFor), and one that collides with a real column
+// name is dropped - the physical column already resolves through the map, and
+// two options sharing a value would be indistinguishable to the tester.
+function withMappedColumns(literalColumns, mappedNames) {
+  const taken = new Set(literalColumns.map((c) => c.name));
+  return [
+    ...literalColumns,
+    ...mappedNames
+      .filter((name) => !taken.has(name))
+      .map((name) => ({ name, data_type: 'column map', mapped: true })),
+  ];
+}
+
+/**
+ * Instant hints plus a Check syntax button, shared by all three SQL editors.
+ *
+ * Two layers on purpose. The hints are heuristics and cost nothing, so they show
+ * as you type but never block Save. The button is authoritative - it EXPLAINs on
+ * the real connector, so it catches misspelled columns and tables that no
+ * heuristic can - but opening a Fabric connection takes ~5-9s, which is why it's
+ * on demand rather than per keystroke.
+ */
+function SqlEditorFooter({ hints, onCheck, checkState }) {
   return (
-    <div className="border border-slate-300 rounded-lg max-h-32 overflow-y-auto">
-      {tables.length === 0 && <p className="text-sm text-slate-400 italic px-3 py-2">No tables</p>}
-      {tables.map((t) => (
-        <label key={t} className="flex items-center gap-2 px-3 py-1.5 text-sm font-mono hover:bg-slate-50 cursor-pointer border-b border-slate-100 last:border-b-0">
-          <input
-            type="checkbox"
-            checked={selected.includes(t)}
-            onChange={() => onToggle(t)}
-            className="rounded border-slate-300 text-mastek-primary focus:ring-mastek-accent shrink-0"
-          />
-          <span className="truncate">{t}</span>
-        </label>
+    <div className="mt-1 space-y-1">
+      {hints.map((hint) => (
+        <p key={hint} className="flex items-start gap-1.5 text-[11px] text-mastek-warning">
+          <AlertCircle className="w-3 h-3 shrink-0 mt-0.5" /> {hint}
+        </p>
       ))}
+      <div className="flex items-start gap-2">
+        <button
+          type="button"
+          onClick={onCheck}
+          disabled={checkState?.busy}
+          title="Parses the query against the real database without running it - also catches misspelled column and table names"
+          className="flex items-center gap-1.5 px-2 py-1 text-[11px] font-medium text-mastek-primary border border-mastek-primary/40 rounded-md hover:bg-mastek-primary/10 disabled:opacity-50 shrink-0"
+        >
+          {checkState?.busy ? <Loader2 className="w-3 h-3 animate-spin" /> : <Search className="w-3 h-3" />}
+          {checkState?.busy ? 'Checking...' : 'Check syntax'}
+        </button>
+        {checkState?.ok === true && (
+          <p className="flex items-center gap-1 text-[11px] text-mastek-success pt-1">
+            <CheckCircle2 className="w-3 h-3 shrink-0" /> Valid against the live schema
+          </p>
+        )}
+        {checkState?.ok === false && (
+          <p className="flex-1 text-[11px] text-red-600 whitespace-pre-wrap pt-1 break-words">{checkState.error}</p>
+        )}
+      </div>
     </div>
   );
 }
 
-export default function TestCasePanel({ mapping, onRunComplete, focus }) {
+// rowCounts is { tableName: count }. Counts arrive with the schema fetch, so
+// while it's in flight a table simply has no entry - deliberately rendered as
+// nothing rather than a placeholder, so the list doesn't flicker.
+// Note the ?? rather than ||: an empty table's count is 0, which is falsy, and
+// hiding "0" would suppress exactly the case a tester most wants to notice.
+function TableCheckboxList({ tables, selected, onToggle, rowCounts = {} }) {
+  return (
+    <div className="border border-slate-300 rounded-lg max-h-32 overflow-y-auto">
+      {tables.length === 0 && <p className="text-sm text-slate-400 italic px-3 py-2">No tables</p>}
+      {tables.map((t) => {
+        const count = rowCounts[t];
+        return (
+          <label key={t} className="flex items-center gap-2 px-3 py-1.5 text-sm font-mono hover:bg-slate-50 cursor-pointer border-b border-slate-100 last:border-b-0">
+            <input
+              type="checkbox"
+              checked={selected.includes(t)}
+              onChange={() => onToggle(t)}
+              className="rounded border-slate-300 text-mastek-primary focus:ring-mastek-accent shrink-0"
+            />
+            <span className="truncate">{t}</span>
+            {count !== undefined && (
+              <span
+                className="ml-auto shrink-0 text-[11px] text-slate-500 bg-slate-100 px-1.5 py-0.5 rounded"
+                title={count === null ? 'Row count unavailable' : `${count.toLocaleString()} rows`}
+              >
+                {count === null ? '—' : `${count.toLocaleString()} rows`}
+              </span>
+            )}
+          </label>
+        );
+      })}
+    </div>
+  );
+}
+
+export default function TestCasePanel({ mapping, onRunComplete, focus, onMappingUpdated }) {
 const [tab, setTab] = useState('ai'); // 'ai' | 'manual'
+  const [showColumnMap, setShowColumnMap] = useState(false);
 
   const [testCases, setTestCases] = useState([]);
   const [isLoading, setIsLoading] = useState(false);
@@ -398,20 +528,49 @@ const [tab, setTab] = useState('ai'); // 'ai' | 'manual'
   useEffect(() => {
     if (!mapping) { setSourceSchema([]); setDestinationSchema([]); return; }
     let cancelled = false;
-    fetchContainerTables(mapping.source_connector_id, mapping.source_container_id)
+    // Row counts come along with the schema so the table pickers can show how
+    // big each table is before any test case exists. On Fabric they ride the
+    // connection the listing already opens, so they're effectively free.
+    const opts = { includeRowCounts: true };
+    fetchContainerTables(mapping.source_connector_id, mapping.source_container_id, opts)
       .then((data) => { if (!cancelled) setSourceSchema(data.tables); })
       .catch(() => { if (!cancelled) setSourceSchema([]); });
-    fetchContainerTables(mapping.destination_connector_id, mapping.destination_container_id)
+    fetchContainerTables(mapping.destination_connector_id, mapping.destination_container_id, opts)
       .then((data) => { if (!cancelled) setDestinationSchema(data.tables); })
       .catch(() => { if (!cancelled) setDestinationSchema([]); });
     return () => { cancelled = true; };
   }, [mapping]);
 
+  // name -> row_count, for the pickers. Tables whose count hasn't arrived (or
+  // couldn't be read) simply aren't in the map.
+  const rowCountsOf = (schema) => Object.fromEntries(
+    schema.filter((t) => t.row_count !== undefined).map((t) => [t.name, t.row_count])
+  );
+  const sourceRowCounts = rowCountsOf(sourceSchema);
+  const destinationRowCounts = rowCountsOf(destinationSchema);
+  // The freehand Custom SQL picker can offer BOTH sides' tables when they share
+  // one connection (see customSqlTableOptions), so it needs both maps.
+  const bothSidesRowCounts = { ...sourceRowCounts, ...destinationRowCounts };
+
   const selectedAiTables = aiTables.filter((t) => aiTableNames.includes(t.name));
-  const sourceParityColumns = commonColumns(sourceSchema, form.sourceTables);
-  const destinationParityColumns = commonColumns(destinationSchema, form.destinationTables);
-  const crossParityKeyColumns = commonColumns(sourceSchema, form.sourceTargetTables)
-    .filter((c) => commonColumns(destinationSchema, form.destinationTargetTables).some((c2) => c2.name === c.name));
+  const sourceParityColumns = withMappedColumns(
+    commonColumns(sourceSchema, form.sourceTables),
+    commonNamesFor(mapping, 'source', form.sourceTables),
+  );
+  const destinationParityColumns = withMappedColumns(
+    commonColumns(destinationSchema, form.destinationTables),
+    commonNamesFor(mapping, 'destination', form.destinationTables),
+  );
+  // A common name qualifies as a cross-table key when the map covers every
+  // selected table on BOTH sides - the engine resolves it per table, so the
+  // two sides never have to spell the key the same way. That's the case that
+  // was previously unselectable no matter what the tester did.
+  const crossParityKeyColumns = withMappedColumns(
+    commonColumns(sourceSchema, form.sourceTargetTables)
+      .filter((c) => commonColumns(destinationSchema, form.destinationTargetTables).some((c2) => c2.name === c.name)),
+    commonNamesFor(mapping, 'source', form.sourceTargetTables)
+      .filter((name) => commonNamesFor(mapping, 'destination', form.destinationTargetTables).includes(name)),
+  );
 
   const toggleAiTableName = (table) => {
     setAiTableNames((prev) => (prev.includes(table) ? prev.filter((t) => t !== table) : [...prev, table]));
@@ -509,6 +668,7 @@ const [tab, setTab] = useState('ai'); // 'ai' | 'manual'
         sourceTables: aiCrossSourceTables.map((n) => toContext(sourceSchema, n)),
         destinationTables: aiCrossDestinationTables.map((n) => toContext(destinationSchema, n)),
         description: aiCrossDescription,
+        mappingId: mapping.id,
       });
       // Hand off to the Manual tab, pre-filled and ready to review/save -
       // same landing spot the 'single' mode's Generate Test Case uses.
@@ -580,6 +740,8 @@ const [tab, setTab] = useState('ai'); // 'ai' | 'manual'
       destinationTables: tc.destination_tables || [], destinationColumn: tc.destination_column || '',
       sourceTargetTables: tc.source_target_tables || [], destinationTargetTables: tc.destination_target_tables || [],
       keyColumn: tc.key_column || '',
+      parityPattern: tc.parity_config?.pattern || '',
+      destinationScriptText: tc.destination_script_text || '',
     });
   };
 
@@ -590,6 +752,20 @@ const [tab, setTab] = useState('ai'); // 'ai' | 'manual'
   };
 
   const isCrossTableParity = form.checkType === 'sql' && form.checkScope === 'cross_table_parity';
+  const isDualScript = form.checkType === 'sql' && form.checkScope === 'dual_script';
+  // Both scopes live under the one "Custom SQL script" check type - the
+  // "Runs against" row picks between them.
+  const isCustomSql = form.checkType === 'sql' && !isCrossTableParity;
+
+  // These checks compute one fixed thing, so validation_type is only a label the
+  // engine never reads (_run_row_count_match and _run_cross_table_parity_check
+  // both ignore it) - which is why the picker is hidden for them. Pinning the
+  // label here too stops a stale selection (pick "Length Constraint", then
+  // switch to Row count match) being saved and shown in the Results table where
+  // the tester can no longer see or correct it.
+  const fixedValidationType = form.checkType === 'row_count_match' ? 'Record Volume Integrity'
+    : isCrossTableParity ? 'Custom'
+    : null;
   const isTemplateMode = form.checkType === 'sql' && form.checkScope === 'single_side' && prebuiltKey !== 'custom_sql';
   const templateVarsComplete = (TEMPLATE_VARS[prebuiltKey] || []).every((v) => {
     const val = form.templateVars[v.key];
@@ -599,17 +775,68 @@ const [tab, setTab] = useState('ai'); // 'ai' | 'manual'
   const canSave = form.checkType === 'row_count_match'
     ? !!(form.name && form.rowCountSourceTables.length > 0 && form.rowCountDestinationTables.length > 0)
     : form.checkType === 'column_parity'
-    ? !!(form.name && form.sourceTables.length > 0 && form.sourceColumn && form.destinationTables.length > 0 && form.destinationColumn)
+    ? !!(form.name && form.sourceTables.length > 0 && form.sourceColumn
+         && form.destinationTables.length > 0 && form.destinationColumn
+         // Regex Pattern Check has nothing to execute without a pattern, and
+         // the API rejects it anyway - block it here so the tester finds out
+         // before the round trip.
+         && (form.validationType !== PARITY_PATTERN_TYPE || form.parityPattern.trim()))
     : isCrossTableParity
     ? !!(form.name && form.sourceTargetTables.length > 0 && form.destinationTargetTables.length > 0 && form.keyColumn)
+    : isDualScript
+    ? !!(form.name && form.scriptText.trim() && form.destinationScriptText.trim())
     : isTemplateMode
     ? !!(form.name && templateVarsComplete)
     : !!(form.name && form.targetTables.length > 0 && form.scriptText);
 
+  // Per-editor "Check syntax" verdicts, keyed 'source' | 'destination' | 'single'.
+  const [sqlCheck, setSqlCheck] = useState({});
+
+  const requiredColumn = requiredColumnFor(form.checkScope);
+  const sourceHints = lintSql(form.scriptText, { requiredColumn });
+  const destinationHints = lintSql(form.destinationScriptText, { requiredColumn: 'value' });
+
+  const setScript = (editorKey, value) => {
+    setForm((f) => (editorKey === 'destination'
+      ? { ...f, destinationScriptText: value }
+      : { ...f, scriptText: value }));
+    // A verdict on the old text says nothing about the new text - clearing it
+    // stops a stale green tick vouching for SQL that has since changed.
+    setSqlCheck((s) => (s[editorKey] ? { ...s, [editorKey]: undefined } : s));
+  };
+
+  const runSyntaxCheck = async (editorKey) => {
+    // 'single' validates against whichever side the Runs-against radio picked.
+    const target = editorKey === 'single' ? form.target : editorKey;
+    const sql = editorKey === 'destination' ? form.destinationScriptText : form.scriptText;
+    if (!sql.trim()) return;
+    setSqlCheck((s) => ({ ...s, [editorKey]: { busy: true } }));
+    try {
+      const { ok, error } = await validateS2DSql(mapping.id, { target, sql });
+      setSqlCheck((s) => ({ ...s, [editorKey]: { busy: false, ok, error } }));
+    } catch (err) {
+      // Couldn't run the check at all (connector unreachable) - report it as the
+      // check failing, not as the tester's SQL being wrong.
+      setSqlCheck((s) => ({ ...s, [editorKey]: { busy: false, ok: false, error: err.message } }));
+    }
+  };
+
+  const copyScriptAcross = (toDestination) => {
+    const from = toDestination ? form.scriptText : form.destinationScriptText;
+    const targetKey = toDestination ? 'destinationScriptText' : 'scriptText';
+    if (!from.trim()) return;
+    const existing = form[targetKey] || '';
+    if (existing.trim() && existing !== from
+        && !confirm("Replace the other side's script with this one?")) return;
+    setForm((f) => ({ ...f, [targetKey]: from }));
+    setSqlCheck((s) => ({ ...s, [toDestination ? 'destination' : 'source']: undefined }));
+  };
+
   const buildPayload = () => {
+    const validationType = fixedValidationType || form.validationType;
     if (form.checkType === 'row_count_match') {
       return {
-        name: form.name, validation_type: form.validationType, check_type: 'row_count_match',
+        name: form.name, validation_type: validationType, check_type: 'row_count_match',
         row_count_source_tables: form.rowCountSourceTables,
         row_count_destination_tables: form.rowCountDestinationTables,
       };
@@ -619,11 +846,24 @@ const [tab, setTab] = useState('ai'); // 'ai' | 'manual'
         name: form.name, validation_type: form.validationType, check_type: 'column_parity',
         source_tables: form.sourceTables, source_column: form.sourceColumn,
         destination_tables: form.destinationTables, destination_column: form.destinationColumn,
+        // Only sent for the metric that actually takes a parameter, so switching
+        // away from Regex Pattern Check clears the stored pattern rather than
+        // leaving a stale one behind.
+        parity_config: form.validationType === PARITY_PATTERN_TYPE
+          ? { pattern: form.parityPattern.trim() }
+          : null,
+      };
+    }
+    if (isDualScript) {
+      return {
+        name: form.name, validation_type: form.validationType, check_type: 'sql',
+        check_scope: 'dual_script', script_type: form.scriptType,
+        script_text: form.scriptText, destination_script_text: form.destinationScriptText,
       };
     }
     if (isCrossTableParity) {
       return {
-        name: form.name, validation_type: form.validationType, check_type: 'sql',
+        name: form.name, validation_type: validationType, check_type: 'sql',
         check_scope: 'cross_table_parity', key_column: form.keyColumn,
         source_target_tables: form.sourceTargetTables, destination_target_tables: form.destinationTargetTables,
       };
@@ -840,6 +1080,19 @@ const [tab, setTab] = useState('ai'); // 'ai' | 'manual'
   const targetTableOptions = form.target === 'source' ? mapping.source_tables : mapping.destination_tables;
   const templateSchema = form.target === 'source' ? sourceSchema : destinationSchema;
 
+  // Mirrors shares_connection() in s2d/engine.py. A single SQL statement runs
+  // inside exactly one connection, so it can only reach both sides when they
+  // share a connector AND a container - then joining source to destination is
+  // legitimate and the picker offers both lists.
+  const sharesConnection = mapping.source_connector_id === mapping.destination_connector_id
+    && mapping.source_container_id === mapping.destination_container_id;
+  // Only the freehand Custom SQL picker widens. Templates stay on one side:
+  // their column dropdowns are fed from that side's schema alone, so offering
+  // the other side's tables there would produce empty column lists.
+  const customSqlTableOptions = sharesConnection
+    ? [...new Set([...mapping.source_tables, ...mapping.destination_tables])]
+    : targetTableOptions;
+
   const handlePrebuiltChange = (key) => {
     setPrebuiltKey(key);
     const template = PREBUILT_TEMPLATES[key];
@@ -892,6 +1145,20 @@ const [tab, setTab] = useState('ai'); // 'ai' | 'manual'
           </p>
         </div>
 
+        <div className="flex items-center gap-2 shrink-0">
+        <button
+          onClick={() => setShowColumnMap(true)}
+          title="Map columns - give differently-named columns one common name"
+          className="flex items-center gap-2 px-4 py-2 text-sm font-medium text-mastek-primary border border-mastek-primary/40 rounded-lg hover:bg-mastek-primary/10"
+        >
+          <Columns3 className="w-4 h-4" /> Map Columns
+          {(mapping.column_map?.length || 0) > 0 && (
+            <span className="text-[10px] font-medium px-1.5 py-0.5 rounded-full bg-mastek-primary/10">
+              {mapping.column_map.length}
+            </span>
+          )}
+        </button>
+
         <div className="bg-white p-1 rounded-lg border border-slate-200 flex gap-1 text-sm font-medium shrink-0">
           <button
             onClick={() => setTab('ai')}
@@ -910,7 +1177,16 @@ const [tab, setTab] = useState('ai'); // 'ai' | 'manual'
             <Code2 className="w-3.5 h-3.5" /> Manual Notebook IDE
           </button>
         </div>
+        </div>
       </div>
+
+      {showColumnMap && (
+        <ColumnMapModal
+          mapping={mapping}
+          onClose={() => setShowColumnMap(false)}
+          onSaved={(updated) => onMappingUpdated?.(updated)}
+        />
+      )}
 
       {tab === 'ai' && (
         <div className="bg-white border border-slate-200 rounded-xl p-5 space-y-4 shadow-sm">
@@ -981,6 +1257,7 @@ const [tab, setTab] = useState('ai'); // 'ai' | 'manual'
                   tables={aiTables.map((t) => t.name)}
                   selected={aiTableNames}
                   onToggle={toggleAiTableName}
+                  rowCounts={aiTarget === 'source' ? sourceRowCounts : destinationRowCounts}
                 />
               )}
 
@@ -1080,6 +1357,7 @@ const [tab, setTab] = useState('ai'); // 'ai' | 'manual'
                     tables={mapping.source_tables}
                     selected={aiParitySourceTables}
                     onToggle={(t) => toggleAiParityTable('source', t)}
+                    rowCounts={sourceRowCounts}
                   />
                 </div>
                 <div className="space-y-1">
@@ -1088,6 +1366,7 @@ const [tab, setTab] = useState('ai'); // 'ai' | 'manual'
                     tables={mapping.destination_tables}
                     selected={aiParityDestinationTables}
                     onToggle={(t) => toggleAiParityTable('destination', t)}
+                    rowCounts={destinationRowCounts}
                   />
                 </div>
               </div>
@@ -1149,6 +1428,7 @@ const [tab, setTab] = useState('ai'); // 'ai' | 'manual'
                     tables={mapping.source_tables}
                     selected={aiCrossSourceTables}
                     onToggle={(t) => toggleAiCrossTable('source', t)}
+                    rowCounts={sourceRowCounts}
                   />
                 </div>
                 <div className="space-y-1">
@@ -1157,6 +1437,7 @@ const [tab, setTab] = useState('ai'); // 'ai' | 'manual'
                     tables={mapping.destination_tables}
                     selected={aiCrossDestinationTables}
                     onToggle={(t) => toggleAiCrossTable('destination', t)}
+                    rowCounts={destinationRowCounts}
                   />
                 </div>
               </div>
@@ -1247,38 +1528,51 @@ const [tab, setTab] = useState('ai'); // 'ai' | 'manual'
             </div>
           )}
 
+          {/* Row count match has nothing to choose: the check is fully defined by
+              the tables you pick, and the engine never reads validation_type for
+              it (only column_parity does - see s2d/engine.py's PARITY_METRICS).
+              Offering a 10-way dropdown that changes nothing was just noise, so
+              it's hidden and the label is fixed to Record Volume Integrity. */}
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
             <input
               value={form.name}
               onChange={(e) => setForm((f) => ({ ...f, name: e.target.value }))}
               placeholder="Test case name"
-              className="px-3 py-2 text-sm border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-mastek-accent"
+              className={`px-3 py-2 text-sm border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-mastek-accent ${
+                form.checkType === 'row_count_match' ? 'sm:col-span-2' : ''
+              }`}
             />
-            <select
-              value={form.validationType}
-              onChange={(e) => setForm((f) => ({ ...f, validationType: e.target.value }))}
-              className="px-3 py-2 text-sm border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-mastek-accent"
-            >
-              {(form.checkType === 'column_parity' ? PARITY_VALIDATION_TYPES : VALIDATION_TYPES).map((v) => (
-                <option key={v} value={v}>{v}</option>
-              ))}
-            </select>
+            {form.checkType !== 'row_count_match' && (
+              <select
+                value={form.validationType}
+                onChange={(e) => setForm((f) => ({ ...f, validationType: e.target.value }))}
+                className="px-3 py-2 text-sm border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-mastek-accent"
+              >
+                {(form.checkType === 'column_parity' ? PARITY_VALIDATION_TYPES : VALIDATION_TYPES).map((v) => (
+                  <option key={v} value={v}>{v}</option>
+                ))}
+              </select>
+            )}
           </div>
 
           <div className="border-b border-slate-100 pb-3">
             <div className="text-xs font-medium text-slate-500 mb-2">Check type — pick what fits your validation:</div>
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+              {/* Covers both single_side and dual_script - which one you get is
+                  chosen by the "Runs against" row below, since that's really a
+                  property of a custom script rather than a separate check type. */}
               <label className={`flex items-start gap-2 cursor-pointer p-2 rounded-lg border ${
-                form.checkType === 'sql' && form.checkScope === 'single_side'
-                  ? 'border-mastek-primary bg-mastek-primary/5' : 'border-slate-200 hover:bg-slate-50'
+                isCustomSql ? 'border-mastek-primary bg-mastek-primary/5' : 'border-slate-200 hover:bg-slate-50'
               }`}>
-                <input type="radio" checked={form.checkType === 'sql' && form.checkScope === 'single_side'}
+                <input type="radio" checked={isCustomSql}
                   onChange={() => setForm((f) => ({ ...f, checkType: 'sql', checkScope: 'single_side' }))}
                   className="text-mastek-primary focus:ring-mastek-accent mt-0.5 shrink-0" />
                 <div className="min-w-0">
                   <div className="text-sm font-medium text-slate-800">Custom SQL script</div>
                   <div className="text-xs text-slate-500 mt-0.5">
-                    Write your own SQL. Must return one row with a <code className="font-mono">passed</code> (1/0) column. Use when the built-ins don't fit.
+                    Write your own SQL against one side (returning <code className="font-mono">passed</code>), or
+                    against <strong>both</strong> sides &mdash; one script each returning
+                    a <code className="font-mono">value</code>, which get compared.
                   </div>
                 </div>
               </label>
@@ -1288,7 +1582,13 @@ const [tab, setTab] = useState('ai'); // 'ai' | 'manual'
                   ? 'border-mastek-primary bg-mastek-primary/5' : 'border-slate-200 hover:bg-slate-50'
               }`}>
                 <input type="radio" checked={form.checkType === 'row_count_match'}
-                  onChange={() => setForm((f) => ({ ...f, checkType: 'row_count_match' }))}
+                  onChange={() => setForm((f) => ({
+                    ...f, checkType: 'row_count_match',
+                    // Fixed, because the dropdown is hidden for this check type and
+                    // the API still requires a non-empty validation_type. This is
+                    // exactly what a row count check is.
+                    validationType: ROW_COUNT_VALIDATION_TYPE,
+                  }))}
                   className="text-mastek-primary focus:ring-mastek-accent mt-0.5 shrink-0" />
                 <div className="min-w-0">
                   <div className="text-sm font-medium text-slate-800 flex items-center gap-1.5">
@@ -1317,7 +1617,9 @@ const [tab, setTab] = useState('ai'); // 'ai' | 'manual'
                     Column parity
                   </div>
                   <div className="text-xs text-slate-500 mt-0.5">
-                    Compares one column's stats — nulls, unique values, or min–max range — between source and destination. Spot-check quality on a specific field.
+                    Compares one column between source and destination — nulls, distinct values, range, volume,
+                    value length, regex matches, category set or freshness. Works across every table you select
+                    on each side, and names each table's contribution when it fails.
                   </div>
                 </div>
               </label>
@@ -1339,6 +1641,7 @@ const [tab, setTab] = useState('ai'); // 'ai' | 'manual'
                   </div>
                 </div>
               </label>
+
             </div>
           </div>
 
@@ -1355,6 +1658,7 @@ const [tab, setTab] = useState('ai'); // 'ai' | 'manual'
                     tables={mapping.source_tables}
                     selected={form.rowCountSourceTables}
                     onToggle={(t) => toggleRcTable('source', t)}
+                    rowCounts={sourceRowCounts}
                   />
                 </div>
                 <div>
@@ -1363,6 +1667,7 @@ const [tab, setTab] = useState('ai'); // 'ai' | 'manual'
                     tables={mapping.destination_tables}
                     selected={form.rowCountDestinationTables}
                     onToggle={(t) => toggleRcTable('destination', t)}
+                    rowCounts={destinationRowCounts}
                   />
                 </div>
               </div>
@@ -1383,6 +1688,7 @@ const [tab, setTab] = useState('ai'); // 'ai' | 'manual'
                     tables={mapping.source_tables}
                     selected={form.sourceTables}
                     onToggle={(t) => toggleParityTable('source', t)}
+                    rowCounts={sourceRowCounts}
                   />
                   <select
                     value={form.sourceColumn}
@@ -1394,7 +1700,7 @@ const [tab, setTab] = useState('ai'); // 'ai' | 'manual'
                       {form.sourceTables.length === 0
                         ? 'Select table(s) first'
                         : sourceParityColumns.length === 0
-                        ? 'No column common to all selected tables'
+                        ? 'No shared column - try Map Columns'
                         : 'Select column'}
                     </option>
                     {sourceParityColumns.map((c) => (
@@ -1408,6 +1714,7 @@ const [tab, setTab] = useState('ai'); // 'ai' | 'manual'
                     tables={mapping.destination_tables}
                     selected={form.destinationTables}
                     onToggle={(t) => toggleParityTable('destination', t)}
+                    rowCounts={destinationRowCounts}
                   />
                   <select
                     value={form.destinationColumn}
@@ -1419,7 +1726,7 @@ const [tab, setTab] = useState('ai'); // 'ai' | 'manual'
                       {form.destinationTables.length === 0
                         ? 'Select table(s) first'
                         : destinationParityColumns.length === 0
-                        ? 'No column common to all selected tables'
+                        ? 'No shared column - try Map Columns'
                         : 'Select column'}
                     </option>
                     {destinationParityColumns.map((c) => (
@@ -1428,6 +1735,29 @@ const [tab, setTab] = useState('ai'); // 'ai' | 'manual'
                   </select>
                 </div>
               </div>
+
+              {PARITY_METRIC_HINTS[form.validationType] && (
+                <p className="text-xs text-slate-500 bg-slate-50 border border-slate-200 rounded-lg px-3 py-2">
+                  <span className="font-medium text-slate-600">{form.validationType}:</span>{' '}
+                  {PARITY_METRIC_HINTS[form.validationType]}
+                </p>
+              )}
+
+              {form.validationType === PARITY_PATTERN_TYPE && (
+                <div>
+                  <p className="text-xs font-medium text-slate-500 mb-1">Regex pattern</p>
+                  <input
+                    value={form.parityPattern}
+                    onChange={(e) => setForm((f) => ({ ...f, parityPattern: e.target.value }))}
+                    placeholder="e.g. ^[A-Z]{2}-[0-9]{4}$"
+                    className="w-full px-2.5 py-1.5 text-sm font-mono border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-mastek-accent"
+                  />
+                  <p className="text-[11px] text-slate-400 mt-1">
+                    Counted with DuckDB&rsquo;s <code className="font-mono">regexp_matches</code> on each side; the
+                    two counts must match. NULLs are never counted as matches.
+                  </p>
+                </div>
+              )}
             </div>
           )}
 
@@ -1446,6 +1776,7 @@ const [tab, setTab] = useState('ai'); // 'ai' | 'manual'
                     tables={mapping.source_tables}
                     selected={form.sourceTargetTables}
                     onToggle={(t) => toggleCrossParityTable('source', t)}
+                    rowCounts={sourceRowCounts}
                   />
                 </div>
                 <div className="space-y-1">
@@ -1454,6 +1785,7 @@ const [tab, setTab] = useState('ai'); // 'ai' | 'manual'
                     tables={mapping.destination_tables}
                     selected={form.destinationTargetTables}
                     onToggle={(t) => toggleCrossParityTable('destination', t)}
+                    rowCounts={destinationRowCounts}
                   />
                 </div>
               </div>
@@ -1467,7 +1799,7 @@ const [tab, setTab] = useState('ai'); // 'ai' | 'manual'
                   {form.sourceTargetTables.length === 0 || form.destinationTargetTables.length === 0
                     ? 'Select table(s) on both sides first'
                     : crossParityKeyColumns.length === 0
-                    ? 'No column common to all selected tables'
+                    ? 'No shared key column - try Map Columns'
                     : 'Select key column'}
                 </option>
                 {crossParityKeyColumns.map((c) => (
@@ -1477,24 +1809,112 @@ const [tab, setTab] = useState('ai'); // 'ai' | 'manual'
             </div>
           )}
 
-          {form.checkType === 'sql' && form.checkScope === 'single_side' && (
+          {isCustomSql && (
             <>
+              {/* One row decides the scope: a single script against one side
+                  (single_side, returns "passed"), or one script per side
+                  (dual_script, each returns "value" and they're compared). */}
               <div className="flex flex-wrap items-center gap-x-4 gap-y-2 text-sm">
                 <span className="text-xs font-medium text-slate-500">Runs against:</span>
                 <label className="flex items-center gap-2 cursor-pointer">
-                  <input type="radio" checked={form.target === 'source'}
-                    onChange={() => setForm((f) => ({ ...f, target: 'source', targetTables: [], templateVars: {} }))}
+                  <input type="radio" checked={!isDualScript && form.target === 'source'}
+                    onChange={() => setForm((f) => ({ ...f, checkScope: 'single_side', target: 'source', targetTables: [], templateVars: {} }))}
                     className="text-mastek-primary focus:ring-mastek-accent" />
                   Source
                 </label>
                 <label className="flex items-center gap-2 cursor-pointer">
-                  <input type="radio" checked={form.target === 'destination'}
-                    onChange={() => setForm((f) => ({ ...f, target: 'destination', targetTables: [], templateVars: {} }))}
+                  <input type="radio" checked={!isDualScript && form.target === 'destination'}
+                    onChange={() => setForm((f) => ({ ...f, checkScope: 'single_side', target: 'destination', targetTables: [], templateVars: {} }))}
                     className="text-mastek-primary focus:ring-mastek-accent" />
                   Destination
                 </label>
+                <label className="flex items-center gap-2 cursor-pointer">
+                  <input type="radio" checked={isDualScript}
+                    onChange={() => setForm((f) => ({ ...f, checkScope: 'dual_script', scriptType: 'sql' }))}
+                    className="text-mastek-primary focus:ring-mastek-accent" />
+                  Both sides <span className="text-xs text-slate-400">(compare two scripts)</span>
+                </label>
               </div>
 
+              {isDualScript ? (
+              <div className="space-y-3">
+                <p className="text-sm text-slate-500">
+                  Each script runs on its own side&rsquo;s connection and must return <strong>one row</strong> with
+                  a column named <code className="font-mono text-xs">value</code>. The check passes when the two
+                  values are equal. Optionally return a <code className="font-mono text-xs">details</code> column
+                  to explain your number.
+                  {!sharesConnection && (
+                    <> Source and destination are on different connections here, which is exactly why this is two
+                    scripts rather than one &mdash; a single SQL statement can&rsquo;t reach both.</>
+                  )}
+                </p>
+                <div className="grid grid-cols-1 lg:grid-cols-2 gap-3">
+                  <div>
+                    <div className="flex items-center gap-2 mb-1">
+                      <p className="text-xs font-medium text-slate-500 truncate">
+                        Source script <span className="font-mono text-slate-400">{mapping.source_connector_name}</span>
+                      </p>
+                      <button
+                        type="button"
+                        onClick={() => copyScriptAcross(true)}
+                        disabled={!form.scriptText.trim()}
+                        title="Copy this script into the destination box - the two are often identical"
+                        className="ml-auto flex items-center gap-1 px-1.5 py-0.5 text-[11px] text-slate-400 hover:text-mastek-primary hover:bg-mastek-primary/10 rounded disabled:opacity-40 shrink-0"
+                      >
+                        Copy to destination <ArrowRight className="w-3 h-3" />
+                      </button>
+                    </div>
+                    <textarea
+                      value={form.scriptText}
+                      onChange={(e) => setScript('source', e.target.value)}
+                      rows={9}
+                      spellCheck={false}
+                      placeholder={DUAL_SCRIPT_PLACEHOLDER_SOURCE}
+                      className="w-full px-3 py-2 text-xs font-mono border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-mastek-accent"
+                    />
+                    <SqlEditorFooter
+                      hints={sourceHints}
+                      onCheck={() => runSyntaxCheck('source')}
+                      checkState={sqlCheck.source}
+                    />
+                  </div>
+                  <div>
+                    <div className="flex items-center gap-2 mb-1">
+                      <p className="text-xs font-medium text-slate-500 truncate">
+                        Destination script <span className="font-mono text-slate-400">{mapping.destination_connector_name}</span>
+                      </p>
+                      <button
+                        type="button"
+                        onClick={() => copyScriptAcross(false)}
+                        disabled={!form.destinationScriptText.trim()}
+                        title="Copy this script into the source box"
+                        className="ml-auto flex items-center gap-1 px-1.5 py-0.5 text-[11px] text-slate-400 hover:text-mastek-primary hover:bg-mastek-primary/10 rounded disabled:opacity-40 shrink-0"
+                      >
+                        <ArrowLeft className="w-3 h-3" /> Copy to source
+                      </button>
+                    </div>
+                    <textarea
+                      value={form.destinationScriptText}
+                      onChange={(e) => setScript('destination', e.target.value)}
+                      rows={9}
+                      spellCheck={false}
+                      placeholder={DUAL_SCRIPT_PLACEHOLDER_DESTINATION}
+                      className="w-full px-3 py-2 text-xs font-mono border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-mastek-accent"
+                    />
+                    <SqlEditorFooter
+                      hints={destinationHints}
+                      onCheck={() => runSyntaxCheck('destination')}
+                      checkState={sqlCheck.destination}
+                    />
+                  </div>
+                </div>
+                <p className="text-xs text-slate-400">
+                  Available tables &mdash; source: <span className="font-mono">{mapping.source_tables.join(', ')}</span>
+                  {' · '}destination: <span className="font-mono">{mapping.destination_tables.join(', ')}</span>
+                </p>
+              </div>
+              ) : (
+              <>
               <div className="flex items-center gap-2">
                 <FileCode2 className="w-3.5 h-3.5 text-mastek-highlight shrink-0" />
                 <select
@@ -1513,10 +1933,17 @@ const [tab, setTab] = useState('ai'); // 'ai' | 'manual'
                   <div>
                     <p className="text-xs font-medium text-slate-500 mb-1">Target tables</p>
                     <TableCheckboxList
-                      tables={targetTableOptions}
+                      tables={customSqlTableOptions}
                       selected={form.targetTables}
                       onToggle={toggleTargetTable}
+                      rowCounts={bothSidesRowCounts}
                     />
+                    {sharesConnection && (
+                      <p className="text-xs text-mastek-primary mt-1">
+                        Source and destination share one connection, so your script can reference tables from
+                        either side &mdash; including joining them together.
+                      </p>
+                    )}
                     {form.targetTables.length > 1 && (
                       <p className="text-xs text-mastek-primary mt-1">
                         {form.targetTables.length} tables selected - will be combined (UNION ALL) for this check.
@@ -1539,10 +1966,18 @@ const [tab, setTab] = useState('ai'); // 'ai' | 'manual'
 
                   <textarea
                     value={form.scriptText}
-                    onChange={(e) => setForm((f) => ({ ...f, scriptText: e.target.value }))}
+                    onChange={(e) => setScript('single', e.target.value)}
                     placeholder={form.scriptType === 'sql' ? SQL_PLACEHOLDER : 'def validate(df):\n    ...'}
                     className="w-full h-40 bg-slate-950 text-slate-100 border border-slate-800 rounded-lg p-4 text-sm font-mono placeholder-slate-600 focus:outline-none focus:ring-2 focus:ring-mastek-accent"
                   />
+                  {/* PySpark isn't executable yet, so there's nothing to parse it against. */}
+                  {form.scriptType === 'sql' && (
+                    <SqlEditorFooter
+                      hints={sourceHints}
+                      onCheck={() => runSyntaxCheck('single')}
+                      checkState={sqlCheck.single}
+                    />
+                  )}
                 </>
               ) : (
                 <>
@@ -1622,6 +2057,8 @@ const [tab, setTab] = useState('ai'); // 'ai' | 'manual'
                     />
                   </div>
                 </>
+              )}
+              </>
               )}
             </>
           )}

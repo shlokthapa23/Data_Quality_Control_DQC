@@ -7,12 +7,16 @@ from catalog import db as catalog_db
 from connector_factory import build_connector
 from harvest import run_harvest
 from local_files import db as local_db
+from s2d import column_map as s2d_column_map
 from s2d import db as s2d_db
 from s2d.engine import run_pipeline
 from ai_service import (
     generate_test_case_sql, generate_rules_from_sample, generate_parity_rules_from_samples,
-    generate_key_column_suggestion, generate_key_column_suggestions_from_samples, PARITY_VALIDATION_TYPES,
+    generate_key_column_suggestion, generate_key_column_suggestions_from_samples,
 )
+# Straight from the engine's metric registry, so a request can never be accepted
+# for a column_parity metric that has no implementation behind it.
+from s2d.engine import PARITY_VALIDATION_TYPES, shares_connection
 from connectors.sql_guard import validate_select_only
 import scheduler as _scheduler
 
@@ -178,6 +182,110 @@ def get_all_lakehouses(connector_id):
         return jsonify({"error": "Failed to list lakehouses", "details": str(e)}), 502
 
 
+# --- Data pipelines ---------------------------------------------------------
+
+def _fabric_connector_or_error(connector_id):
+    """
+    (connector, None) for a Fabric connector, or (None, (response, status)) to
+    return. Pipelines are a Fabric-only concept, so every route below refuses
+    other connector types up front rather than relying on the base class's
+    NotImplementedError.
+    """
+    config = catalog_db.get_connector_config(connector_id)
+    if not config:
+        return None, (jsonify({"error": f"Unknown connector: {connector_id}"}), 404)
+    if config["type"] != "fabric":
+        return None, (jsonify({"error": "Pipelines are only available on fabric connectors"}), 400)
+    try:
+        _, connector = get_connector_instance(connector_id)
+    except KeyError as e:
+        return None, (jsonify({"error": str(e)}), 404)
+    except ValueError as e:
+        return None, (jsonify({"error": str(e)}), 400)
+    return connector, None
+
+
+@app.route('/api/connectors/<connector_id>/pipelines', methods=['GET'])
+def list_connector_pipelines(connector_id):
+    """The workspace's Data Pipelines - {"pipelines": [{"id", "name"}, ...]}."""
+    connector, error = _fabric_connector_or_error(connector_id)
+    if error:
+        return error
+
+    try:
+        return jsonify({"pipelines": connector.list_pipelines()})
+    except Exception as e:
+        return jsonify({"error": "Failed to list pipelines", "details": str(e)}), 502
+
+
+@app.route('/api/connectors/<connector_id>/pipelines/<item_id>/run', methods=['POST'])
+def run_connector_pipeline(connector_id, item_id):
+    """
+    Starts the pipeline on demand and returns {"run_id": ...} to poll.
+
+    Note on the error mapping below: listing pipelines and reading their run
+    history both work with a plain service-principal token, but STARTING a job
+    is a separate Fabric permission. A 401/403 here therefore almost always
+    means the SP lacks the run-on-demand right rather than that anything is
+    misconfigured, so it says exactly that instead of a bare "failed".
+    """
+    connector, error = _fabric_connector_or_error(connector_id)
+    if error:
+        return error
+
+    try:
+        run_id = connector.run_pipeline(item_id)
+    except Exception as e:
+        detail = str(e)
+        if "401" in detail or "403" in detail:
+            return jsonify({
+                "error": "This connector isn't allowed to start pipeline runs. It can list pipelines "
+                         "and read their history, so this is specifically the run-on-demand "
+                         "permission - the service principal needs at least Contributor on the "
+                         "Fabric workspace.",
+                "details": detail,
+            }), 403
+        if "404" in detail:
+            return jsonify({
+                "error": "That pipeline no longer exists in the workspace - refresh the list.",
+                "details": detail,
+            }), 404
+        return jsonify({"error": "Could not start the pipeline", "details": detail}), 502
+
+    if not run_id:
+        return jsonify({
+            "error": "The pipeline was started but Fabric didn't report a run id, so its progress "
+                     "can't be followed here. Check the run history below in a moment.",
+        }), 502
+    return jsonify({"run_id": run_id})
+
+
+@app.route('/api/connectors/<connector_id>/pipelines/<item_id>/runs', methods=['GET'])
+def list_connector_pipeline_runs(connector_id, item_id):
+    """Recent runs for one pipeline, newest first."""
+    connector, error = _fabric_connector_or_error(connector_id)
+    if error:
+        return error
+
+    try:
+        return jsonify({"runs": connector.list_pipeline_runs(item_id)})
+    except Exception as e:
+        return jsonify({"error": "Failed to read pipeline run history", "details": str(e)}), 502
+
+
+@app.route('/api/connectors/<connector_id>/pipelines/<item_id>/runs/<run_id>', methods=['GET'])
+def get_connector_pipeline_run(connector_id, item_id, run_id):
+    """One run's current status - polled by the Pipelines tab while it's live."""
+    connector, error = _fabric_connector_or_error(connector_id)
+    if error:
+        return error
+
+    try:
+        return jsonify(connector.get_pipeline_run(item_id, run_id))
+    except Exception as e:
+        return jsonify({"error": "Failed to read the pipeline run", "details": str(e)}), 502
+
+
 @app.route('/api/connectors/<connector_id>/pin-containers', methods=['POST'])
 def pin_connector_containers(connector_id):
     """
@@ -229,7 +337,14 @@ def get_container_tables_live(connector_id, container_id):
     Live table list for one container - powers the S2D mapping form's
     table dropdown. Works identically for a Fabric Lakehouse or a Local
     file store, since both implement list_tables_in_container().
+
+    ?include_row_counts=1 adds "row_count" to each table so the pickers can show
+    how big it is before any test case exists. Opt-in: counting costs real time
+    against a remote endpoint, and callers that only want columns shouldn't pay
+    for it. Omitting the flag returns exactly the original shape.
     """
+    include_row_counts = request.args.get("include_row_counts") in ("1", "true", "yes")
+
     try:
         _, connector = get_connector_instance(connector_id)
     except KeyError as e:
@@ -238,8 +353,13 @@ def get_container_tables_live(connector_id, container_id):
         return jsonify({"error": str(e)}), 400
 
     try:
-        schema = connector.list_tables_in_container(container_id)
-        tables = [{"name": t["table"], "kind": t["kind"], "columns": t["columns"]} for t in schema]
+        schema = connector.list_tables_in_container(container_id, include_row_counts=include_row_counts)
+        tables = []
+        for t in schema:
+            entry = {"name": t["table"], "kind": t["kind"], "columns": t["columns"]}
+            if include_row_counts:
+                entry["row_count"] = t.get("row_count")
+            tables.append(entry)
         return jsonify({"tables": tables})
     except Exception as e:
         return jsonify({"error": "Failed to list tables", "details": str(e)}), 502
@@ -412,6 +532,80 @@ def rename_s2d_mapping(mapping_id):
     return jsonify(s2d_db.get_mapping(mapping_id))
 
 
+@app.route('/api/s2d/mappings/<mapping_id>/column-map', methods=['PUT'])
+def set_s2d_column_map(mapping_id):
+    """
+    Body: { "column_map": [ { "name": "order_id",
+                              "source": {"<table>": "<column>", ...},
+                              "destination": {"<table>": "<column>", ...} }, ... ] }
+
+    Full replace, same as suite membership - the editor always submits the
+    whole map. Entirely opt-in: an empty array clears it and puts every test
+    case in this validation back on plain literal column names.
+
+    Deliberately does NOT verify the columns still exist - that would mean a
+    live connector round-trip on every save, and the editor already builds its
+    dropdowns from live schema. A column renamed upstream afterwards surfaces
+    as a query error on the next run.
+    """
+    mapping = s2d_db.get_mapping(mapping_id)
+    if not mapping:
+        return jsonify({"error": "Mapping not found"}), 404
+
+    body = request.get_json(force=True) or {}
+    error, cleaned = s2d_column_map.prepare(
+        body.get("column_map") or [], mapping["source_tables"], mapping["destination_tables"]
+    )
+    if error:
+        return jsonify({"error": error}), 400
+
+    s2d_db.set_column_map(mapping_id, cleaned)
+    return jsonify(s2d_db.get_mapping(mapping_id))
+
+
+@app.route('/api/s2d/mappings/<mapping_id>/validate-sql', methods=['POST'])
+def validate_s2d_sql(mapping_id):
+    """
+    Body: { "target": "source"|"destination", "sql": "SELECT ..." }
+
+    Parses and binds the script against that side's real connector WITHOUT
+    executing it, so the editor can report a genuine syntax/column/table error
+    before the tester saves and runs. Writes nothing.
+
+    Returns 200 for BOTH outcomes - {"ok": true} or {"ok": false, "error": ...} -
+    because a syntax error is a successful validation result, not a failed
+    request. Non-2xx stays reserved for "we couldn't run the check at all"
+    (unknown connector, Lakehouse unreachable).
+    """
+    mapping = s2d_db.get_mapping(mapping_id)
+    if not mapping:
+        return jsonify({"error": "Mapping not found"}), 404
+
+    body = request.get_json(force=True) or {}
+    target = body.get("target")
+    sql = (body.get("sql") or "").strip()
+    if target not in ("source", "destination"):
+        return jsonify({"error": "target must be 'source' or 'destination'"}), 400
+    if not sql:
+        return jsonify({"error": "sql is required"}), 400
+
+    connector_id = mapping[f"{target}_connector_id"]
+    container_id = mapping[f"{target}_container_id"]
+    try:
+        _, connector = get_connector_instance(connector_id)
+    except KeyError as e:
+        return jsonify({"error": str(e)}), 404
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+
+    try:
+        ok, error = connector.validate_query(container_id, sql)
+    except Exception as e:
+        return jsonify({"error": "Could not check the query", "details": str(e)}), 502
+
+    return jsonify({"ok": ok, "error": error})
+
+
 @app.route('/api/s2d/mappings/<mapping_id>', methods=['DELETE'])
 def delete_s2d_mapping(mapping_id):
     # Deregister any live APScheduler jobs for this mapping's suites BEFORE
@@ -447,6 +641,12 @@ def create_s2d_test_case(mapping_id):
     Body (cross-table parity): { "name": "...", "validation_type": "...", "check_type": "sql",
                           "check_scope": "cross_table_parity", "key_column": "...",
                           "source_target_tables": ["..."], "destination_target_tables": ["..."] }
+    Body (dual script):{ "name": "...", "validation_type": "...", "check_type": "sql",
+                          "check_scope": "dual_script", "script_type": "sql",
+                          "script_text": "<source script>", "destination_script_text": "<destination script>" }
+      Each script returns one row with a 'value' column, which the engine compares
+      for equality - the only way to check both sides at once when they live on
+      different connections. See s2d/engine.py's _run_dual_script_check.
     """
     mapping = s2d_db.get_mapping(mapping_id)
     if not mapping:
@@ -463,6 +663,7 @@ def create_s2d_test_case(mapping_id):
         mapping_id=mapping_id, name=body["name"], validation_type=body["validation_type"],
         check_type=body["check_type"], target=body.get("target"), target_table=body.get("target_table"),
         script_type=body.get("script_type"), script_text=body.get("script_text"),
+        destination_script_text=body.get("destination_script_text"),
         row_count_source_tables=body.get("row_count_source_tables"),
         row_count_destination_tables=body.get("row_count_destination_tables"),
         source_tables=body.get("source_tables"), source_column=body.get("source_column"),
@@ -470,6 +671,7 @@ def create_s2d_test_case(mapping_id):
         target_tables=target_tables, check_scope=body.get("check_scope"), key_column=body.get("key_column"),
         source_target_tables=body.get("source_target_tables"),
         destination_target_tables=body.get("destination_target_tables"),
+        parity_config=body.get("parity_config"),
         severity=body.get("severity", "error"), description=body.get("description"),
     )
     return jsonify({"id": test_case_id}), 201
@@ -488,8 +690,16 @@ def _validate_test_case_body(body, mapping):
 
     if check_type == "sql":
         check_scope = body.get("check_scope") or "single_side"
-        if check_scope not in ("single_side", "cross_table_parity"):
-            return "check_scope must be 'single_side' or 'cross_table_parity' for sql checks"
+        if check_scope not in ("single_side", "cross_table_parity", "dual_script"):
+            return "check_scope must be 'single_side', 'cross_table_parity', or 'dual_script' for sql checks"
+
+        if check_scope == "dual_script":
+            if body.get("script_type") not in ("sql", "pyspark"):
+                return "script_type must be 'sql' or 'pyspark'"
+            if not body.get("script_text"):
+                return "script_text (the source script) is required for dual_script checks"
+            if not body.get("destination_script_text"):
+                return "destination_script_text is required for dual_script checks"
 
         if check_scope == "single_side":
             target = body.get("target")
@@ -507,9 +717,18 @@ def _validate_test_case_body(body, mapping):
             target_tables = body.get("target_tables") or ([body["target_table"]] if body.get("target_table") else None)
             if not target_tables:
                 return "target_tables is required for single_side sql checks"
+            # When both sides sit on the same connector AND container there is
+            # only one connection, so a single script can legitimately join
+            # source and destination tables together - allow it to declare
+            # tables from either side. Across different connections that's
+            # physically impossible, so the original one-side rule stands.
             valid_tables = mapping["source_tables"] if target == "source" else mapping["destination_tables"]
+            if shares_connection(mapping):
+                valid_tables = list(mapping["source_tables"]) + list(mapping["destination_tables"])
             if not set(target_tables).issubset(set(valid_tables)):
-                return f"target_tables must be a subset of the mapping's {target} tables"
+                return (f"target_tables must be a subset of the mapping's {target} tables"
+                        if not shares_connection(mapping)
+                        else "target_tables must be a subset of this validation's source or destination tables")
 
         if check_scope == "cross_table_parity":
             key_column = body.get("key_column")
@@ -535,9 +754,15 @@ def _validate_test_case_body(body, mapping):
             return "row_count_destination_tables must be a subset of the mapping's destination tables"
 
     if check_type == "column_parity":
+        # Validated against the engine's own metric registry (s2d/engine.py's
+        # PARITY_METRICS) rather than a list duplicated here - a hardcoded copy
+        # had already drifted once and would silently reject the very metrics
+        # the UI offers.
         validation_type = body["validation_type"]
-        if validation_type not in ("Null Value Constraint", "Uniqueness Constraint", "Boundary Range Constraint"):
-            return "column_parity checks only support Null Value Constraint, Uniqueness Constraint, or Boundary Range Constraint"
+        if validation_type not in PARITY_VALIDATION_TYPES:
+            return f"column_parity checks only support: {', '.join(PARITY_VALIDATION_TYPES)}"
+        if validation_type == "Regex Pattern Check" and not (body.get("parity_config") or {}).get("pattern"):
+            return "Regex Pattern Check needs parity_config.pattern"
         source_tables = body.get("source_tables")
         source_column = body.get("source_column")
         destination_tables = body.get("destination_tables")
@@ -573,6 +798,7 @@ def update_s2d_test_case(test_case_id):
         test_case_id, name=body["name"], validation_type=body["validation_type"],
         check_type=body["check_type"], target=body.get("target"), target_table=body.get("target_table"),
         script_type=body.get("script_type"), script_text=body.get("script_text"),
+        destination_script_text=body.get("destination_script_text"),
         row_count_source_tables=body.get("row_count_source_tables"),
         row_count_destination_tables=body.get("row_count_destination_tables"),
         source_tables=body.get("source_tables"), source_column=body.get("source_column"),
@@ -580,6 +806,7 @@ def update_s2d_test_case(test_case_id):
         target_tables=target_tables, check_scope=body.get("check_scope"), key_column=body.get("key_column"),
         source_target_tables=body.get("source_target_tables"),
         destination_target_tables=body.get("destination_target_tables"),
+        parity_config=body.get("parity_config"),
         severity=body.get("severity"), description=body.get("description"),
     )
     return jsonify({"updated": test_case_id})
@@ -641,7 +868,13 @@ def ai_generate_test_case():
 
     Body (cross_table_parity): { "check_scope": "cross_table_parity",
             "source_tables": [{"table_name":..., "columns":[...]}, ...],
-            "destination_tables": [{"table_name":..., "columns":[...]}, ...], "description": "..." }
+            "destination_tables": [{"table_name":..., "columns":[...]}, ...], "description": "...",
+            "mapping_id": "..." (optional) }
+
+    mapping_id is optional and only used to load that validation's column map,
+    so a common name covering every selected table counts as a valid key even
+    when no single physical column name is shared across them. Omitting it
+    just means literal-name matching, exactly as before.
 
     The real table name(s) and real column list(s) are supplied by the
     frontend (pulled from the same live schema the table dropdowns already
@@ -667,15 +900,27 @@ def ai_generate_test_case():
         if not source_tables or not destination_tables:
             return jsonify({"error": "source_tables and destination_tables are required for cross_table_parity"}), 400
 
+        mapping = s2d_db.get_mapping(body["mapping_id"]) if body.get("mapping_id") else None
+
         try:
-            suggestion = generate_key_column_suggestion(source_tables, destination_tables, description)
+            suggestion = generate_key_column_suggestion(
+                source_tables, destination_tables, description,
+                column_map_text=s2d_column_map.describe(mapping),
+            )
         except Exception as e:
             print(f"AI key column suggestion error: {e}")
             return jsonify({"error": "AI generation failed", "details": str(e)}), 502
 
         key_column = suggestion.get("key_column")
+        # A key is valid if it's a physical column present on every selected
+        # table (the original rule) OR a common name from the validation's
+        # column map that covers every selected table on that side.
         source_column_names = set.intersection(*({c["name"] for c in t["columns"]} for t in source_tables))
         destination_column_names = set.intersection(*({c["name"] for c in t["columns"]} for t in destination_tables))
+        source_column_names |= set(s2d_column_map.common_names(
+            mapping, "source", [t["table_name"] for t in source_tables]))
+        destination_column_names |= set(s2d_column_map.common_names(
+            mapping, "destination", [t["table_name"] for t in destination_tables]))
         if key_column not in source_column_names or key_column not in destination_column_names:
             return jsonify({
                 "error": f"AI suggested key_column '{key_column}', which isn't common to every selected table on both sides - pick one manually",
@@ -860,6 +1105,10 @@ def ai_suggest_parity_rules(mapping_id):
                 tuple(sorted(tc.get("source_tables") or [])), tc.get("source_column"),
                 tuple(sorted(tc.get("destination_tables") or [])), tc.get("destination_column"),
                 tc.get("validation_type"),
+                # The pattern is part of the identity: two Regex Pattern Checks
+                # on the same column pair with different patterns are different
+                # rules, not duplicates.
+                (tc.get("parity_config") or {}).get("pattern"),
             )
             for tc in s2d_db.list_test_cases(mapping_id)
             if tc["check_type"] == "column_parity"
@@ -872,6 +1121,7 @@ def ai_suggest_parity_rules(mapping_id):
             first_source_table, source_entries[first_source_table]["columns"], source_sample,
             first_destination_table, destination_entries[first_destination_table]["columns"], destination_sample,
             already_covered_text=already_covered_text,
+            column_map_text=s2d_column_map.describe(mapping),
         )
     except Exception as e:
         print(f"AI parity rule suggestion error: {e}")
@@ -879,13 +1129,16 @@ def ai_suggest_parity_rules(mapping_id):
 
     # Column must exist on EVERY selected table per side, not just the one
     # the AI actually saw a sample of - otherwise the UNION ALL query the
-    # engine builds would fail against tables the AI never looked at.
+    # engine builds would fail against tables the AI never looked at. A common
+    # name from the validation's column map counts too, as long as the map
+    # covers every selected table on that side: the engine resolves it to each
+    # table's own physical column, so the UNION ALL is still valid.
     source_column_names = set.intersection(*(
         {c["name"] for c in entry["columns"]} for entry in source_entries.values()
-    ))
+    )) | set(s2d_column_map.common_names(mapping, "source", source_tables))
     destination_column_names = set.intersection(*(
         {c["name"] for c in entry["columns"]} for entry in destination_entries.values()
-    ))
+    )) | set(s2d_column_map.common_names(mapping, "destination", destination_tables))
 
     created = []
     skipped = []
@@ -898,6 +1151,13 @@ def ai_suggest_parity_rules(mapping_id):
         if validation_type not in PARITY_VALIDATION_TYPES:
             skipped.append({"name": name, "reason": f"Unsupported validation_type: {validation_type}"})
             continue
+        # Regex Pattern Check is the one metric that needs a parameter. If the
+        # model proposed the type without a pattern there's nothing to execute,
+        # so skip it rather than saving a rule that can only ERROR at run time.
+        parity_config = {"pattern": rule["pattern"]} if rule.get("pattern") else None
+        if validation_type == "Regex Pattern Check" and not parity_config:
+            skipped.append({"name": name, "reason": "Regex Pattern Check proposed without a pattern"})
+            continue
         if source_column not in source_column_names:
             skipped.append({"name": name, "reason": f"source_column '{source_column}' isn't common to every selected source table"})
             continue
@@ -908,7 +1168,7 @@ def ai_suggest_parity_rules(mapping_id):
         signature = (
             tuple(sorted(source_tables)), source_column,
             tuple(sorted(destination_tables)), destination_column,
-            validation_type,
+            validation_type, (parity_config or {}).get("pattern"),
         )
         if signature in existing_signatures:
             skipped.append({"name": name, "reason": "Duplicate of an existing rule"})
@@ -918,6 +1178,7 @@ def ai_suggest_parity_rules(mapping_id):
             mapping_id=mapping_id, name=name, validation_type=validation_type, check_type="column_parity",
             source_tables=source_tables, source_column=source_column,
             destination_tables=destination_tables, destination_column=destination_column,
+            parity_config=parity_config,
             origin="ai", severity=rule.get("severity", "error"), description=rule.get("description"),
         )
         created.append(s2d_db.get_test_case(test_case_id))
@@ -1002,6 +1263,7 @@ def ai_suggest_cross_table_parity_rules(mapping_id):
             first_source_table, source_entries[first_source_table]["columns"], source_sample,
             first_destination_table, destination_entries[first_destination_table]["columns"], destination_sample,
             already_covered_text=already_covered_text,
+            column_map_text=s2d_column_map.describe(mapping),
         )
     except Exception as e:
         print(f"AI cross-table parity rule suggestion error: {e}")
@@ -1009,13 +1271,17 @@ def ai_suggest_cross_table_parity_rules(mapping_id):
 
     # Key column must exist on EVERY selected table per side, not just the
     # one the AI actually saw a sample of - otherwise the UNION ALL query
-    # the engine builds would fail against tables the AI never looked at.
+    # the engine builds would fail against tables the AI never looked at. A
+    # common name from the validation's column map counts too when the map
+    # covers every selected table on that side, since the engine resolves it
+    # per table - that's the whole point of the map, and without this the AI
+    # can't propose anything at all for tables that renamed their key.
     source_column_names = set.intersection(*(
         {c["name"] for c in entry["columns"]} for entry in source_entries.values()
-    ))
+    )) | set(s2d_column_map.common_names(mapping, "source", source_tables))
     destination_column_names = set.intersection(*(
         {c["name"] for c in entry["columns"]} for entry in destination_entries.values()
-    ))
+    )) | set(s2d_column_map.common_names(mapping, "destination", destination_tables))
 
     created = []
     skipped = []

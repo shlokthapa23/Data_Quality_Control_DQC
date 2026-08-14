@@ -101,6 +101,20 @@ def _add_missing_test_case_columns():
         if "destination_target_tables" not in existing:
             conn.execute("ALTER TABLE s2d_test_cases ADD COLUMN destination_target_tables TEXT")
 
+        # column_parity grew from 3 comparison metrics to 8; the ones that need
+        # a parameter (today only Regex Pattern Check's pattern) keep it here as
+        # JSON. Nullable with nothing to backfill - the 3 original metrics are
+        # all parameterless, so existing rows are already complete.
+        if "parity_config" not in existing:
+            conn.execute("ALTER TABLE s2d_test_cases ADD COLUMN parity_config TEXT")
+
+        # 'sql' checks gained a third scope, 'dual_script': one script per side,
+        # each returning a 'value' the engine compares - the only way to check
+        # both sides at once when they live on different systems. The source
+        # script reuses script_text, so single_side rows need no backfill.
+        if "destination_script_text" not in existing:
+            conn.execute("ALTER TABLE s2d_test_cases ADD COLUMN destination_script_text TEXT")
+
         stale_sql_rows = conn.execute("""
             SELECT id, target_table FROM s2d_test_cases
             WHERE check_type = 'sql' AND (target_tables IS NULL OR check_scope IS NULL)
@@ -134,6 +148,12 @@ def init_s2d_tables():
                 destination_container_name TEXT NOT NULL,
                 destination_tables TEXT NOT NULL,  -- JSON array of table names
 
+                -- Opt-in per-validation column map: JSON array of
+                -- {name, source:{table:col}, destination:{table:col}}, letting
+                -- differently-named columns across tables share one common name.
+                -- NULL when the tester hasn't opted in - see s2d/column_map.py.
+                column_map TEXT,
+
                 created_at TEXT NOT NULL
             )
         """)
@@ -154,7 +174,10 @@ def init_s2d_tables():
                 source_target_tables TEXT,           -- JSON array - cross_table_parity scope only
                 destination_target_tables TEXT,      -- JSON array - cross_table_parity scope only
                 script_type TEXT,                   -- 'sql' | 'pyspark'
-                script_text TEXT,
+                script_text TEXT,                   -- the script; for dual_script scope this is the SOURCE script
+                destination_script_text TEXT,       -- dual_script scope only - the destination-side script.
+                                                    -- Both return one row with a 'value' column, which the
+                                                    -- engine compares; see _run_dual_script_check.
 
                 -- 'row_count_match' checks only:
                 row_count_source_tables TEXT,       -- JSON array (subset of mapping.source_tables)
@@ -167,6 +190,10 @@ def init_s2d_tables():
                 destination_column TEXT,
                 source_tables TEXT,       -- JSON array (subset of mapping.source_tables), unioned together
                 destination_tables TEXT,  -- JSON array (subset of mapping.destination_tables), unioned together
+                parity_config TEXT,       -- JSON object of extra params for the chosen metric
+                                          -- (today: {"pattern": "..."} for Regex Pattern Check).
+                                          -- One JSON column rather than a typed column per
+                                          -- param, so a future metric needs no new migration.
 
                 origin TEXT NOT NULL DEFAULT 'manual',  -- 'manual' | 'ai'
                 severity TEXT NOT NULL DEFAULT 'error',  -- 'critical' | 'error' | 'warning'
@@ -285,6 +312,27 @@ def init_s2d_tables():
     _add_missing_test_case_columns()
     _add_missing_test_result_columns()
     _add_missing_test_run_columns()
+    _add_missing_mapping_columns()
+
+
+def _add_missing_mapping_columns():
+    """
+    Additive migration: s2d_mappings gained column_map, the opt-in per-
+    validation map of common column name -> physical column per table.
+    Nullable with no default and nothing to backfill - a NULL column_map is
+    precisely "the tester hasn't opted in", which every read path already
+    treats as today's literal-name behaviour.
+    """
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='s2d_mappings'"
+        ).fetchone()
+        if not row:
+            return  # fresh install - CREATE TABLE above already includes the column
+
+        existing = {r[1] for r in conn.execute("PRAGMA table_info(s2d_mappings)").fetchall()}
+        if "column_map" not in existing:
+            conn.execute("ALTER TABLE s2d_mappings ADD COLUMN column_map TEXT")
 
 
 def _add_missing_test_run_columns():
@@ -346,6 +394,9 @@ def _mapping_row_to_dict(row):
     m = dict(row)
     m["source_tables"] = json.loads(m["source_tables"])
     m["destination_tables"] = json.loads(m["destination_tables"])
+    # Always a list, never None - "no column map" and "an empty column map"
+    # mean the same thing (nobody opted in) to every consumer.
+    m["column_map"] = json.loads(m["column_map"]) if m.get("column_map") else []
     return m
 
 
@@ -391,6 +442,17 @@ def rename_mapping(mapping_id, name):
         conn.execute("UPDATE s2d_mappings SET name = ? WHERE id = ?", (name, mapping_id))
 
 
+def set_column_map(mapping_id, column_map):
+    """
+    Full replace - the editor always submits the whole map, same as suite
+    membership. An empty map is stored as NULL so "opted out" has exactly one
+    representation in the DB.
+    """
+    payload = json.dumps(column_map) if column_map else None
+    with get_conn() as conn:
+        conn.execute("UPDATE s2d_mappings SET column_map = ? WHERE id = ?", (payload, mapping_id))
+
+
 def delete_mapping(mapping_id):
     """Deletes a mapping and everything that lives inside it - test cases,
     test suites, suite membership, and suite schedules. Run history
@@ -425,6 +487,9 @@ def _test_case_row_to_dict(row):
     tc["target_tables"] = json.loads(tc["target_tables"]) if tc["target_tables"] else None
     tc["source_target_tables"] = json.loads(tc["source_target_tables"]) if tc["source_target_tables"] else None
     tc["destination_target_tables"] = json.loads(tc["destination_target_tables"]) if tc["destination_target_tables"] else None
+    # Always a dict, never None - the engine reads .get("pattern") off it
+    # unconditionally, and "no config" and "empty config" mean the same thing.
+    tc["parity_config"] = json.loads(tc["parity_config"]) if tc.get("parity_config") else {}
     tc["active"] = bool(tc["active"])
     return tc
 
@@ -435,6 +500,7 @@ def create_test_case(mapping_id, name, validation_type, check_type,
                       source_tables=None, source_column=None, destination_tables=None, destination_column=None,
                       target_tables=None, check_scope=None, key_column=None,
                       source_target_tables=None, destination_target_tables=None,
+                      parity_config=None, destination_script_text=None,
                       origin='manual', severity='error', active=True, description=None):
     test_case_id = str(uuid.uuid4())
     now = datetime.now(timezone.utc).isoformat()
@@ -442,14 +508,15 @@ def create_test_case(mapping_id, name, validation_type, check_type,
         conn.execute("""
             INSERT INTO s2d_test_cases
                 (id, mapping_id, name, validation_type, check_type, target, target_table,
-                 script_type, script_text, row_count_source_tables, row_count_destination_tables,
+                 script_type, script_text, destination_script_text,
+                 row_count_source_tables, row_count_destination_tables,
                  source_tables, source_column, destination_tables, destination_column,
                  target_tables, check_scope, key_column, source_target_tables, destination_target_tables,
-                 origin, severity, active, description, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 parity_config, origin, severity, active, description, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             test_case_id, mapping_id, name, validation_type, check_type, target, target_table,
-            script_type, script_text,
+            script_type, script_text, destination_script_text,
             json.dumps(row_count_source_tables) if row_count_source_tables is not None else None,
             json.dumps(row_count_destination_tables) if row_count_destination_tables is not None else None,
             json.dumps(source_tables) if source_tables is not None else None, source_column,
@@ -457,6 +524,7 @@ def create_test_case(mapping_id, name, validation_type, check_type,
             json.dumps(target_tables) if target_tables is not None else None, check_scope, key_column,
             json.dumps(source_target_tables) if source_target_tables is not None else None,
             json.dumps(destination_target_tables) if destination_target_tables is not None else None,
+            json.dumps(parity_config) if parity_config else None,
             origin, severity, 1 if active else 0, description,
             now,
         ))
@@ -469,6 +537,7 @@ def update_test_case(test_case_id, name, validation_type, check_type,
                       source_tables=None, source_column=None, destination_tables=None, destination_column=None,
                       target_tables=None, check_scope=None, key_column=None,
                       source_target_tables=None, destination_target_tables=None,
+                      parity_config=None, destination_script_text=None,
                       severity=None, description=None):
     with get_conn() as conn:
         if severity is None:
@@ -477,13 +546,15 @@ def update_test_case(test_case_id, name, validation_type, check_type,
         conn.execute("""
             UPDATE s2d_test_cases SET
                 name = ?, validation_type = ?, check_type = ?, target = ?, target_table = ?,
-                script_type = ?, script_text = ?, row_count_source_tables = ?, row_count_destination_tables = ?,
+                script_type = ?, script_text = ?, destination_script_text = ?,
+                row_count_source_tables = ?, row_count_destination_tables = ?,
                 source_tables = ?, source_column = ?, destination_tables = ?, destination_column = ?,
                 target_tables = ?, check_scope = ?, key_column = ?, source_target_tables = ?, destination_target_tables = ?,
-                severity = ?, description = ?
+                parity_config = ?, severity = ?, description = ?
             WHERE id = ?
         """, (
             name, validation_type, check_type, target, target_table, script_type, script_text,
+            destination_script_text,
             json.dumps(row_count_source_tables) if row_count_source_tables is not None else None,
             json.dumps(row_count_destination_tables) if row_count_destination_tables is not None else None,
             json.dumps(source_tables) if source_tables is not None else None, source_column,
@@ -491,6 +562,7 @@ def update_test_case(test_case_id, name, validation_type, check_type,
             json.dumps(target_tables) if target_tables is not None else None, check_scope, key_column,
             json.dumps(source_target_tables) if source_target_tables is not None else None,
             json.dumps(destination_target_tables) if destination_target_tables is not None else None,
+            json.dumps(parity_config) if parity_config else None,
             severity, description,
             test_case_id,
         ))

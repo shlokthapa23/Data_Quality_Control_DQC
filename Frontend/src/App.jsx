@@ -1,6 +1,7 @@
 import { useState } from 'react';
-import { Plug, DownloadCloud, LayoutGrid, Waypoints, GitCompareArrows, ListChecks, CalendarClock, History } from 'lucide-react';
+import { Plug, DownloadCloud, LayoutGrid, Waypoints, GitCompareArrows, ListChecks, CalendarClock, History, Workflow } from 'lucide-react';
 import ConnectPage from './pages/ConnectPage';
+import PipelinesPage from './pages/PipelinesPage';
 import HarvestWizard from './pages/HarvestWizard';
 import CatalogPage from './pages/CatalogPage';
 import MappingsPage from './pages/MappingsPage';
@@ -12,9 +13,13 @@ import HistoryPage from './pages/HistoryPage';
 import mastekLogo from './images/logo.png'
 const NAV_PAGES = [
   { id: 'connect', label: 'Connect', icon: Plug },
-  { id: 'harvest', label: 'Harvest', icon: DownloadCloud },
+  // Sits between Connect and Harvest to match the data flow: connect, load the
+  // data with a pipeline, then harvest what it produced.
+  
+  { id: 'harvest', label: 'Harvest MetaData', icon: DownloadCloud },
   { id: 'catalog', label: 'Catalog', icon: LayoutGrid },
   { id: 'mapping', label: 'Validation Layer Setup', icon: Waypoints },
+  { id: 'pipelines', label: 'Test Data Preparation', icon: Workflow },
   { id: 's2d', label: 'S2D Validation', icon: GitCompareArrows },
   { id: 'suites', label: 'Test Suites', icon: ListChecks },
   { id: 'schedules', label: 'Schedules', icon: CalendarClock },
@@ -79,6 +84,8 @@ function App() {
     );
   } else if (activePage === 'connect') {
     content = <ConnectPage />;
+  } else if (activePage === 'pipelines') {
+    content = <PipelinesPage onGoToHarvest={() => goToPage('harvest')} />;
   } else if (activePage === 'harvest') {
     content = <HarvestWizard />;
   } else if (activePage === 'catalog') {

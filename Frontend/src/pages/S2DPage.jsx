@@ -45,6 +45,8 @@ export default function S2DPage({ onNavigateToRun, focus }) {
         mapping={selectedMapping}
         onRunComplete={onNavigateToRun}
         focus={focus}
+        onMappingUpdated={(updated) =>
+          setMappings((ms) => ms.map((m) => (m.id === updated.id ? updated : m)))}
       />
     </div>
   );

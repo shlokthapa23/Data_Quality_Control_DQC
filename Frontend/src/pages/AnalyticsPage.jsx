@@ -203,9 +203,18 @@ export default function AnalyticsPage({ runId, onBackToS2D, onGoToHistory }) {
 
           <div className="bg-white border border-slate-200 rounded-xl p-5 space-y-4 shadow-sm font-mono text-xs flex flex-col h-full min-h-[320px]">
             <div className="flex items-center justify-between border-b border-slate-200 pb-2 text-slate-400">
-              <span className="font-bold tracking-wide text-red-600 flex items-center gap-1.5">
-                <AlertTriangle className="w-3.5 h-3.5" /> ERROR TRACE ANALYSIS
-              </span>
+              {/* The panel now shows passing results too, so a green heading
+                  when nothing went wrong - a PASS under a red "ERROR TRACE"
+                  banner reads as a failure at a glance. */}
+              {selectedResult?.status === 'PASS' ? (
+                <span className="font-bold tracking-wide text-mastek-success flex items-center gap-1.5">
+                  <CheckCircle2 className="w-3.5 h-3.5" /> RESULT DETAIL
+                </span>
+              ) : (
+                <span className="font-bold tracking-wide text-red-600 flex items-center gap-1.5">
+                  <AlertTriangle className="w-3.5 h-3.5" /> ERROR TRACE ANALYSIS
+                </span>
+              )}
               <span>{selectedResult?.test_label || '--'}</span>
             </div>
 
@@ -213,11 +222,12 @@ export default function AnalyticsPage({ runId, onBackToS2D, onGoToHistory }) {
               <p className="text-slate-400 italic flex-1">Select a test case to see its trace.</p>
             )}
 
-            {selectedResult && selectedResult.status === 'PASS' && (
-              <p className="text-mastek-success flex-1">✓ This test case passed - nothing to trace.</p>
-            )}
-
-            {selectedResult && selectedResult.status !== 'PASS' && (
+            {/* Shown for PASS as well as failures. A passing check's details
+                carry the actual measured numbers ("source value = 140 |
+                destination value = 140") - that IS the result the tester asked
+                the query for, and hiding it behind "nothing to trace" meant a
+                successful check displayed no evidence at all. */}
+            {selectedResult && (
               <div className="flex-1 space-y-3 text-slate-600 leading-relaxed overflow-y-auto">
                 <p className="text-slate-400">Evaluating: {selectedResult.rule_target}</p>
                 {selectedResult.evaluated_query && (
@@ -225,8 +235,13 @@ export default function AnalyticsPage({ runId, onBackToS2D, onGoToHistory }) {
                     [QUERY] {selectedResult.evaluated_query}
                   </p>
                 )}
-                <p className="text-red-600 font-semibold">
-                  [{selectedResult.status}] {selectedResult.error_message || 'Assertion failed'}
+                <p className={`font-semibold ${
+                  selectedResult.status === 'PASS' ? 'text-mastek-success' : 'text-red-600'
+                }`}>
+                  [{selectedResult.status}]{' '}
+                  {selectedResult.status === 'PASS'
+                    ? 'Assertion held'
+                    : (selectedResult.error_message || 'Assertion failed')}
                 </p>
                 {selectedResult.details && (
                   <p className="bg-slate-50 border border-slate-200 p-2.5 rounded text-slate-700 whitespace-pre-wrap">

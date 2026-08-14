@@ -1,4 +1,4 @@
-from .base import BaseConnector, AssetItem
+from .base import BaseConnector, AssetItem, build_row_count_query
 from local_files import db as local_db
 
 LOCAL_CONTAINER_ID = "local"
@@ -35,7 +35,7 @@ class LocalConnector(BaseConnector):
             return []
         return self.list_tables_in_container(item_id)
 
-    def list_tables_in_container(self, container_id):
+    def list_tables_in_container(self, container_id, include_row_counts=False):
         tables = local_db.list_local_tables(self.connector_id)
         result = []
         for t in tables:
@@ -45,6 +45,23 @@ class LocalConnector(BaseConnector):
                 "kind": "BASE TABLE",
                 "columns": columns,
             })
+
+        if include_row_counts:
+            # One query per table, matching the Fabric path. Native DuckDB would
+            # tolerate a single unioned query, but keeping one code path means
+            # there's no second, subtly-different implementation to get wrong -
+            # and see build_row_count_query for why the unioned form was removed.
+            # Cheap here regardless: all of these together measured ~0.03s.
+            for entry in result:
+                entry["row_count"] = None
+                try:
+                    row = local_db.run_query(
+                        self.connector_id, build_row_count_query(entry["table"])
+                    )
+                    entry["row_count"] = row["row_count"] if row else None
+                except Exception as e:
+                    print(f"Row count failed for {entry['table']}, showing it without one: {e}")
+
         return result
 
     def run_query(self, container_id, sql):
@@ -52,6 +69,9 @@ class LocalConnector(BaseConnector):
 
     def run_query_all(self, container_id, sql):
         return local_db.run_query_all(self.connector_id, sql)
+
+    def validate_query(self, container_id, sql):
+        return local_db.validate_query(self.connector_id, sql)
 
     def sample_rows(self, container_id, table, limit=20):
         return local_db.sample_rows(self.connector_id, table, limit)

@@ -188,6 +188,31 @@ def run_query(connector_id, sql):
             con.close()
 
 
+def validate_query(connector_id, sql):
+    """
+    EXPLAIN the statement to parse + bind it without executing. Returns
+    (ok, error_message). The SELECT-only guard runs first, so a destructive
+    statement never reaches the database at all.
+    """
+    from connectors.sql_guard import clean_explain_error, validate_select_only
+    try:
+        normalized = validate_select_only(sql)
+    except ValueError as e:
+        return False, str(e)
+
+    db_path = _duckdb_path(connector_id)
+    con = None
+    try:
+        con = duckdb.connect(db_path, read_only=True)
+        con.execute(f"EXPLAIN {normalized}")  # plan discarded - we only want the errors
+        return True, None
+    except Exception as e:
+        return False, clean_explain_error(e)
+    finally:
+        if con is not None:
+            con.close()
+
+
 def run_query_all(connector_id, sql):
     """Like run_query, but returns every matching row (list of dicts) instead
     of just the first - used by cross_table_parity's key-column existence

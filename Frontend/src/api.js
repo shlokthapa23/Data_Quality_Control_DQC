@@ -60,8 +60,12 @@ export function pinConnectorContainers(connectorId, containers) {
   });
 }
 
-export function fetchContainerTables(connectorId, containerId) {
-  return request(`/api/connectors/${connectorId}/containers/${containerId}/tables`);
+// includeRowCounts adds a row_count to every table so pickers can show how big
+// it is. Opt-in because counting costs time against a remote endpoint - callers
+// that only need columns (the column map editor, template dropdowns) omit it.
+export function fetchContainerTables(connectorId, containerId, { includeRowCounts = false } = {}) {
+  const query = includeRowCounts ? '?include_row_counts=1' : '';
+  return request(`/api/connectors/${connectorId}/containers/${containerId}/tables${query}`);
 }
 
 export function fetchLocalFiles(connectorId) {
@@ -87,6 +91,24 @@ export async function uploadLocalFile(connectorId, file, displayName) {
 
 export function deleteLocalFile(connectorId, tableId) {
   return request(`/api/connectors/${connectorId}/local/tables/${tableId}`, { method: 'DELETE' });
+}
+
+// --- Data pipelines (fabric connectors only) ---
+
+export function fetchPipelines(connectorId) {
+  return request(`/api/connectors/${connectorId}/pipelines`);
+}
+
+export function runPipeline(connectorId, itemId) {
+  return request(`/api/connectors/${connectorId}/pipelines/${itemId}/run`, { method: 'POST' });
+}
+
+export function fetchPipelineRuns(connectorId, itemId) {
+  return request(`/api/connectors/${connectorId}/pipelines/${itemId}/runs`);
+}
+
+export function fetchPipelineRun(connectorId, itemId, runId) {
+  return request(`/api/connectors/${connectorId}/pipelines/${itemId}/runs/${runId}`);
 }
 
 // --- Harvest ---
@@ -136,6 +158,27 @@ export function renameS2DMapping(id, name) {
 
 export function deleteS2DMapping(id) {
   return request(`/api/s2d/mappings/${id}`, { method: 'DELETE' });
+}
+
+// Full replace - the editor always submits the whole map. Returns the updated
+// mapping, so callers can drop the response straight into their mapping state
+// instead of refetching. No GET counterpart: column_map already rides along on
+// fetchS2DMappings.
+export function saveS2DColumnMap(id, columnMap) {
+  return request(`/api/s2d/mappings/${id}/column-map`, {
+    method: 'PUT',
+    body: JSON.stringify({ column_map: columnMap }),
+  });
+}
+
+// Parses + binds the script on that side's real connector without executing it.
+// Resolves to { ok, error } for BOTH outcomes - a syntax error is a valid
+// result, not a request failure - so callers read `ok` rather than catching.
+export function validateS2DSql(mappingId, { target, sql }) {
+  return request(`/api/s2d/mappings/${mappingId}/validate-sql`, {
+    method: 'POST',
+    body: JSON.stringify({ target, sql }),
+  });
 }
 
 export function fetchS2DTestCases(mappingId) {
@@ -289,13 +332,16 @@ export function generateAITestCase({ tables, sourceTables, destinationTables, ch
   });
 }
 
-export function generateKeyColumnSuggestion({ sourceTables, destinationTables, description }) {
+// mappingId is optional and only used server-side to load that validation's
+// column map, so a common name counts as a valid key when the two sides name
+// the field differently. Omitting it means literal-name matching only.
+export function generateKeyColumnSuggestion({ sourceTables, destinationTables, description, mappingId }) {
   return request('/api/s2d/ai/generate-test-case', {
     method: 'POST',
     body: JSON.stringify({
       check_scope: 'cross_table_parity',
       source_tables: sourceTables, destination_tables: destinationTables,
-      description,
+      description, mapping_id: mappingId,
     }),
   });
 }

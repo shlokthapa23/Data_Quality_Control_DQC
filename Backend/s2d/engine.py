@@ -1,6 +1,7 @@
 import time
 from datetime import datetime, timezone
 
+from s2d import column_map
 from s2d import db as s2d_db
 
 
@@ -29,6 +30,59 @@ def _interpret_row(row):
 
     details = row.get("details")
     return passed, details
+
+
+def shares_connection(mapping):
+    """
+    True when source and destination live on the same connector AND the same
+    container - the classic bronze/silver-in-one-Lakehouse case. Only then can a
+    single SQL statement reach both sides, since SQL executes inside exactly one
+    connection. Used to decide whether a single_side script may reference the
+    other side's tables.
+    """
+    return (mapping["source_connector_id"] == mapping["destination_connector_id"]
+            and mapping["source_container_id"] == mapping["destination_container_id"])
+
+
+# Columns each script contract already consumes; everything else a script
+# returns is the tester's own output.
+_SQL_CHECK_RESERVED = ("passed", "details", "violations", "total_rows")
+_DUAL_SCRIPT_RESERVED = ("value", "details")
+
+
+def _describe_extra_columns(row, reserved):
+    """
+    "male_count = 140" for any column a script returned beyond the pass/fail
+    contract.
+
+    A tester writing `SELECT COUNT(*) AS male_count, TRUE AS passed ...` wants to
+    READ that number, not merely assert on it. Without this the run showed a bare
+    PASS and the value the query was written to produce was discarded - so the
+    only way to see it was to go and run the query somewhere else.
+
+    Anything not consumed by the contract is treated as the tester's own output
+    and surfaced verbatim; no attempt is made to guess what a column means.
+    """
+    if not row:
+        return None
+    extras = [f"{key} = {value}" for key, value in row.items() if key not in reserved]
+    return ", ".join(extras) if extras else None
+
+
+def _interpret_value_row(row, side):
+    """
+    A 'dual_script' side must return one row with a 'value' column. Same stance
+    as _interpret_row: a malformed script is surfaced loudly rather than guessed
+    into a pass, because silently comparing None to None would look like a
+    healthy PASS.
+    Returns (value, error_message) - error_message is None when valid.
+    """
+    if row is None:
+        return None, f"The {side} script returned no rows - expected exactly one row with a 'value' column"
+    if "value" not in row:
+        return None, (f"The {side} script's result has no 'value' column "
+                      f"(columns returned: {list(row.keys())})")
+    return row["value"], None
 
 
 def _build_summed_count_query(tables):
@@ -72,9 +126,86 @@ def _run_sql_check(tc, mapping, source_connector, destination_connector):
         # back to None (rendered as '-' in the UI) rather than being required.
         violations = row.get("violations") if row else None
         total_rows = row.get("total_rows") if row else None
+        # Whatever else the script selected is the tester's own output - show it.
+        # A script computing `COUNT(*) AS male_count` is asking a question, and a
+        # bare PASS with the answer discarded makes them go and re-run it by hand.
+        extras = _describe_extra_columns(row, _SQL_CHECK_RESERVED)
+        if extras:
+            details = f"{details} | {extras}" if details else extras
         return ("PASS" if passed else "FAIL"), tc["script_text"], details, None, rule_target, violations, total_rows
     except Exception as e:
         return "ERROR", tc["script_text"], None, str(e), rule_target, None, None
+
+
+def _run_dual_script_check(tc, mapping, source_connector, destination_connector):
+    """
+    One script per side, each returning a single row with a 'value' column;
+    the engine runs each on its OWN connector/container and compares the two
+    values. This is the only way to check both sides at once when they live on
+    different systems (Local source, Fabric destination, ...) - a single SQL
+    statement can't span two connections, which is the same reason
+    row_count_match and column_parity are shaped this way.
+
+    The scripts stay independent on purpose: each is written in its own side's
+    column names, so a rename between source and destination - exactly the drift
+    this tool exists to catch - doesn't break the check.
+
+    Both scripts pass through the connector-level SELECT-only guard on
+    execution (connectors/sql_guard.py), so nothing extra is needed here.
+    """
+    source_sql = tc.get("script_text")
+    destination_sql = tc.get("destination_script_text")
+    rule_target = (
+        f"{', '.join(mapping['source_tables'])} -> {', '.join(mapping['destination_tables'])}"
+    )
+    evaluated_query = f"[source] {source_sql}  |  [destination] {destination_sql}"
+
+    if tc.get("script_type") != "sql":
+        return "ERROR", evaluated_query, None, \
+            "PySpark execution isn't wired up yet - use a SQL script for live runs.", rule_target, None, None
+    if not source_sql or not destination_sql:
+        return "ERROR", evaluated_query, None, \
+            "Both a source and a destination script are required for this check.", rule_target, None, None
+
+    try:
+        source_row = source_connector.run_query(mapping["source_container_id"], source_sql)
+    except Exception as e:
+        return "ERROR", evaluated_query, None, f"Source script failed: {e}", rule_target, None, None
+
+    try:
+        destination_row = destination_connector.run_query(mapping["destination_container_id"], destination_sql)
+    except Exception as e:
+        return "ERROR", evaluated_query, None, f"Destination script failed: {e}", rule_target, None, None
+
+    source_value, error = _interpret_value_row(source_row, "source")
+    if error:
+        return "ERROR", evaluated_query, None, error, rule_target, None, None
+    destination_value, error = _interpret_value_row(destination_row, "destination")
+    if error:
+        return "ERROR", evaluated_query, None, error, rule_target, None, None
+
+    passed = source_value == destination_value
+    details = f"source value = {source_value} | destination value = {destination_value}"
+    # Each side may also return a 'details' column to explain its own number, and
+    # anything else it selected is surfaced too - same reasoning as the
+    # single-side path, so the two Custom SQL modes don't behave differently.
+    extra = []
+    for side, r in (("source", source_row), ("destination", destination_row)):
+        parts = [p for p in (r.get("details"), _describe_extra_columns(r, _DUAL_SCRIPT_RESERVED)) if p]
+        if parts:
+            extra.append(f"{side}: " + ", ".join(str(p) for p in parts))
+    if extra:
+        details += " (" + "; ".join(extra) + ")"
+
+    # A numeric gap is a meaningful violation count; anything else (strings,
+    # dates, NULLs) can only be a 0/1 flag.
+    if isinstance(source_value, (int, float)) and isinstance(destination_value, (int, float)) \
+            and not isinstance(source_value, bool) and not isinstance(destination_value, bool):
+        violations = abs(source_value - destination_value)
+    else:
+        violations = 0 if passed else 1
+
+    return ("PASS" if passed else "FAIL"), evaluated_query, details, None, rule_target, violations, None
 
 
 def _run_row_count_match(tc, mapping, source_connector, destination_connector):
@@ -110,45 +241,190 @@ def _run_row_count_match(tc, mapping, source_connector, destination_connector):
     return ("PASS" if passed else "FAIL"), evaluated_query, details, None, rule_target, violations, total_rows
 
 
-def _build_column_union(tables, column):
+def _sql_string_literal(value):
+    """
+    A well-formed SQL string literal. Table names arrive already double-quoted
+    for Fabric ('"dbo"."t"'), so only single quotes need escaping.
+    """
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def _build_column_union(column_by_table, tagged=False):
     """
     One table -> a plain "SELECT col AS val FROM t". Multiple tables ->
     UNION ALL'd together first - same shape as _build_summed_count_query,
     just aliasing to "val" so the outer aggregate query never has to
     re-quote the real column name. Works identically for 1 or many tables,
     no single-table special case needed (unlike the count-query version).
+
+    Takes {table: physical column} rather than one shared column name so each
+    arm can select a differently-named column - that's what lets a validation
+    whose tables use different names for the same field be checked at all.
+    Callers build the dict with s2d.column_map.columns_for(), which resolves
+    to the given name verbatim when no map covers a table, so an unmapped
+    validation produces byte-identical SQL to before this took a dict.
+
+    tagged=True also selects the table name as a literal "src_table" column, so
+    one GROUP BY ROLLUP query can report a metric per table AND overall in a
+    single round trip. cross_table_parity leaves it False, keeping its SQL
+    exactly as it was.
     """
-    quoted = f'"{column}"'
-    parts = [f"SELECT {quoted} AS val FROM {t}" for t in tables]
+    parts = []
+    for t, column in column_by_table.items():
+        tag = f"{_sql_string_literal(t)} AS src_table, " if tagged else ""
+        parts.append(f'SELECT {tag}"{column}" AS val FROM {t}')
     return " UNION ALL ".join(parts)
 
 
-def _build_parity_metric_query(validation_type, tables, column):
-    union_sql = _build_column_union(tables, column)
-    if validation_type == "Null Value Constraint":
-        return f"SELECT SUM(CASE WHEN val IS NULL THEN 1 ELSE 0 END) AS metric FROM ({union_sql}) combined"
-    if validation_type == "Uniqueness Constraint":
-        return f"SELECT COUNT(DISTINCT val) AS metric FROM ({union_sql}) combined"
-    if validation_type == "Boundary Range Constraint":
-        return f"SELECT MIN(val) AS min_val, MAX(val) AS max_val FROM ({union_sql}) combined"
-    raise ValueError(f"Unsupported column_parity validation_type: {validation_type}")
+# One entry per column_parity metric. "exprs" is spliced into the SELECT list of
+# the ROLLUP wrapper in _build_parity_metric_query, so adding a metric is one
+# entry here plus one line in PARITY_VALIDATION_TYPES.
+#
+# "kind" says how to compare and render the result:
+#   'count'  - one number; the per-table figures do sum to the overall one
+#   'count2' - total rows plus non-null rows
+#   'range'  - a low/high pair compared as a pair
+#   'scalar' - one non-additive value compared for equality (never subtracted -
+#              Data Freshness' metric is a timestamp string)
+#
+# "additive" is presentational only: it decides whether the breakdown is
+# rendered as summands. COUNT(DISTINCT) across two tables is NOT the sum of
+# their per-table counts, so showing those as if they added up would read as a
+# bug - see _format_breakdown.
+#
+# "Categorical Constraint" is deliberately absent: it compares the SET of
+# distinct values rather than an aggregate, so it takes the _run_categorical_
+# parity path instead.
+PARITY_METRICS = {
+    "Null Value Constraint": {
+        "kind": "count", "additive": True, "label": "nulls",
+        "exprs": "SUM(CASE WHEN val IS NULL THEN 1 ELSE 0 END) AS metric",
+    },
+    "Uniqueness Constraint": {
+        "kind": "count", "additive": False, "label": "distinct values",
+        "exprs": "COUNT(DISTINCT val) AS metric",
+    },
+    "Boundary Range Constraint": {
+        "kind": "range", "additive": False, "label": "range",
+        "exprs": "MIN(val) AS min_val, MAX(val) AS max_val",
+    },
+    "Record Volume Integrity": {
+        "kind": "count2", "additive": True, "label": "volume",
+        "exprs": "COUNT(*) AS metric, COUNT(val) AS non_null",
+    },
+    "Length Constraint": {
+        "kind": "range", "additive": False, "label": "value length",
+        "exprs": ("MIN(LENGTH(CAST(val AS VARCHAR))) AS min_val, "
+                  "MAX(LENGTH(CAST(val AS VARCHAR))) AS max_val"),
+    },
+    "Regex Pattern Check": {
+        "kind": "count", "additive": True, "label": "values matching the pattern",
+        "needs_pattern": True,
+        "exprs": ("SUM(CASE WHEN val IS NOT NULL AND "
+                  "regexp_matches(CAST(val AS VARCHAR), '<pattern>') THEN 1 ELSE 0 END) AS metric"),
+    },
+    "Data Freshness": {
+        "kind": "scalar", "additive": False, "label": "most recent value",
+        "exprs": "CAST(MAX(val) AS VARCHAR) AS metric",
+    },
+}
+
+# The metrics the engine can actually execute. Both app.py's request validation
+# and ai_service.py's prompt vocabulary import this, so the API can never
+# accept - nor the AI propose - a metric with no implementation behind it.
+PARITY_VALIDATION_TYPES = list(PARITY_METRICS) + ["Categorical Constraint"]
 
 
-def _build_row_count_query(tables, column):
-    union_sql = _build_column_union(tables, column)
+def _build_parity_metric_query(validation_type, column_by_table, parity_config=None):
+    spec = PARITY_METRICS.get(validation_type)
+    if not spec:
+        raise ValueError(f"Unsupported column_parity validation_type: {validation_type}")
+
+    exprs = spec["exprs"]
+    if spec.get("needs_pattern"):
+        pattern = (parity_config or {}).get("pattern")
+        if not pattern:
+            raise ValueError(f"{validation_type} needs a regex pattern - edit the test case and set one")
+        exprs = exprs.replace("<pattern>", str(pattern).replace("'", "''"))
+
+    union_sql = _build_column_union(column_by_table, tagged=True)
+    # ROLLUP yields one row per table PLUS a grand-total row (src_table IS
+    # NULL). The total row is aggregated over the whole union, so it stays
+    # correct for metrics that don't sum across tables - COUNT(DISTINCT) above
+    # all, where summing the per-table rows would be plain wrong.
+    return (
+        f"SELECT src_table, {exprs} FROM ({union_sql}) combined "
+        f"GROUP BY ROLLUP (src_table) ORDER BY src_table"
+    )
+
+
+def _split_rollup(rows):
+    """
+    (grand_total_row, {table: row}) out of a ROLLUP result. The grand total is
+    the row with a NULL src_table - unambiguous because every tagged union arm
+    selects a non-null string literal for it.
+    """
+    total = None
+    per_table = {}
+    for row in rows:
+        if row["src_table"] is None:
+            total = row
+        else:
+            per_table[row["src_table"]] = row
+    return total, per_table
+
+
+def _format_breakdown(per_table, render, additive):
+    """
+    The per-table detail the tester needs to see WHICH table is off. Additive
+    metrics read as summands ("(a: 3, b: 4)"); non-additive ones get an
+    explicit "per-table:" prefix so nobody reads "distinct = 2 (a: 2, b: 2)"
+    as broken arithmetic.
+    """
+    if len(per_table) < 2:
+        return ""  # a single table adds nothing the overall figure didn't say
+    if additive:
+        return " (" + ", ".join(f"{t}: {render(r)}" for t, r in per_table.items()) + ")"
+    return " (per-table: " + ", ".join(f"{t} {render(r)}" for t, r in per_table.items()) + ")"
+
+
+def _build_row_count_query(column_by_table):
+    union_sql = _build_column_union(column_by_table)
     return f"SELECT COUNT(*) AS cnt FROM ({union_sql}) combined"
+
+
+def _destination_total_rows(mapping, destination_connector, destination_columns):
+    """
+    Total rows scanned on the destination side - the "current state" being
+    validated. Best-effort: a failure here doesn't invalidate the parity result
+    itself, so it just leaves total_rows as None.
+    """
+    try:
+        row = destination_connector.run_query(
+            mapping["destination_container_id"],
+            _build_row_count_query(destination_columns),
+        )
+        return row["cnt"] if row else None
+    except Exception:
+        return None
 
 
 def _run_column_parity(tc, mapping, source_connector, destination_connector):
     """
-    Computes the same metric (null count / distinct count / min-max range)
-    across ALL selected source tables (unioned together) and ALL selected
-    destination tables (unioned together), then compares them - proving
-    the data that left the source side arrived on the destination side
-    intact, the same way _run_row_count_match proves it at the
-    whole-table level. Multiple tables per side are expected to share the
-    same column name and represent similarly-shaped data (e.g. daily
-    partitions), same assumption row_count_match already makes.
+    Computes the same metric across ALL selected source tables (unioned
+    together) and ALL selected destination tables (unioned together), then
+    compares them - proving the data that left the source side arrived on the
+    destination side intact, the same way _run_row_count_match proves it at the
+    whole-table level. See PARITY_METRICS for the metrics available.
+
+    Multiple tables per side are expected to represent similarly-shaped data
+    (e.g. daily partitions) - and they no longer have to share a column name,
+    since the validation's column map lets each table contribute its own
+    physical column under one shared name.
+
+    Every metric query is grouped with ROLLUP, so one round trip per side
+    returns both the overall figure that decides PASS/FAIL and the per-table
+    figures that tell the tester WHICH table is responsible.
     """
     validation_type = tc["validation_type"]
     source_tables, source_column = tc["source_tables"], tc["source_column"]
@@ -158,54 +434,157 @@ def _run_column_parity(tc, mapping, source_connector, destination_connector):
         f"{', '.join(destination_tables)}.{destination_column}"
     )
 
-    source_query = _build_parity_metric_query(validation_type, source_tables, source_column)
-    destination_query = _build_parity_metric_query(validation_type, destination_tables, destination_column)
+    source_columns = column_map.columns_for(mapping, "source", source_tables, source_column)
+    destination_columns = column_map.columns_for(mapping, "destination", destination_tables, destination_column)
+
+    if validation_type == "Categorical Constraint":
+        return _run_categorical_parity(
+            mapping, source_connector, destination_connector,
+            source_columns, destination_columns, rule_target,
+        )
+
+    try:
+        source_query = _build_parity_metric_query(validation_type, source_columns, tc.get("parity_config"))
+        destination_query = _build_parity_metric_query(validation_type, destination_columns, tc.get("parity_config"))
+    except ValueError as e:
+        # A misconfigured test case (unknown metric, or a regex check saved
+        # without a pattern) is the test case's fault, not the data's - surface
+        # it as ERROR rather than letting it read as a data failure.
+        return "ERROR", "", None, str(e), rule_target, None, None
+
     evaluated_query = f"[source] {source_query}  |  [destination] {destination_query}"
 
     try:
-        source_row = source_connector.run_query(mapping["source_container_id"], source_query)
+        source_rows = source_connector.run_query_all(mapping["source_container_id"], source_query)
     except Exception as e:
         return "ERROR", evaluated_query, None, f"Source query failed: {e}", rule_target, None, None
 
     try:
-        destination_row = destination_connector.run_query(mapping["destination_container_id"], destination_query)
+        destination_rows = destination_connector.run_query_all(mapping["destination_container_id"], destination_query)
     except Exception as e:
         return "ERROR", evaluated_query, None, f"Destination query failed: {e}", rule_target, None, None
 
-    # Total rows scanned on the destination side - the "current state"
-    # being validated. Best-effort: a failure here doesn't invalidate the
-    # parity result itself, so it just leaves total_rows as None.
-    total_rows = None
-    try:
-        total_row = destination_connector.run_query(
-            mapping["destination_container_id"],
-            _build_row_count_query(destination_tables, destination_column),
-        )
-        total_rows = total_row["cnt"] if total_row else None
-    except Exception:
-        total_rows = None
+    source_total, source_per_table = _split_rollup(source_rows)
+    destination_total, destination_per_table = _split_rollup(destination_rows)
+    if source_total is None or destination_total is None:
+        return "ERROR", evaluated_query, None, \
+            "Metric query returned no grand-total row - the tables may be empty", rule_target, None, None
 
-    if validation_type == "Boundary Range Constraint":
-        source_min, source_max = source_row["min_val"], source_row["max_val"]
-        dest_min, dest_max = destination_row["min_val"], destination_row["max_val"]
-        passed = source_min == dest_min and source_max == dest_max
-        details = f"source range = [{source_min}, {source_max}] | destination range = [{dest_min}, {dest_max}]"
-        # A range mismatch isn't naturally a per-row count without embedding
-        # the bound values back into a follow-up query (risky across value
-        # types - dates, decimals, etc - through a plain SQL string), so this
-        # is a flag rather than an exact row-level violation count.
+    total_rows = _destination_total_rows(mapping, destination_connector, destination_columns)
+
+    spec = PARITY_METRICS[validation_type]
+    kind, label, additive = spec["kind"], spec["label"], spec["additive"]
+
+    if kind == "range":
+        def render(row):
+            return f"[{row['min_val']}, {row['max_val']}]"
+        source_value = (source_total["min_val"], source_total["max_val"])
+        destination_value = (destination_total["min_val"], destination_total["max_val"])
+        passed = source_value == destination_value
+        source_text, destination_text = render(source_total), render(destination_total)
+        # A range mismatch isn't naturally a per-row count without embedding the
+        # bound values back into a follow-up query (risky across value types -
+        # dates, decimals, etc - through a plain SQL string), so this is a flag
+        # rather than an exact row-level violation count.
         violations = 0 if passed else 1
-    else:
-        source_metric = source_row["metric"]
-        dest_metric = destination_row["metric"]
-        label = "nulls" if validation_type == "Null Value Constraint" else "distinct values"
-        passed = source_metric == dest_metric
-        details = f"source {label} = {source_metric} | destination {label} = {dest_metric}"
+    elif kind == "count2":
+        def render(row):
+            return f"{row['metric']} rows/{row['non_null']} non-null"
+        source_value = (source_total["metric"], source_total["non_null"])
+        destination_value = (destination_total["metric"], destination_total["non_null"])
+        passed = source_value == destination_value
+        source_text, destination_text = render(source_total), render(destination_total)
+        violations = sum(
+            abs(s - d) for s, d in zip(source_value, destination_value)
+            if s is not None and d is not None
+        )
+    else:  # 'count' and 'scalar'
+        def render(row):
+            return row["metric"]
+        source_value, destination_value = source_total["metric"], destination_total["metric"]
+        passed = source_value == destination_value
+        source_text, destination_text = str(source_value), str(destination_value)
+        # 'scalar' metrics are never subtracted - Data Freshness compares a
+        # timestamp rendered as a string.
         violations = (
-            abs(source_metric - dest_metric)
-            if source_metric is not None and dest_metric is not None else None
+            abs(source_value - destination_value)
+            if kind == "count" and source_value is not None and destination_value is not None
+            else (0 if passed else 1)
         )
 
+    details = (
+        f"source {label} = {source_text}{_format_breakdown(source_per_table, render, additive)}"
+        f" | destination {label} = {destination_text}"
+        f"{_format_breakdown(destination_per_table, render, additive)}"
+    )
+    return ("PASS" if passed else "FAIL"), evaluated_query, details, None, rule_target, violations, total_rows
+
+
+def _run_categorical_parity(mapping, source_connector, destination_connector,
+                             source_columns, destination_columns, rule_target):
+    """
+    Compares the SET of distinct values on each side rather than a count, so a
+    value that exists on the source but never arrived on the destination is
+    caught even when both sides happen to hold the same NUMBER of distinct
+    values - which a plain distinct-count comparison would pass.
+
+    Fetches distinct (table, value) pairs and diffs in Python, the same shape
+    _run_cross_table_parity_check uses for keys. That transports values rather
+    than an aggregate, so this is for low-cardinality columns (status codes,
+    flags, categories), not free text.
+    """
+    def build(column_by_table):
+        return (
+            f"SELECT DISTINCT src_table, CAST(val AS VARCHAR) AS val "
+            f"FROM ({_build_column_union(column_by_table, tagged=True)}) combined"
+        )
+
+    source_query, destination_query = build(source_columns), build(destination_columns)
+    evaluated_query = f"[source] {source_query}  |  [destination] {destination_query}"
+
+    try:
+        source_rows = source_connector.run_query_all(mapping["source_container_id"], source_query)
+    except Exception as e:
+        return "ERROR", evaluated_query, None, f"Source query failed: {e}", rule_target, None, None
+
+    try:
+        destination_rows = destination_connector.run_query_all(mapping["destination_container_id"], destination_query)
+    except Exception as e:
+        return "ERROR", evaluated_query, None, f"Destination query failed: {e}", rule_target, None, None
+
+    # Which table(s) each value came from, so a missing value can be traced back
+    # to the table that still has it.
+    source_origin = {}
+    for row in source_rows:
+        source_origin.setdefault(row["val"], []).append(row["src_table"])
+    destination_values = {row["val"] for row in destination_rows}
+    source_values = set(source_origin)
+
+    missing_in_destination = source_values - destination_values
+    extra_in_destination = destination_values - source_values
+    passed = not missing_in_destination and not extra_in_destination
+
+    def _sample(values, n=5):
+        return ", ".join(repr(v) for v in sorted(values, key=lambda v: (v is None, str(v)))[:n])
+
+    parts = []
+    if missing_in_destination:
+        traced = ", ".join(
+            f"{v!r} (in {', '.join(source_origin[v])})"
+            for v in sorted(missing_in_destination, key=lambda v: (v is None, str(v)))[:5]
+        )
+        parts.append(f"{len(missing_in_destination)} source value(s) absent from destination: {traced}")
+    if extra_in_destination:
+        parts.append(
+            f"{len(extra_in_destination)} destination value(s) with no source counterpart: "
+            f"{_sample(extra_in_destination)}"
+        )
+    details = "; ".join(parts) if parts else (
+        f"all {len(source_values)} distinct value(s) present on both sides"
+    )
+
+    violations = len(missing_in_destination) + len(extra_in_destination)
+    total_rows = _destination_total_rows(mapping, destination_connector, destination_columns)
     return ("PASS" if passed else "FAIL"), evaluated_query, details, None, rule_target, violations, total_rows
 
 
@@ -219,19 +598,28 @@ def _run_cross_table_parity_check(tc, mapping, source_connector, destination_con
     it runs exactly one query per side and compares in Python, so it works
     identically whether source and destination share a connector or are
     completely different systems (Fabric source, Local destination, etc).
+
+    key_column holds either a physical column name (the original behaviour,
+    when every selected table happens to name the key identically) or a common
+    name from the validation's column map - resolved independently per side
+    AND per table below, which is what makes "3 source tables + 1 destination,
+    same data under different column names" checkable.
     """
     key_column = tc["key_column"]
     source_tables = tc["source_target_tables"]
     destination_tables = tc["destination_target_tables"]
     rule_target = f"{', '.join(source_tables)} -> {', '.join(destination_tables)} (key: {key_column})"
 
+    source_columns = column_map.columns_for(mapping, "source", source_tables, key_column)
+    destination_columns = column_map.columns_for(mapping, "destination", destination_tables, key_column)
+
     source_query = (
         f"SELECT COALESCE(CAST(TRY_CAST(val AS DATE) AS VARCHAR), CAST(val AS VARCHAR)) AS val "
-        f"FROM ({_build_column_union(source_tables, key_column)}) combined"
+        f"FROM ({_build_column_union(source_columns)}) combined"
     )
     destination_query = (
         f"SELECT COALESCE(CAST(TRY_CAST(val AS DATE) AS VARCHAR), CAST(val AS VARCHAR)) AS val "
-        f"FROM ({_build_column_union(destination_tables, key_column)}) combined"
+        f"FROM ({_build_column_union(destination_columns)}) combined"
     )
     evaluated_query = f"[source] {source_query}  |  [destination] {destination_query}"
 
@@ -284,6 +672,8 @@ def run_single_test_case(tc, mapping, source_connector, destination_connector):
         return _run_column_parity(tc, mapping, source_connector, destination_connector)
     if tc["check_type"] == "sql" and tc.get("check_scope") == "cross_table_parity":
         return _run_cross_table_parity_check(tc, mapping, source_connector, destination_connector)
+    if tc["check_type"] == "sql" and tc.get("check_scope") == "dual_script":
+        return _run_dual_script_check(tc, mapping, source_connector, destination_connector)
     return _run_sql_check(tc, mapping, source_connector, destination_connector)
 
 

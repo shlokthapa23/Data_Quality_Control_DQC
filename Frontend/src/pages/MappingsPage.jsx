@@ -1,13 +1,14 @@
 import { useEffect, useState } from 'react';
 import {
   ArrowDown, Trash2, Loader2, Plus, ChevronDown, ChevronRight,
-  ListChecks, AlertCircle, CheckCircle2, Pencil, Check, X,
+  ListChecks, AlertCircle, CheckCircle2, Pencil, Check, X, Columns3,
 } from 'lucide-react';
 import {
   fetchConnectors, fetchConnectorContainers, fetchContainerTables,
   fetchS2DMappings, createS2DMapping, renameS2DMapping, deleteS2DMapping,
   fetchTestSuitesForMapping, createTestSuite, deleteTestSuite,
 } from '../api';
+import ColumnMapModal from '../components/s2d/ColumnMapModal';
 
 function EndpointPicker({ label, connectors, endpoint, onChange }) {
   const [containers, setContainers] = useState([]);
@@ -38,7 +39,9 @@ function EndpointPicker({ label, connectors, endpoint, onChange }) {
     if (!endpoint.connectorId || !endpoint.containerId) return;
     setIsLoadingTables(true);
     setError(null);
-    fetchContainerTables(endpoint.connectorId, endpoint.containerId)
+    // Row counts ride along with the listing, so the tester can size up each
+    // table while choosing which ones the validation covers.
+    fetchContainerTables(endpoint.connectorId, endpoint.containerId, { includeRowCounts: true })
       .then((data) => {
         setTables(data.tables);
         setIsLoadingTables(false);
@@ -114,7 +117,16 @@ function EndpointPicker({ label, connectors, endpoint, onChange }) {
                 className="rounded border-slate-300 text-mastek-primary focus:ring-mastek-accent shrink-0"
               />
               <span className="truncate">{t.name}</span>
-              <span className="text-slate-400 text-xs shrink-0 ml-auto">{t.kind === 'VIEW' ? 'view' : 'table'}</span>
+              {/* ?? not ||: an empty table's count is 0, and hiding "0" would
+                  suppress exactly the case worth noticing. */}
+              {t.row_count !== undefined && (
+                <span className="text-[11px] text-slate-500 bg-slate-100 px-1.5 py-0.5 rounded shrink-0 ml-auto">
+                  {t.row_count === null ? '—' : `${t.row_count.toLocaleString()} rows`}
+                </span>
+              )}
+              <span className={`text-slate-400 text-xs shrink-0 ${t.row_count === undefined ? 'ml-auto' : ''}`}>
+                {t.kind === 'VIEW' ? 'view' : 'table'}
+              </span>
             </label>
           ))}
         </div>
@@ -288,6 +300,7 @@ export default function MappingsPage() {
   const [renamingId, setRenamingId] = useState(null);
   const [renameValue, setRenameValue] = useState('');
   const [isRenaming, setIsRenaming] = useState(false);
+  const [columnMapMappingId, setColumnMapMappingId] = useState(null);
 
   const loadMappings = () => {
     fetchS2DMappings().then((data) => {
@@ -430,6 +443,22 @@ export default function MappingsPage() {
                             {m.destination_connector_name}/{m.destination_tables.length} table{m.destination_tables.length !== 1 ? 's' : ''}
                           </p>
                         </div>
+                        {/* Deliberately outside the hover-reveal cluster below:
+                            an opt-in feature nobody can see isn't opt-in, it's
+                            hidden. The badge shows how many common names are
+                            already declared. */}
+                        <button
+                          onClick={(e) => { e.stopPropagation(); setColumnMapMappingId(m.id); }}
+                          className="flex items-center gap-1 p-1 ml-2 text-slate-400 hover:text-mastek-primary shrink-0"
+                          title="Map columns - give differently-named columns one common name"
+                        >
+                          <Columns3 className="w-3.5 h-3.5" />
+                          {(m.column_map?.length || 0) > 0 && (
+                            <span className="text-[10px] font-medium px-1.5 py-0.5 rounded-full bg-mastek-primary/10 text-mastek-primary">
+                              {m.column_map.length}
+                            </span>
+                          )}
+                        </button>
                         <div className="flex items-center opacity-0 group-hover:opacity-100 shrink-0">
                           <button
                             onClick={(e) => { e.stopPropagation(); startRename(m); }}
@@ -524,6 +553,14 @@ export default function MappingsPage() {
       <div>
         <TestSuitesForMapping mapping={selectedMapping} />
       </div>
+
+      {columnMapMappingId && (
+        <ColumnMapModal
+          mapping={mappings.find((m) => m.id === columnMapMappingId)}
+          onClose={() => setColumnMapMappingId(null)}
+          onSaved={(updated) => setMappings((ms) => ms.map((m) => (m.id === updated.id ? updated : m)))}
+        />
+      )}
     </div>
   );
 }
