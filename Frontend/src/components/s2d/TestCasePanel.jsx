@@ -13,6 +13,7 @@ import {
 } from '../../api';
 import { commonNamesFor } from '../../columnMap';
 import { lintSql } from '../../sqlLint';
+import { formatRowCount, rowCountStyle, rowCountTitle } from '../../rowCount';
 import ColumnMapModal from './ColumnMapModal';
 
 const SEVERITY_STYLES = {
@@ -369,7 +370,15 @@ function SqlEditorFooter({ hints, onCheck, checkState }) {
           </p>
         )}
         {checkState?.ok === false && (
-          <p className="flex-1 text-[11px] text-red-600 whitespace-pre-wrap pt-1 break-words">{checkState.error}</p>
+          <div className="flex-1 pt-1 space-y-1">
+            <p className="text-[11px] text-red-600 whitespace-pre-wrap break-words">{checkState.error}</p>
+            {/* The database says what's wrong; this says what to change. */}
+            {checkState.hint && (
+              <p className="flex items-start gap-1.5 text-[11px] text-mastek-primary bg-mastek-primary/5 border border-mastek-primary/20 rounded px-2 py-1">
+                <Wand2 className="w-3 h-3 shrink-0 mt-0.5" /> {checkState.hint}
+              </p>
+            )}
+          </div>
         )}
       </div>
     </div>
@@ -398,10 +407,10 @@ function TableCheckboxList({ tables, selected, onToggle, rowCounts = {} }) {
             <span className="truncate">{t}</span>
             {count !== undefined && (
               <span
-                className="ml-auto shrink-0 text-[11px] text-slate-500 bg-slate-100 px-1.5 py-0.5 rounded"
-                title={count === null ? 'Row count unavailable' : `${count.toLocaleString()} rows`}
+                className={`ml-auto shrink-0 text-[11px] px-1.5 py-0.5 rounded ${rowCountStyle(count)}`}
+                title={rowCountTitle(count)}
               >
-                {count === null ? '—' : `${count.toLocaleString()} rows`}
+                {formatRowCount(count)}
               </span>
             )}
           </label>
@@ -814,8 +823,8 @@ const [tab, setTab] = useState('ai'); // 'ai' | 'manual'
     if (!sql.trim()) return;
     setSqlCheck((s) => ({ ...s, [editorKey]: { busy: true } }));
     try {
-      const { ok, error } = await validateS2DSql(mapping.id, { target, sql });
-      setSqlCheck((s) => ({ ...s, [editorKey]: { busy: false, ok, error } }));
+      const { ok, error, hint } = await validateS2DSql(mapping.id, { target, sql });
+      setSqlCheck((s) => ({ ...s, [editorKey]: { busy: false, ok, error, hint } }));
     } catch (err) {
       // Couldn't run the check at all (connector unreachable) - report it as the
       // check failing, not as the tester's SQL being wrong.

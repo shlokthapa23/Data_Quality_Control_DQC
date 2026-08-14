@@ -9,6 +9,7 @@ import {
   fetchTestSuitesForMapping, createTestSuite, deleteTestSuite,
 } from '../api';
 import ColumnMapModal from '../components/s2d/ColumnMapModal';
+import { formatRowCount, rowCountStyle, rowCountTitle } from '../rowCount';
 
 function EndpointPicker({ label, connectors, endpoint, onChange }) {
   const [containers, setContainers] = useState([]);
@@ -120,8 +121,11 @@ function EndpointPicker({ label, connectors, endpoint, onChange }) {
               {/* ?? not ||: an empty table's count is 0, and hiding "0" would
                   suppress exactly the case worth noticing. */}
               {t.row_count !== undefined && (
-                <span className="text-[11px] text-slate-500 bg-slate-100 px-1.5 py-0.5 rounded shrink-0 ml-auto">
-                  {t.row_count === null ? '—' : `${t.row_count.toLocaleString()} rows`}
+                <span
+                  className={`text-[11px] px-1.5 py-0.5 rounded shrink-0 ml-auto ${rowCountStyle(t.row_count)}`}
+                  title={rowCountTitle(t.row_count)}
+                >
+                  {formatRowCount(t.row_count)}
                 </span>
               )}
               <span className={`text-slate-400 text-xs shrink-0 ${t.row_count === undefined ? 'ml-auto' : ''}`}>

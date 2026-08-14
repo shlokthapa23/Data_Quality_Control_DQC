@@ -17,7 +17,7 @@ from ai_service import (
 # Straight from the engine's metric registry, so a request can never be accepted
 # for a column_parity metric that has no implementation behind it.
 from s2d.engine import PARITY_VALIDATION_TYPES, shares_connection
-from connectors.sql_guard import validate_select_only
+from connectors.sql_guard import suggest_fix, validate_select_only
 import scheduler as _scheduler
 
 
@@ -603,7 +603,9 @@ def validate_s2d_sql(mapping_id):
     except Exception as e:
         return jsonify({"error": "Could not check the query", "details": str(e)}), 502
 
-    return jsonify({"ok": ok, "error": error})
+    # The database says what's wrong; the hint says what to change. Derived from
+    # the error text and the script alone, so it costs no extra queries.
+    return jsonify({"ok": ok, "error": error, "hint": None if ok else suggest_fix(sql, error)})
 
 
 @app.route('/api/s2d/mappings/<mapping_id>', methods=['DELETE'])
