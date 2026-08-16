@@ -379,8 +379,11 @@ def get_container_tables_live(connector_id, container_id):
 @app.route('/api/connectors/<connector_id>/local/upload', methods=['POST'])
 def upload_local_file(connector_id):
     """
-    Multipart form upload. Fields: 'file' (the .csv/.parquet), optional
-    'display_name'. Ingests into DuckDB as a real table immediately.
+    Multipart form upload. Fields: 'file' (any of local_db.SUPPORTED_EXTENSIONS),
+    optional 'display_name', optional 'xml_record_element' to override which
+    repeating element XML rows are taken from. Ingests into DuckDB as a real
+    table immediately, so the file is queryable with the same SQL as everything
+    else regardless of the format it arrived in.
     """
     config = catalog_db.get_connector_config(connector_id)
     if not config:
@@ -393,14 +396,47 @@ def upload_local_file(connector_id):
 
     file_storage = request.files['file']
     display_name = request.form.get('display_name')
+    xml_record_element = request.form.get('xml_record_element') or None
 
     try:
-        row = local_db.ingest_file(connector_id, file_storage, display_name=display_name)
+        row = local_db.ingest_file(
+            connector_id, file_storage,
+            display_name=display_name, xml_record_element=xml_record_element)
         return jsonify(row), 201
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
     except Exception as e:
-        return jsonify({"error": "Failed to ingest file", "details": str(e)}), 500
+        # A malformed file is the tester's problem to fix, so give them the
+        # parser's own words rather than a generic failure.
+        return jsonify({"error": "Couldn't read that file", "details": str(e)}), 400
+
+
+@app.route('/api/connectors/<connector_id>/local/tables/<table_id>/reingest', methods=['POST'])
+def reingest_local_table(connector_id, table_id):
+    """
+    Body: { "xml_record_element": "..." }. Rebuilds an XML table from a
+    different repeating element when the auto-detected one was wrong - the raw
+    upload is still on disk, so this costs no re-upload.
+    """
+    config = catalog_db.get_connector_config(connector_id)
+    if not config:
+        return jsonify({"error": "Unknown connector"}), 404
+    if config["type"] != "local":
+        return jsonify({"error": "This connector isn't a Local connector"}), 400
+
+    body = request.get_json(force=True) or {}
+    element = (body.get("xml_record_element") or "").strip()
+    if not element:
+        return jsonify({"error": "xml_record_element is required"}), 400
+
+    try:
+        return jsonify(local_db.reingest_xml(connector_id, table_id, element))
+    except KeyError:
+        return jsonify({"error": "Unknown table"}), 404
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        return jsonify({"error": "Couldn't re-read that file", "details": str(e)}), 400
 
 
 @app.route('/api/connectors/<connector_id>/local/tables', methods=['GET'])

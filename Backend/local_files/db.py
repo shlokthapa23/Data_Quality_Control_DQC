@@ -1,6 +1,11 @@
+import csv
+import json
 import os
 import re
+import tempfile
 import uuid
+import xml.etree.ElementTree as ET
+from collections import Counter
 from datetime import datetime, timezone
 
 import duckdb
@@ -9,6 +14,15 @@ from catalog.db import get_conn  # same sqlite catalog.db used everywhere else
 
 UPLOAD_DIR = "local_uploads"
 _TABLE_NAME_RE = re.compile(r'[^A-Za-z0-9_]')
+
+# Every format a tester can upload. The point of accepting this many is that
+# once a file is in here it stops being "a JSON file" or "an XML file" and
+# becomes a DuckDB table like any other - so ONE dialect of SQL tests them all,
+# and a tester can prove a file's quality BEFORE it is loaded into a Lakehouse.
+#
+# Not supported: .xlsx. It needs DuckDB's `excel` extension, which isn't
+# installed and would have to be fetched over the network.
+SUPPORTED_EXTENSIONS = ("csv", "tsv", "txt", "json", "ndjson", "jsonl", "parquet", "xml")
 
 
 def init_local_tables_table():
@@ -19,10 +33,15 @@ def init_local_tables_table():
                 connector_id TEXT NOT NULL,
                 display_name TEXT NOT NULL,
                 duckdb_table_name TEXT NOT NULL,
-                file_type TEXT NOT NULL,       -- 'csv' | 'parquet'
+                file_type TEXT NOT NULL,       -- any of SUPPORTED_EXTENSIONS
                 uploaded_at TEXT NOT NULL
             )
         """)
+        # Additive: how the file was interpreted (currently the XML record
+        # element). JSON so a future per-format option needs no migration.
+        existing = {r[1] for r in conn.execute("PRAGMA table_info(local_tables)").fetchall()}
+        if "source_options" not in existing:
+            conn.execute("ALTER TABLE local_tables ADD COLUMN source_options TEXT")
 
 
 def _duckdb_path(connector_id):
@@ -62,7 +81,216 @@ def _next_available_table_name(con, base_name):
     return f"{base_name}_{i}"
 
 
-def ingest_file(connector_id, file_storage, display_name=None):
+def _reader_sql(ext, path):
+    """
+    The DuckDB expression that reads one uploaded file.
+
+    csv/tsv/txt all go through read_csv_auto because its sniffer works out the
+    delimiter itself - a tab-, pipe- or semicolon-separated .txt loads without
+    anyone having to say what's inside it.
+    """
+    quoted = path.replace("'", "''")
+    if ext == "parquet":
+        return f"read_parquet('{quoted}')"
+    if ext == "json":
+        return f"read_json_auto('{quoted}')"
+    if ext in ("ndjson", "jsonl"):
+        return f"read_ndjson_auto('{quoted}')"
+    return f"read_csv_auto('{quoted}')"
+
+
+def _flatten_parts(expr, alias, dtype):
+    """
+    (expression, alias) pairs that turn one possibly-nested column into flat
+    ones. Walks the type programmatically - .id then .children - rather than
+    parsing DuckDB's type string, which would break on any nesting it didn't
+    anticipate.
+    """
+    kind = dtype.id
+    if kind == "struct":
+        children = dtype.children
+        if not children:
+            # A struct with no fields would otherwise vanish entirely.
+            yield f"CAST({expr} AS VARCHAR)", alias
+            return
+        for child_name, child_type in children:
+            yield from _flatten_parts(f'{expr}."{child_name}"', f"{alias}.{child_name}", child_type)
+    elif kind in ("list", "array", "map", "union"):
+        # Arrays keep their shape as JSON text. Exploding them into rows would
+        # silently change the row count, which is the one number a tester is
+        # most likely to be checking.
+        yield f"CAST({expr} AS VARCHAR)", alias
+    else:
+        yield expr, alias
+
+
+def _flattened_select(con, source_sql):
+    """
+    A SELECT over source_sql with nested structures flattened into dotted
+    columns ("customer.address.city"), so plain SQL reaches every field:
+    SELECT COUNT(*) ... WHERE "customer.address.city" = 'X' just works.
+
+    Flat input (every CSV and most Parquet) has nothing to flatten, so this
+    returns the same columns it was given - the existing formats are unaffected.
+    """
+    rel = con.sql(f"SELECT * FROM {source_sql} LIMIT 0")
+    parts = []
+    for name, dtype in zip(rel.columns, rel.types):
+        parts.extend(_flatten_parts(f'"{name}"', name, dtype))
+    if not parts:
+        return f"SELECT * FROM {source_sql}"
+    select_list = ", ".join(f'{expr} AS "{alias}"' for expr, alias in parts)
+    return f"SELECT {select_list} FROM {source_sql}"
+
+
+def _localname(tag):
+    """Drop any XML namespace: '{urn:x}order' -> 'order'."""
+    return tag.split('}', 1)[1] if '}' in tag else tag
+
+
+def _element_to_row(element, prefix, row):
+    """
+    Flatten one XML record into {column: text}, using the same dotted
+    convention as the JSON path so the two formats produce comparable tables.
+    Attributes are prefixed with @; repeated children become JSON text, matching
+    how arrays are handled everywhere else.
+    """
+    for key, value in element.attrib.items():
+        row[f"{prefix}@{_localname(key)}" if prefix else f"@{_localname(key)}"] = value
+
+    children = list(element)
+    if not children:
+        if prefix:
+            row[prefix.rstrip('.')] = (element.text or '').strip()
+        return
+
+    by_name = {}
+    for child in children:
+        by_name.setdefault(_localname(child.tag), []).append(child)
+
+    for name, group in by_name.items():
+        child_prefix = f"{prefix}{name}" if prefix else name
+        if len(group) == 1:
+            _element_to_row(group[0], f"{child_prefix}.", row)
+        else:
+            row[child_prefix] = json.dumps([_element_text_or_dict(c) for c in group])
+
+
+def _element_text_or_dict(element):
+    """One member of a repeated element group, as a JSON-encodable value."""
+    if not list(element) and not element.attrib:
+        return (element.text or '').strip()
+    nested = {}
+    _element_to_row(element, "", nested)
+    return nested
+
+
+def xml_to_rows(path, record_element=None):
+    """
+    Turn an XML document into rows.
+
+    XML has no notion of a row, so one has to be chosen: the most frequent
+    REPEATING element directly under the root, which is what essentially every
+    record-per-element document looks like. Returns
+    (rows, chosen_element, candidates) so the caller can report the guess and
+    let the tester pick a different one.
+
+    Two shapes are deliberately not treated as collections:
+      - a root with no element children is an EMPTY document -> zero rows, not
+        one empty row. A file with no records has to read as 0, because that's
+        the case a tester most needs to notice.
+      - a root with SEVERAL differently-named children, none repeated, is a
+        SINGLE record and those children are its fields. Taking "the most
+        frequent child" there would turn each field into its own row.
+
+    A root with exactly one child is deliberately read as a collection of one,
+    NOT as a single record: otherwise a file with one <item> would produce
+    different column names than the same file with two, and a test written
+    against one of them would break against the other.
+    """
+    root = ET.parse(path).getroot()
+    counts = Counter(_localname(child.tag) for child in root)
+    candidates = [name for name, _ in counts.most_common()]
+
+    if not counts:
+        return [], None, []
+    if record_element is None and sum(counts.values()) > 1 and max(counts.values()) == 1:
+        return [_single_row(root)], None, candidates
+
+    chosen = record_element or candidates[0]
+    if chosen not in counts:
+        raise ValueError(
+            f"No <{chosen}> elements under the root. Found: {', '.join(candidates)}"
+        )
+
+    rows = []
+    for child in root:
+        if _localname(child.tag) == chosen:
+            rows.append(_single_row(child))
+    return rows, chosen, candidates
+
+
+def _single_row(element):
+    row = {}
+    _element_to_row(element, "", row)
+    if not row:
+        # A record that is just text, e.g. <note>hello</note>. Without this the
+        # row would be empty and the value silently thrown away; name the column
+        # after the element it came from.
+        row[_localname(element.tag)] = (element.text or '').strip()
+    return row
+
+
+def _rows_to_csv(rows):
+    """
+    Park XML rows in a temporary CSV and let read_csv_auto load them, so an XML
+    file gets exactly the same type sniffing as the equivalent CSV upload. That
+    is the point of the whole exercise: the format the data arrived in must stop
+    being visible once it's a table.
+    """
+    columns = []
+    seen = set()
+    for row in rows:
+        for key in row:
+            if key not in seen:
+                seen.add(key)
+                columns.append(key)
+
+    handle = tempfile.NamedTemporaryFile(
+        mode='w', suffix='.csv', delete=False, newline='', encoding='utf-8')
+    try:
+        writer = csv.DictWriter(handle, fieldnames=columns or ['value'])
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({c: row.get(c, '') for c in columns})
+    finally:
+        handle.close()
+    return handle.name
+
+
+def _create_table_from_file(con, table_name, ext, saved_path, xml_record_element=None):
+    """
+    Load one file into `table_name`, returning the XML details when relevant.
+    Every format funnels through the same flatten-then-CREATE step so none of
+    them can end up behaving differently from the others.
+    """
+    chosen, candidates, temp_csv = None, None, None
+    try:
+        if ext == "xml":
+            rows, chosen, candidates = xml_to_rows(saved_path, xml_record_element)
+            temp_csv = _rows_to_csv(rows)
+            source_sql = _reader_sql("csv", temp_csv)
+        else:
+            source_sql = _reader_sql(ext, saved_path)
+
+        con.execute(f"CREATE TABLE {table_name} AS {_flattened_select(con, source_sql)}")
+    finally:
+        if temp_csv:
+            os.remove(temp_csv)
+    return chosen, candidates
+
+
+def ingest_file(connector_id, file_storage, display_name=None, xml_record_element=None):
     """
     file_storage: a Flask FileStorage object (request.files['file']).
     Saves the raw upload, loads it into DuckDB as a real materialized
@@ -71,8 +299,11 @@ def ingest_file(connector_id, file_storage, display_name=None):
     """
     original_filename = file_storage.filename or "upload"
     ext = os.path.splitext(original_filename)[1].lower().lstrip('.')
-    if ext not in ("csv", "parquet"):
-        raise ValueError("Only .csv and .parquet files are supported")
+    if ext not in SUPPORTED_EXTENSIONS:
+        raise ValueError(
+            f"Can't read a .{ext or '?'} file. Supported: "
+            + ", ".join(f".{e}" for e in SUPPORTED_EXTENSIONS)
+        )
 
     os.makedirs(UPLOAD_DIR, exist_ok=True)
     file_id = str(uuid.uuid4())
@@ -88,25 +319,83 @@ def ingest_file(connector_id, file_storage, display_name=None):
         table_name = _next_available_table_name(con, base_name)
         # saved_path is server-generated (uuid-based), not user-controlled
         # text, so direct interpolation here doesn't carry injection risk.
-        if ext == "csv":
-            con.execute(f"CREATE TABLE {table_name} AS SELECT * FROM read_csv_auto('{saved_path}')")
-        else:
-            con.execute(f"CREATE TABLE {table_name} AS SELECT * FROM read_parquet('{saved_path}')")
+        chosen, candidates = _create_table_from_file(
+            con, table_name, ext, saved_path, xml_record_element)
+        row_count = con.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()[0]
+        column_count = len(con.execute(f"DESCRIBE {table_name}").fetchall())
+    except Exception:
+        # Don't leave the raw upload behind when nothing was registered for it.
+        if os.path.exists(saved_path):
+            os.remove(saved_path)
+        raise
     finally:
         if con is not None:
             con.close()
 
+    options = {"xml_record_element": chosen} if chosen else None
     now = datetime.now(timezone.utc).isoformat()
     with get_conn() as conn:
         conn.execute("""
-            INSERT INTO local_tables (id, connector_id, display_name, duckdb_table_name, file_type, uploaded_at)
-            VALUES (?, ?, ?, ?, ?, ?)
-        """, (file_id, connector_id, display_name or original_filename, table_name, ext, now))
+            INSERT INTO local_tables (id, connector_id, display_name, duckdb_table_name,
+                                      file_type, uploaded_at, source_options)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (file_id, connector_id, display_name or original_filename, table_name, ext, now,
+              json.dumps(options) if options else None))
 
     return {
         "id": file_id, "connector_id": connector_id,
         "display_name": display_name or original_filename,
         "duckdb_table_name": table_name, "file_type": ext, "uploaded_at": now,
+        "row_count": row_count, "column_count": column_count,
+        "xml_record_element": chosen, "xml_candidates": candidates,
+    }
+
+
+def reingest_xml(connector_id, table_id, record_element):
+    """
+    Rebuild an XML-sourced table from a different record element.
+
+    The raw upload is still on disk, so a wrong auto-detection is recoverable
+    without asking the tester to upload the file again.
+    """
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM local_tables WHERE id = ? AND connector_id = ?", (table_id, connector_id)
+        ).fetchone()
+    if not row:
+        raise KeyError("Unknown table")
+    row = dict(row)
+    if row["file_type"] != "xml":
+        raise ValueError("Only XML tables can be re-read with a different record element")
+
+    saved_path = os.path.join(UPLOAD_DIR, f"{table_id}.xml")
+    if not os.path.exists(saved_path):
+        raise ValueError("The original upload is no longer on disk - please upload the file again")
+
+    table_name = row["duckdb_table_name"]
+    con = None
+    try:
+        con = duckdb.connect(_duckdb_path(connector_id))
+        # Build the replacement first: if the chosen element is wrong, the
+        # existing table must survive untouched rather than being dropped for a
+        # rebuild that then fails.
+        staging = _next_available_table_name(con, f"{table_name}_restaging")
+        chosen, candidates = _create_table_from_file(con, staging, "xml", saved_path, record_element)
+        con.execute(f"DROP TABLE IF EXISTS {table_name}")
+        con.execute(f"ALTER TABLE {staging} RENAME TO {table_name}")
+        row_count = con.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()[0]
+        column_count = len(con.execute(f"DESCRIBE {table_name}").fetchall())
+    finally:
+        if con is not None:
+            con.close()
+
+    with get_conn() as conn:
+        conn.execute("UPDATE local_tables SET source_options = ? WHERE id = ?",
+                     (json.dumps({"xml_record_element": chosen}), table_id))
+
+    return {
+        **row, "row_count": row_count, "column_count": column_count,
+        "xml_record_element": chosen, "xml_candidates": candidates,
     }
 
 
@@ -116,7 +405,18 @@ def list_local_tables(connector_id):
             "SELECT * FROM local_tables WHERE connector_id = ? ORDER BY uploaded_at DESC",
             (connector_id,),
         ).fetchall()
-        return [dict(r) for r in rows]
+
+    result = []
+    for r in rows:
+        row = dict(r)
+        # Parsed here rather than in the caller, so nothing downstream has to
+        # know the column happens to hold JSON. Absent or unreadable -> {}.
+        try:
+            row["source_options"] = json.loads(row.get("source_options") or "{}")
+        except (TypeError, ValueError):
+            row["source_options"] = {}
+        result.append(row)
+    return result
 
 
 def delete_local_table(connector_id, table_id):

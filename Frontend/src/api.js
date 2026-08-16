@@ -93,6 +93,15 @@ export function deleteLocalFile(connectorId, tableId) {
   return request(`/api/connectors/${connectorId}/local/tables/${tableId}`, { method: 'DELETE' });
 }
 
+// Rebuild an XML table from a different repeating element. The raw upload is
+// still on disk, so correcting a bad guess costs no re-upload.
+export function reingestLocalTable(connectorId, tableId, xmlRecordElement) {
+  return request(`/api/connectors/${connectorId}/local/tables/${tableId}/reingest`, {
+    method: 'POST',
+    body: JSON.stringify({ xml_record_element: xmlRecordElement }),
+  });
+}
+
 // --- Data pipelines (fabric connectors only) ---
 
 export function fetchPipelines(connectorId) {
