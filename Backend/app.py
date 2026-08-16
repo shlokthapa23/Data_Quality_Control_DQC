@@ -532,23 +532,35 @@ def create_s2d_mapping():
     (Fabric <-> Local, Local <-> Local). Each side can hold multiple tables.
     """
     body = request.get_json(force=True)
+    validation_kind = body.get("validation_kind") or "source_to_destination"
+    if validation_kind not in ("source_to_destination", "source_only"):
+        return jsonify({"error": f"Unknown validation_kind: {validation_kind}"}), 400
+    source_only = validation_kind == "source_only"
+
     required = [
         "name",
         "source_connector_id", "source_connector_name", "source_container_id", "source_container_name", "source_tables",
-        "destination_connector_id", "destination_connector_name", "destination_container_id", "destination_container_name", "destination_tables",
     ]
+    if not source_only:
+        required += [
+            "destination_connector_id", "destination_connector_name",
+            "destination_container_id", "destination_container_name", "destination_tables",
+        ]
     missing = [f for f in required if not body.get(f)]
     if missing:
         return jsonify({"error": f"Missing fields: {', '.join(missing)}"}), 400
 
     source_tables = body["source_tables"]
-    destination_tables = body["destination_tables"]
+    destination_tables = [] if source_only else body["destination_tables"]
     if not isinstance(source_tables, list) or not isinstance(destination_tables, list):
         return jsonify({"error": "source_tables and destination_tables must be arrays"}), 400
-    if not source_tables or not destination_tables:
+    if not source_tables:
+        return jsonify({"error": "Select at least one source table"}), 400
+    if not source_only and not destination_tables:
         return jsonify({"error": "Select at least one table on each side"}), 400
 
-    if (body["source_connector_id"] == body["destination_connector_id"]
+    if (not source_only
+            and body["source_connector_id"] == body["destination_connector_id"]
             and body["source_container_id"] == body["destination_container_id"]
             and set(source_tables) == set(destination_tables)):
         return jsonify({"error": "Source and destination can't be the exact same set of tables"}), 400
@@ -558,9 +570,12 @@ def create_s2d_mapping():
         source_connector_id=body["source_connector_id"], source_connector_name=body["source_connector_name"],
         source_container_id=body["source_container_id"], source_container_name=body["source_container_name"],
         source_tables=source_tables,
-        destination_connector_id=body["destination_connector_id"], destination_connector_name=body["destination_connector_name"],
-        destination_container_id=body["destination_container_id"], destination_container_name=body["destination_container_name"],
+        destination_connector_id=body.get("destination_connector_id"),
+        destination_connector_name=body.get("destination_connector_name"),
+        destination_container_id=body.get("destination_container_id"),
+        destination_container_name=body.get("destination_container_name"),
         destination_tables=destination_tables,
+        validation_kind=validation_kind,
     )
     return jsonify({"id": mapping_id}), 201
 
@@ -724,6 +739,19 @@ def create_s2d_test_case(mapping_id):
     return jsonify({"id": test_case_id}), 201
 
 
+def _destination_connector_for(mapping):
+    """
+    The destination connector, or None for a source_only validation - which has
+    no destination at all, so there is nothing to build. Every check a
+    source_only validation can hold runs against the source, and
+    _validate_test_case_body refuses the two-sided ones up front.
+    """
+    if mapping.get("validation_kind") == "source_only" or not mapping.get("destination_connector_id"):
+        return None
+    _, connector = get_connector_instance(mapping["destination_connector_id"])
+    return connector
+
+
 def _validate_test_case_body(body, mapping):
     """Shared validation for create and update. Returns an error string, or None if valid."""
     required = ["name", "validation_type", "check_type"]
@@ -735,10 +763,25 @@ def _validate_test_case_body(body, mapping):
     if check_type not in ("sql", "row_count_match", "column_parity"):
         return "check_type must be 'sql', 'row_count_match', or 'column_parity'"
 
+    # A source-only validation has nothing to compare against, so every check
+    # that is definitionally two-sided is refused here rather than failing
+    # later with a confusing "unknown connector ''".
+    source_only = mapping.get("validation_kind") == "source_only"
+    if source_only and check_type != "sql":
+        return ("This validation checks a source on its own, so it can only run Custom SQL "
+                "checks against that source - there is no destination to compare with")
+
     if check_type == "sql":
         check_scope = body.get("check_scope") or "single_side"
         if check_scope not in ("single_side", "cross_table_parity", "dual_script"):
             return "check_scope must be 'single_side', 'cross_table_parity', or 'dual_script' for sql checks"
+        if source_only and check_scope != "single_side":
+            return ("This validation checks a source on its own, so a Custom SQL check has to run "
+                    "against the source - there is no destination side")
+        # The engine picks its connector from `target`; 'destination' would hand
+        # it None on a source-only validation.
+        if source_only and check_scope == "single_side" and body.get("target", "source") != "source":
+            return "This validation has no destination, so the script has to target the source"
 
         if check_scope == "dual_script":
             if body.get("script_type") not in ("sql", "pyspark"):
@@ -894,7 +937,7 @@ def run_single_s2d_test_case(test_case_id):
 
     try:
         _, source_connector = get_connector_instance(mapping["source_connector_id"])
-        _, destination_connector = get_connector_instance(mapping["destination_connector_id"])
+        destination_connector = _destination_connector_for(mapping)
     except KeyError as e:
         return jsonify({"error": str(e)}), 404
     except ValueError as e:
@@ -1119,7 +1162,7 @@ def ai_suggest_parity_rules(mapping_id):
 
     try:
         _, source_connector = get_connector_instance(mapping["source_connector_id"])
-        _, destination_connector = get_connector_instance(mapping["destination_connector_id"])
+        destination_connector = _destination_connector_for(mapping)
     except KeyError as e:
         return jsonify({"error": str(e)}), 404
     except ValueError as e:
@@ -1266,7 +1309,7 @@ def ai_suggest_cross_table_parity_rules(mapping_id):
 
     try:
         _, source_connector = get_connector_instance(mapping["source_connector_id"])
-        _, destination_connector = get_connector_instance(mapping["destination_connector_id"])
+        destination_connector = _destination_connector_for(mapping)
     except KeyError as e:
         return jsonify({"error": str(e)}), 404
     except ValueError as e:
@@ -1453,7 +1496,7 @@ def run_s2d_suite(suite_id):
     mapping = suite["mapping"]
     try:
         _, source_connector = get_connector_instance(mapping["source_connector_id"])
-        _, destination_connector = get_connector_instance(mapping["destination_connector_id"])
+        destination_connector = _destination_connector_for(mapping)
     except KeyError as e:
         return jsonify({"error": str(e)}), 404
     except ValueError as e:
@@ -1475,7 +1518,7 @@ def run_s2d_pipeline(mapping_id):
 
     try:
         _, source_connector = get_connector_instance(mapping["source_connector_id"])
-        _, destination_connector = get_connector_instance(mapping["destination_connector_id"])
+        destination_connector = _destination_connector_for(mapping)
     except KeyError as e:
         return jsonify({"error": str(e)}), 404
     except ValueError as e:

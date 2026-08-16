@@ -295,6 +295,10 @@ export default function MappingsPage() {
   const [selectedMappingId, setSelectedMappingId] = useState(null);
   const [connectors, setConnectors] = useState([]);
   const [name, setName] = useState('');
+  // 'source_to_destination' compares two sides; 'source_only' checks a source
+  // on its own, which is how a tester proves a file before it is loaded
+  // anywhere - at which point there is no destination to compare against yet.
+  const [validationKind, setValidationKind] = useState('source_to_destination');
   const [source, setSource] = useState(EMPTY_ENDPOINT);
   const [destination, setDestination] = useState(EMPTY_ENDPOINT);
   const [isSaving, setIsSaving] = useState(false);
@@ -319,8 +323,10 @@ export default function MappingsPage() {
   }, []);
 
   const isFormOpen = showForm || mappings.length === 0;
+  const sourceOnly = validationKind === 'source_only';
   const isComplete = name && source.connectorId && source.containerId && source.tables.length > 0
-    && destination.connectorId && destination.containerId && destination.tables.length > 0;
+    && (sourceOnly
+      || (destination.connectorId && destination.containerId && destination.tables.length > 0));
 
   const handleCreate = async () => {
     if (!isComplete) return;
@@ -332,9 +338,14 @@ export default function MappingsPage() {
         source_connector_id: source.connectorId, source_connector_name: source.connectorName,
         source_container_id: source.containerId, source_container_name: source.containerName,
         source_tables: source.tables,
-        destination_connector_id: destination.connectorId, destination_connector_name: destination.connectorName,
-        destination_container_id: destination.containerId, destination_container_name: destination.containerName,
-        destination_tables: destination.tables,
+        validation_kind: validationKind,
+        // A source-only validation has no destination at all - not an empty
+        // one - so the fields are left off entirely.
+        ...(sourceOnly ? {} : {
+          destination_connector_id: destination.connectorId, destination_connector_name: destination.connectorName,
+          destination_container_id: destination.containerId, destination_container_name: destination.containerName,
+          destination_tables: destination.tables,
+        }),
       });
       setName('');
       setSource(EMPTY_ENDPOINT);
@@ -515,13 +526,47 @@ export default function MappingsPage() {
                 className="w-full mb-4 px-2.5 py-1.5 text-sm border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-mastek-accent"
               />
 
-              <EndpointPicker label="1. Source" connectors={connectors} endpoint={source} onChange={setSource} />
-
-              <div className="flex justify-center my-3">
-                <ArrowDown className="w-4 h-4 text-slate-300" />
+              <div className="mb-4 grid grid-cols-2 gap-2">
+                {[
+                  { kind: 'source_to_destination', title: 'Source → Destination',
+                    hint: 'Compare two sides — the data moved correctly.' },
+                  { kind: 'source_only', title: 'Source only',
+                    hint: 'Check a source on its own, before loading it anywhere.' },
+                ].map((opt) => (
+                  <button
+                    key={opt.kind}
+                    onClick={() => setValidationKind(opt.kind)}
+                    className={`text-left px-3 py-2 rounded-lg border text-xs ${
+                      validationKind === opt.kind
+                        ? 'border-mastek-primary bg-mastek-primary/5 text-slate-800'
+                        : 'border-slate-200 text-slate-500 hover:bg-slate-50'
+                    }`}
+                  >
+                    <span className="block font-medium">{opt.title}</span>
+                    <span className="block text-[11px] text-slate-400 mt-0.5">{opt.hint}</span>
+                  </button>
+                ))}
               </div>
 
-              <EndpointPicker label="2. Destination" connectors={connectors} endpoint={destination} onChange={setDestination} />
+              <EndpointPicker label="1. Source" connectors={connectors} endpoint={source} onChange={setSource} />
+
+              {!sourceOnly && (
+                <>
+                  <div className="flex justify-center my-3">
+                    <ArrowDown className="w-4 h-4 text-slate-300" />
+                  </div>
+
+                  <EndpointPicker label="2. Destination" connectors={connectors} endpoint={destination} onChange={setDestination} />
+                </>
+              )}
+
+              {sourceOnly && (
+                <p className="mt-3 text-xs text-slate-400">
+                  Checks run against the source alone, so only Custom SQL against that source is
+                  available &mdash; there is nothing to compare it with yet. Useful for proving a
+                  file&rsquo;s quality before it becomes a Lakehouse table.
+                </p>
+              )}
 
               {(source.tables.length > 0 || destination.tables.length > 0) && (
                 <div className="mt-4 p-3 rounded-lg bg-slate-50 border border-slate-200 text-xs space-y-2">
@@ -530,10 +575,14 @@ export default function MappingsPage() {
                     <p className="text-mastek-highlight truncate">
                       {source.tables.length > 0 ? source.tables.join(', ') : '...'}
                     </p>
-                    <p className="text-center text-slate-300">&#8595;</p>
-                    <p className="text-mastek-accent truncate">
-                      {destination.tables.length > 0 ? destination.tables.join(', ') : '...'}
-                    </p>
+                    {!sourceOnly && (
+                      <>
+                        <p className="text-center text-slate-300">&#8595;</p>
+                        <p className="text-mastek-accent truncate">
+                          {destination.tables.length > 0 ? destination.tables.join(', ') : '...'}
+                        </p>
+                      </>
+                    )}
                   </div>
                 </div>
               )}

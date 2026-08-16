@@ -154,6 +154,15 @@ def init_s2d_tables():
                 -- NULL when the tester hasn't opted in - see s2d/column_map.py.
                 column_map TEXT,
 
+                -- 'source_to_destination' (compare two sides) or 'source_only'
+                -- (check a source before there is anything to compare it to,
+                -- e.g. proving a file's quality before loading it anywhere).
+                -- The destination_* columns above are NOT NULL, so a
+                -- source_only row stores empty strings and an empty table list
+                -- rather than NULL - dropping NOT NULL would mean rebuilding
+                -- the table, and migrations here are additive only.
+                validation_kind TEXT NOT NULL DEFAULT 'source_to_destination',
+
                 created_at TEXT NOT NULL
             )
         """)
@@ -340,6 +349,11 @@ def _add_missing_mapping_columns():
     Nullable with no default and nothing to backfill - a NULL column_map is
     precisely "the tester hasn't opted in", which every read path already
     treats as today's literal-name behaviour.
+
+    Then validation_kind, which is 'source_to_destination' for every existing
+    row - the default makes that true without a backfill - or 'source_only' for
+    a validation that checks a source before it has a destination to compare
+    against, which is the whole point of testing a file before loading it.
     """
     with get_conn() as conn:
         row = conn.execute(
@@ -351,6 +365,10 @@ def _add_missing_mapping_columns():
         existing = {r[1] for r in conn.execute("PRAGMA table_info(s2d_mappings)").fetchall()}
         if "column_map" not in existing:
             conn.execute("ALTER TABLE s2d_mappings ADD COLUMN column_map TEXT")
+        if "validation_kind" not in existing:
+            conn.execute(
+                "ALTER TABLE s2d_mappings ADD COLUMN validation_kind TEXT "
+                "NOT NULL DEFAULT 'source_to_destination'")
 
 
 def _add_missing_test_run_columns():
@@ -415,30 +433,39 @@ def _mapping_row_to_dict(row):
     # Always a list, never None - "no column map" and "an empty column map"
     # mean the same thing (nobody opted in) to every consumer.
     m["column_map"] = json.loads(m["column_map"]) if m.get("column_map") else []
+    # Rows written before this column existed are source-to-destination.
+    m["validation_kind"] = m.get("validation_kind") or "source_to_destination"
     return m
 
 
 def create_mapping(name,
                     source_connector_id, source_connector_name, source_container_id,
                     source_container_name, source_tables,
-                    destination_connector_id, destination_connector_name,
-                    destination_container_id, destination_container_name, destination_tables):
+                    destination_connector_id=None, destination_connector_name=None,
+                    destination_container_id=None, destination_container_name=None,
+                    destination_tables=None,
+                    validation_kind="source_to_destination"):
     mapping_id = str(uuid.uuid4())
     now = datetime.now(timezone.utc).isoformat()
+    # A source_only validation has no destination at all. The columns are
+    # NOT NULL, so store empties - every read path already treats an empty
+    # table list as "nothing on that side".
     with get_conn() as conn:
         conn.execute("""
             INSERT INTO s2d_mappings (
                 id, name,
                 source_connector_id, source_connector_name, source_container_id, source_container_name, source_tables,
                 destination_connector_id, destination_connector_name, destination_container_id, destination_container_name, destination_tables,
-                created_at
+                validation_kind, created_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             mapping_id, name,
             source_connector_id, source_connector_name, source_container_id, source_container_name, json.dumps(source_tables),
-            destination_connector_id, destination_connector_name, destination_container_id, destination_container_name, json.dumps(destination_tables),
-            now,
+            destination_connector_id or "", destination_connector_name or "",
+            destination_container_id or "", destination_container_name or "",
+            json.dumps(destination_tables or []),
+            validation_kind, now,
         ))
     return mapping_id
 

@@ -764,6 +764,10 @@ const [tab, setTab] = useState('ai'); // 'ai' | 'manual'
   };
 
   const isCrossTableParity = form.checkType === 'sql' && form.checkScope === 'cross_table_parity';
+  // A source-only validation has nothing to compare against, so the two-sided
+  // check types aren't offered at all. The API refuses them too - this just
+  // stops the tester building something that can only be rejected on save.
+  const sourceOnly = mapping?.validation_kind === 'source_only';
   const isDualScript = form.checkType === 'sql' && form.checkScope === 'dual_script';
   // Both scopes live under the one "Custom SQL script" check type - the
   // "Runs against" row picks between them.
@@ -1588,6 +1592,7 @@ const [tab, setTab] = useState('ai'); // 'ai' | 'manual'
                 </div>
               </label>
 
+              {!sourceOnly && (
               <label className={`flex items-start gap-2 cursor-pointer p-2 rounded-lg border ${
                 form.checkType === 'row_count_match'
                   ? 'border-mastek-primary bg-mastek-primary/5' : 'border-slate-200 hover:bg-slate-50'
@@ -1611,7 +1616,9 @@ const [tab, setTab] = useState('ai'); // 'ai' | 'manual'
                   </div>
                 </div>
               </label>
+              )}
 
+              {!sourceOnly && (
               <label className={`flex items-start gap-2 cursor-pointer p-2 rounded-lg border ${
                 form.checkType === 'column_parity'
                   ? 'border-mastek-primary bg-mastek-primary/5' : 'border-slate-200 hover:bg-slate-50'
@@ -1634,7 +1641,9 @@ const [tab, setTab] = useState('ai'); // 'ai' | 'manual'
                   </div>
                 </div>
               </label>
+              )}
 
+              {!sourceOnly && (
               <label className={`flex items-start gap-2 cursor-pointer p-2 rounded-lg border ${
                 form.checkType === 'sql' && form.checkScope === 'cross_table_parity'
                   ? 'border-mastek-primary bg-mastek-primary/5' : 'border-slate-200 hover:bg-slate-50'
@@ -1652,6 +1661,7 @@ const [tab, setTab] = useState('ai'); // 'ai' | 'manual'
                   </div>
                 </div>
               </label>
+              )}
 
             </div>
           </div>
