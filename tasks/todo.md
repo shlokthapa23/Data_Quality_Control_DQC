@@ -48,6 +48,58 @@ Everything from **"Custom SQL now shows the numbers your query computed"** downw
 
 ## Feature changelog (newest first)
 
+### Renames, layout, any-file-type SQL, and source-only validations — 2026-08-16
+
+Four commits: `55c817f` (renames + layout), `a3fd086` (file formats), `6517ef4` (source-only),
+plus `71d2455` (Lakehouse table list) earlier the same day.
+
+**Renames** — labels only; route ids, API paths, DB values and component names are unchanged,
+following the precedent set when "Mapping" became "Validation":
+Catalog → **Catalog Viewer**, Validation Layer Setup → **Test Layer & Test Suite Setup**,
+S2D Validation → **Test Cases Validation**, Test Suites → **Test Suite Execution**,
+Schedules → **Test Suite & Harvest Schedule**, History → **Test Run History**.
+Cross-page prose had to follow or it would point at tabs that no longer exist.
+*Note: the Schedules label names two kinds but the dashboard shows three — pipeline schedules
+landed in `5f15fd5`.*
+
+**Test Data Preparation layout**: table list moved left, pipelines right, and the Connector and
+Lakehouse selectors moved into the page header top-right — they drive both panels, so they were
+never properties of the pipelines card.
+
+**Any file type, one SQL.** `.json`, `.ndjson`/`.jsonl`, `.txt`, `.tsv` and `.xml` join
+`.csv`/`.parquet`. The format stops being visible once the file lands: every upload becomes an
+ordinary DuckDB table, so the same SQL runs against a file and a Fabric table alike, and quality
+can be proved *before* loading anything.
+
+> **This needed no engine, connector or test-case change.** `LocalConnector` already exposes each
+> upload as a real table, so the pickers, row counts, syntax checker, all 10 templates, the 8
+> parity metrics, suites and schedules got the new formats for free. Normalising at ingest is what
+> makes one dialect enough — don't teach the query layer about formats.
+
+- csv/tsv/txt use `read_csv_auto`, whose sniffer finds the delimiter; json/ndjson use the native
+  readers. Nested structures flatten to dotted columns (`"customer.address.city"`), arrays become
+  JSON text rather than being exploded into rows (which would silently change the row count).
+- **XML has no DuckDB reader**, so it's converted in Python and parked in a temp CSV to get the
+  same type sniffing as an equivalent CSV. Row element = most frequent *repeating* child;
+  attributes become `@`-prefixed columns. Degenerate shapes are decided explicitly (see
+  `tasks/lessons.md`). A wrong guess is fixable via `POST …/reingest`, which stages the
+  replacement first so a bad element can't destroy a working table.
+- **`.xlsx` is not supported** — it needs DuckDB's `excel` extension, which isn't installed and
+  would have to be fetched over the network.
+
+**Source-only validations.** `s2d_mappings.validation_kind` is `'source_to_destination'` (default,
+so all existing rows are already correct) or `'source_only'`. The two-sided check types are
+refused by the API and hidden in the UI. Everything else — test cases, suites, schedules, results,
+history — is reused unchanged.
+
+**Verified**: the same four records as csv/txt/json/ndjson/xml/parquet, one identical SQL →
+identical results *and* schemas, repeated end to end through the live upload route; nested JSON 3
+deep queried by dotted column; XML override end to end incl. a bogus element returning 400 with
+the good table intact; empty files → 0 rows; malformed files → the parser's own message;
+flat CSV byte-identical to the old implementation; a source-only validation run → PASS
+`row_count = 1000`. Layout measured from the DOM at 1280/768px. All fixtures torn down and the
+user's tables and validations confirmed untouched. Lint at the 9-problem baseline.
+
 ### Pipelines: duration, measured table changes, and scheduling — 2026-08-14
 
 *(The tab has since been renamed **Test Data Preparation** and moved between Validation Layer Setup and S2D Validation — same `PipelinesPage` component and `pipelines` route id.)*
