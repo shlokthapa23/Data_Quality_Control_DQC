@@ -507,7 +507,7 @@ const [tab, setTab] = useState('ai'); // 'ai' | 'manual'
     setSuggestKeyColumnError(null);
     setSuggestCrossParityError(null); setSuggestCrossParitySummary(null);
     // Skip clearing suite-selection state when a cross-page focus (from the
-    // Test Suites page's Edit Suite button) is about to open it right back
+    // Test Suite Execution's Edit Suite button) is about to open it right back
     // up for this same mapping - otherwise this reset always wins the race
     // against the focus-consuming effect below, since both fire off the
     // same [mapping] change.
@@ -981,7 +981,7 @@ const [tab, setTab] = useState('ai'); // 'ai' | 'manual'
     }
   };
 
-  // Cross-page handoff from the Test Suites page: once this mapping's test
+  // Cross-page handoff from Test Suite Execution: once this mapping's test
   // cases have finished loading, either open the edit form for a specific
   // test case, or open suite-membership editing pre-targeted at a specific
   // suite. Bails while isLoading is still true (initial mount) and only

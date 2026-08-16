@@ -142,7 +142,7 @@ export default function SchedulesDashboard() {
       <div className="flex items-center justify-between mb-4">
         <h2 className="text-lg font-semibold text-slate-800 flex items-center gap-2">
           <CalendarClock className="w-5 h-5 text-mastek-primary" />
-          Schedules
+          Test Suite &amp; Harvest Schedule
         </h2>
         <button
           onClick={reload}
@@ -171,9 +171,9 @@ export default function SchedulesDashboard() {
           <CalendarClock className="w-10 h-10 text-slate-300 mx-auto mb-3" />
           <p className="text-slate-500 text-sm">
             No schedules yet — create one from a test suite's detail page on{' '}
-            <span className="font-medium text-slate-700">Test Suites</span>, from the{' '}
+            <span className="font-medium text-slate-700">Test Suite Execution</span>, from the{' '}
             <span className="font-medium text-slate-700">Harvest</span> wizard, or from{' '}
-            <span className="font-medium text-slate-700">Pipelines</span>.
+            <span className="font-medium text-slate-700">Test Data Preparation</span>.
           </p>
         </div>
       )}

@@ -183,7 +183,7 @@ function TestSuitesForMapping({ mapping }) {
     try {
       await createTestSuite(mapping.id, { name, description: suiteDescription.trim() || null, test_case_ids: [] });
       setSuiteName(''); setSuiteDescription('');
-      setSuccess(`Created "${name}" — add test cases to it from the S2D Validation tab.`);
+      setSuccess(`Created "${name}" — add test cases to it from the Test Cases Validation tab.`);
       load();
     } catch (err) {
       setError(err.message);
@@ -217,7 +217,7 @@ function TestSuitesForMapping({ mapping }) {
         Test Suites for "{mapping.name}"
       </h3>
       <p className="text-xs text-slate-400 mb-4">
-        Create empty suites here, then go to S2D Validation to author test cases and add them into a suite.
+        Create empty suites here, then go to Test Cases Validation to author test cases and add them into a suite.
       </p>
 
       <div className="flex flex-col sm:flex-row gap-2 mb-4">
@@ -493,7 +493,7 @@ export default function MappingsPage() {
             onClick={() => setShowForm((v) => !v)}
             className="w-full flex items-center justify-between text-xs font-bold text-slate-400 uppercase tracking-wider mb-3 hover:text-slate-600"
           >
-            Create New S2D Validation
+            Create New Validation
             {isFormOpen ? <ChevronDown className="w-3.5 h-3.5" /> : <ChevronRight className="w-3.5 h-3.5" />}
           </button>
 

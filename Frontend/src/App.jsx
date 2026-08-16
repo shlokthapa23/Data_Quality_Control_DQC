@@ -17,23 +17,23 @@ const NAV_PAGES = [
   // data with a pipeline, then harvest what it produced.
   
   { id: 'harvest', label: 'Harvest MetaData', icon: DownloadCloud },
-  { id: 'catalog', label: 'Catalog', icon: LayoutGrid },
-  { id: 'mapping', label: 'Validation Layer Setup', icon: Waypoints },
+  { id: 'catalog', label: 'Catalog Viewer', icon: LayoutGrid },
+  { id: 'mapping', label: 'Test Layer & Test Suite Setup', icon: Waypoints },
   { id: 'pipelines', label: 'Test Data Preparation', icon: Workflow },
-  { id: 's2d', label: 'S2D Validation', icon: GitCompareArrows },
-  { id: 'suites', label: 'Test Suites', icon: ListChecks },
-  { id: 'schedules', label: 'Schedules', icon: CalendarClock },
-  { id: 'history', label: 'History', icon: History },
+  { id: 's2d', label: 'Test Cases Validation', icon: GitCompareArrows },
+  { id: 'suites', label: 'Test Suite Execution', icon: ListChecks },
+  { id: 'schedules', label: 'Test Suite & Harvest Schedule', icon: CalendarClock },
+  { id: 'history', label: 'Test Run History', icon: History },
 ];
 
 function App() {
   const [activePage, setActivePage] = useState('harvest');
   const [activeRunId, setActiveRunId] = useState(null);
   const [analyticsReturnTo, setAnalyticsReturnTo] = useState('s2d'); // where "back" goes from Analytics
-  // Cross-page handoff into S2D Validation: { mappingId, suiteId } to open
+  // Cross-page handoff into Test Cases Validation: { mappingId, suiteId } to open
   // suite-membership editing pre-targeted at that suite, or
   // { mappingId, testCaseId } to open the edit form for that test case.
-  // Set by Test Suites page's Edit Suite / row Edit buttons. Deliberately
+  // Set by Test Suite Execution's Edit Suite / row Edit buttons. Deliberately
   // NOT auto-cleared right after TestCasePanel consumes it - React 18
   // StrictMode's dev-only double-mount check (mount -> unmount -> remount,
   // to verify effects are safely re-runnable) would otherwise discard the

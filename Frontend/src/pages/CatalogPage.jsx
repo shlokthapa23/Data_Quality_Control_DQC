@@ -53,7 +53,7 @@ export default function CatalogPage() {
     <div className="max-w-6xl mx-auto">
       <div className="flex items-center justify-between mb-4">
         <h2 className="text-lg font-semibold text-slate-800">
-          Harvested Catalog <span className="text-slate-400 font-normal">({assets.length})</span>
+          Catalog Viewer <span className="text-slate-400 font-normal">({assets.length})</span>
         </h2>
         <button
           onClick={load}

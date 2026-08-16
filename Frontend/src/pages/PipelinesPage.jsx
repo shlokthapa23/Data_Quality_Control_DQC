@@ -186,6 +186,13 @@ function LakehouseTables({ containerName, tables, status, onRefresh }) {
           ))}
         </div>
       )}
+
+      {/* Sits with the counts it describes rather than beside the pipelines. */}
+      <p className="text-xs text-slate-400">
+        These counts are read again just before and just after a run, and the difference is shown
+        below. Fabric doesn&rsquo;t report which tables a pipeline touched, so this measures the
+        effect instead &mdash; a rewrite that lands the same number of rows won&rsquo;t show up.
+      </p>
     </div>
   );
 }
@@ -445,25 +452,23 @@ export default function PipelinesPage({ onGoToHarvest }) {
 
   return (
     <div className="max-w-7xl mx-auto space-y-6">
-      <div>
-        <h2 className="text-xl font-bold tracking-tight text-slate-800 flex items-center gap-2">
-          <Workflow className="w-5 h-5 text-mastek-primary" /> Data Pipelines
-        </h2>
-        <p className="text-sm text-slate-500 mt-1">
-          Run a Fabric pipeline to load data, wait for it to finish, then head to Harvest to pick up
-          the Lakehouse it populated.
-        </p>
-      </div>
+      {/* Title left, the two selectors top-right. They drive BOTH panels below,
+          so they belong to the page rather than sitting inside either card.
+          Stacks under the title below lg rather than being squeezed. */}
+      <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
+        <div>
+          <h2 className="text-xl font-bold tracking-tight text-slate-800 flex items-center gap-2">
+            <Workflow className="w-5 h-5 text-mastek-primary" /> Data Pipelines
+          </h2>
+          <p className="text-sm text-slate-500 mt-1">
+            Run a Fabric pipeline to load data, wait for it to finish, then head to Harvest to pick up
+            the Lakehouse it populated.
+          </p>
+        </div>
 
-      {/* Two columns: the pipelines that load data, beside what is actually
-          in the Lakehouse right now. The tester is comparing the two, so
-          stacking them would put the answer off screen while they read the
-          question. Collapses to one column below lg, where side-by-side would
-          squeeze both. */}
-      <div className={`grid gap-6 items-start ${watchContainerId ? 'lg:grid-cols-2' : ''}`}>
-        <div className="bg-white border border-slate-200 rounded-xl shadow-sm p-4 space-y-3">
-          <label className="flex items-center gap-3 max-w-xl">
-            <span className="text-xs font-bold text-slate-400 uppercase tracking-wider shrink-0">
+        <div className="space-y-2 lg:shrink-0 lg:w-96">
+          <label className="flex items-center gap-3">
+            <span className="text-xs font-bold text-slate-400 uppercase tracking-wider shrink-0 w-20 text-right">
               Connector
             </span>
             <select
@@ -474,7 +479,7 @@ export default function PipelinesPage({ onGoToHarvest }) {
                 setHistory([]);
                 loadPipelines(e.target.value);
               }}
-              className="flex-1 px-2.5 py-1.5 text-sm border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-mastek-accent"
+              className="flex-1 min-w-0 px-2.5 py-1.5 text-sm border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-mastek-accent"
             >
               {connectors.length === 0 && <option value="">No Fabric connector yet — add one on Connect</option>}
               {connectors.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
@@ -482,8 +487,8 @@ export default function PipelinesPage({ onGoToHarvest }) {
           </label>
 
           {containers.length > 0 && (
-            <label className="flex items-center gap-3 max-w-xl">
-              <span className="text-xs font-bold text-slate-400 uppercase tracking-wider shrink-0">
+            <label className="flex items-center gap-3">
+              <span className="text-xs font-bold text-slate-400 uppercase tracking-wider shrink-0 w-20 text-right">
                 Lakehouse
               </span>
               <select
@@ -493,21 +498,33 @@ export default function PipelinesPage({ onGoToHarvest }) {
                   setTableDiff(null);
                   loadTables(connectorId, e.target.value);
                 }}
-                className="flex-1 px-2.5 py-1.5 text-sm border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-mastek-accent"
+                className="flex-1 min-w-0 px-2.5 py-1.5 text-sm border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-mastek-accent"
               >
                 <option value="">Don&rsquo;t list or measure tables</option>
                 {containers.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
               </select>
             </label>
           )}
-          {watchContainerId && (
-            <p className="text-xs text-slate-400">
-              This Lakehouse&rsquo;s tables are listed below with their current row counts. The same
-              counts are read again just before and just after a run, and the difference is shown.
-              Fabric doesn&rsquo;t report which tables a pipeline touched, so this measures the effect
-              instead &mdash; a rewrite that lands the same number of rows won&rsquo;t show up.
-            </p>
-          )}
+        </div>
+      </div>
+
+      {/* What's in the Lakehouse on the LEFT, the pipelines that change it on
+          the right. The tester reads the current state first, then decides what
+          to run against it. Collapses to one column below lg. */}
+      <div className={`grid gap-6 items-start ${watchContainerId ? 'lg:grid-cols-2' : ''}`}>
+        {watchContainerId && (
+          <LakehouseTables
+            containerName={containers.find((c) => c.id === watchContainerId)?.name || 'this Lakehouse'}
+            tables={tables}
+            status={tablesStatus}
+            onRefresh={() => loadTables(connectorId, watchContainerId)}
+          />
+        )}
+
+        <div className="bg-white border border-slate-200 rounded-xl shadow-sm p-4 space-y-3">
+          <h4 className="text-xs font-bold text-slate-400 uppercase tracking-wider flex items-center gap-1.5">
+            <Workflow className="w-3.5 h-3.5" /> Pipelines
+          </h4>
 
           {isLoading && (
             <p className="flex items-center gap-2 text-sm text-slate-500">
@@ -564,15 +581,6 @@ export default function PipelinesPage({ onGoToHarvest }) {
             </p>
           )}
         </div>
-
-        {watchContainerId && (
-          <LakehouseTables
-            containerName={containers.find((c) => c.id === watchContainerId)?.name || 'this Lakehouse'}
-            tables={tables}
-            status={tablesStatus}
-            onRefresh={() => loadTables(connectorId, watchContainerId)}
-          />
-        )}
       </div>
 
       {activeRun && (

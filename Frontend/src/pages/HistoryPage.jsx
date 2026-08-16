@@ -95,7 +95,7 @@ export default function HistoryPage({ onOpenRun }) {
               {runs.length === 0 && (
                 <tr>
                   <td colSpan={7} className="px-6 py-8 text-center text-slate-400">
-                    No test runs yet - run a pipeline from the S2D Validation page.
+                    No test runs yet - run a pipeline from the Test Cases Validation page.
                   </td>
                 </tr>
               )}

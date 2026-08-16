@@ -194,7 +194,7 @@ export default function TestSuitesPage({ onNavigateToRun, onEditSuite, onEditTes
           <ListChecks className="w-10 h-10 text-slate-300 mx-auto mb-3" />
           <p className="text-slate-500 text-sm">
             No test suites yet — create one from a validation's test-case list on the
-            {' '}<span className="font-medium text-slate-700">S2D Validation</span> page.
+            {' '}<span className="font-medium text-slate-700">Test Cases Validation</span> page.
           </p>
         </div>
       )}
@@ -259,7 +259,7 @@ export default function TestSuitesPage({ onNavigateToRun, onEditSuite, onEditTes
                     <button
                       onClick={() => selectedSuite.mapping && onEditSuite(selectedSuite.mapping.id, selectedSuite.id)}
                       disabled={!selectedSuite.mapping}
-                      title="Edit suite membership on the S2D Validation tab"
+                      title="Edit suite membership on the Test Cases Validation tab"
                       className="flex items-center gap-1.5 px-3 py-1.5 text-sm font-medium text-mastek-primary border border-mastek-primary/40 rounded-lg hover:bg-mastek-primary/10 disabled:opacity-50 disabled:cursor-not-allowed"
                     >
                       <Pencil className="w-3.5 h-3.5" />
@@ -330,7 +330,7 @@ export default function TestSuitesPage({ onNavigateToRun, onEditSuite, onEditTes
                                 onClick={() => selectedSuite.mapping && onEditTestCase(selectedSuite.mapping.id, tc.id)}
                                 disabled={!selectedSuite.mapping}
                                 className="p-1.5 text-slate-400 hover:text-mastek-primary hover:bg-mastek-primary/10 rounded-lg shrink-0 disabled:opacity-50"
-                                title="Edit on the S2D Validation tab"
+                                title="Edit on the Test Cases Validation tab"
                               >
                                 <Pencil className="w-4 h-4" />
                               </button>
