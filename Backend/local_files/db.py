@@ -290,6 +290,36 @@ def _create_table_from_file(con, table_name, ext, saved_path, xml_record_element
     return chosen, candidates
 
 
+def _readable_ingest_error(error, saved_path, original_filename):
+    """
+    Reword a reader's failure so it talks about the tester's file.
+
+    Uploads are stored under a generated uuid name, so DuckDB's message points
+    at something like local_uploads\\6ce01da2-....json - a path the tester has
+    never seen and can't act on. Swap it for the name they actually chose, and
+    drop the parser's noise about byte offsets in favour of what to do next.
+    """
+    message = str(error)
+    for path in (saved_path, os.path.abspath(saved_path), os.path.basename(saved_path)):
+        message = message.replace(path, original_filename)
+    # DuckDB prefixes its own category; it adds nothing once the rest is plain.
+    for prefix in ("Invalid Input Error: ", "IO Error: ", "Conversion Error: "):
+        message = message.replace(prefix, "")
+    return message.strip()
+
+
+_FORMAT_ADVICE = {
+    "json": 'Check it is valid JSON - an array of objects, or one object per line for .ndjson.',
+    "ndjson": 'Each line must be one complete JSON object, with no commas between lines.',
+    "jsonl": 'Each line must be one complete JSON object, with no commas between lines.',
+    "xml": 'Check the document is well formed - every opening tag needs its closing tag.',
+    "csv": 'Check the delimiter and that every row has the same number of columns.',
+    "tsv": 'Check the delimiter and that every row has the same number of columns.',
+    "txt": 'Check the delimiter and that every row has the same number of columns.',
+    "parquet": 'The file may be truncated or not actually Parquet.',
+}
+
+
 def ingest_file(connector_id, file_storage, display_name=None, xml_record_element=None):
     """
     file_storage: a Flask FileStorage object (request.files['file']).
@@ -323,11 +353,16 @@ def ingest_file(connector_id, file_storage, display_name=None, xml_record_elemen
             con, table_name, ext, saved_path, xml_record_element)
         row_count = con.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()[0]
         column_count = len(con.execute(f"DESCRIBE {table_name}").fetchall())
-    except Exception:
+    except Exception as e:
         # Don't leave the raw upload behind when nothing was registered for it.
         if os.path.exists(saved_path):
             os.remove(saved_path)
-        raise
+        detail = _readable_ingest_error(e, saved_path, original_filename)
+        advice = _FORMAT_ADVICE.get(ext)
+        raise ValueError(
+            f"Couldn't read {original_filename}: {detail}"
+            + (f" {advice}" if advice else "")
+        ) from e
     finally:
         if con is not None:
             con.close()
