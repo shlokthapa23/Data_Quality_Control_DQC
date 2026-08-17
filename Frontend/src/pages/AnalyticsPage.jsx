@@ -263,7 +263,7 @@ export default function AnalyticsPage({ runId, onBackToS2D, onGoToHistory }) {
                 onClick={() => onBackToS2D(run.mapping_id)}
                 className="flex-1 bg-mastek-primary hover:brightness-110 text-white text-center py-2 rounded font-medium transition"
               >
-                Adjust Logic
+                Update Test Query
               </button>
             </div>
           </div>

@@ -29,6 +29,14 @@ export function formatRowCount(count) {
 /** Tooltip text explaining what the badge means. */
 export function rowCountTitle(count) {
   if (count === null || count === undefined) return 'Row count unavailable';
-  if (count === 0) return 'This table is empty - a check against it has nothing to read';
+  if (count === 0) {
+    // Says what to do next, not just what's wrong: a check against an empty
+    // table passes trivially, so the table needs populating before it can be
+    // meaningfully tested.
+    return 'This table currently holds no records. Test cases cannot be meaningfully '
+      + 'evaluated against it, as any check would pass without verifying anything. '
+      + 'Load data into the table - for example by running the relevant pipeline from '
+      + 'Test Data Preparation - before defining test cases.';
+  }
   return `${count.toLocaleString()} rows`;
 }

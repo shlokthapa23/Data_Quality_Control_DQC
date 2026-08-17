@@ -768,6 +768,13 @@ const [tab, setTab] = useState('ai'); // 'ai' | 'manual'
   // check types aren't offered at all. The API refuses them too - this just
   // stops the tester building something that can only be rejected on save.
   const sourceOnly = mapping?.validation_kind === 'source_only';
+
+  // Newest first, so a test case you just created is the one you're looking at
+  // rather than something you have to scroll to find. Display order only - the
+  // API still returns them oldest-first, which is the order they execute in.
+  const orderedTestCases = [...testCases].sort(
+    (a, b) => String(b.created_at || '').localeCompare(String(a.created_at || '')),
+  );
   const isDualScript = form.checkType === 'sql' && form.checkScope === 'dual_script';
   // Both scopes live under the one "Custom SQL script" check type - the
   // "Runs against" row picks between them.
@@ -1087,7 +1094,7 @@ const [tab, setTab] = useState('ai'); // 'ai' | 'manual'
   if (!mapping) {
     return (
       <main className="flex-1 flex items-center justify-center text-slate-400 text-sm">
-        Select a validation above to configure its test cases, or create one on the Validation Setup tab.
+        Select a test layer above to configure its test cases, or create one on the Test Layer & Test Suite Setup tab.
       </main>
     );
   }
@@ -1571,7 +1578,7 @@ const [tab, setTab] = useState('ai'); // 'ai' | 'manual'
           </div>
 
           <div className="border-b border-slate-100 pb-3">
-            <div className="text-xs font-medium text-slate-500 mb-2">Check type — pick what fits your validation:</div>
+            <div className="text-xs font-medium text-slate-500 mb-2">Check type — pick what fits your test layer:</div>
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
               {/* Covers both single_side and dual_script - which one you get is
                   chosen by the "Runs against" row below, since that's really a
@@ -1670,7 +1677,7 @@ const [tab, setTab] = useState('ai'); // 'ai' | 'manual'
             <div className="space-y-3">
               <p className="text-sm text-slate-500">
                 Sums <code className="font-mono text-xs">COUNT(*)</code> across whichever tables you pick on each
-                side, then compares the two totals. Pick any subset of this validation's tables per side.
+                side, then compares the two totals. Pick any subset of this test layer's tables per side.
               </p>
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                 <div>
@@ -2187,7 +2194,7 @@ const [tab, setTab] = useState('ai'); // 'ai' | 'manual'
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-100">
-                {testCases.map((tc) => (
+                {orderedTestCases.map((tc) => (
                   <tr key={tc.id} className={tc.active === false ? 'opacity-50' : ''}>
                     {isSelectingSuite && (
                       <td className="px-3 py-3 w-8">
@@ -2288,7 +2295,7 @@ const [tab, setTab] = useState('ai'); // 'ai' | 'manual'
                 </div>
               ) : availableSuites.length === 0 ? (
                 <p className="text-sm text-slate-400 italic px-1 py-1.5">
-                  No test suites for this validation yet — create one from the Validation Setup tab.
+                  No test suites for this test layer yet — create one from the Test Layer & Test Suite Setup tab.
                 </p>
               ) : (
                 <select

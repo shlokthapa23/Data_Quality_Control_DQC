@@ -49,7 +49,7 @@ export default function HistoryPage({ onOpenRun }) {
           <table className="w-full text-sm text-left">
             <thead className="bg-slate-50 border-b border-slate-200 text-slate-500">
               <tr>
-                <th className="px-6 py-3 font-medium">Validation</th>
+                <th className="px-6 py-3 font-medium">Test Layer</th>
                 <th className="px-6 py-3 font-medium">Suite</th>
                 <th className="px-6 py-3 font-medium">Status</th>
                 <th className="px-6 py-3 font-medium">Checkpoints</th>
@@ -66,7 +66,7 @@ export default function HistoryPage({ onOpenRun }) {
                   className="hover:bg-slate-50 cursor-pointer transition-colors"
                 >
                   <td className="px-6 py-3 font-medium text-slate-800 truncate max-w-[200px]">
-                    {run.mapping_name || '(deleted validation)'}
+                    {run.mapping_name || '(deleted test layer)'}
                   </td>
                   <td className="px-6 py-3 text-slate-500 truncate max-w-[180px]">
                     {run.suite_name || <span className="text-slate-300">—</span>}

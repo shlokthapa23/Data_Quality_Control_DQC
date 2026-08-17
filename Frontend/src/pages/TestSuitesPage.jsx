@@ -162,7 +162,7 @@ export default function TestSuitesPage({ onNavigateToRun, onEditSuite, onEditTes
 
       <label className="flex items-center gap-3 mb-4 max-w-sm">
         <span className="text-xs font-bold text-slate-400 uppercase tracking-wider shrink-0 flex items-center gap-1.5">
-          <GitCompareArrows className="w-3.5 h-3.5" /> Validation
+          <GitCompareArrows className="w-3.5 h-3.5" /> Test Layer
         </span>
         <select
           value={selectedValidationId}
@@ -193,7 +193,7 @@ export default function TestSuitesPage({ onNavigateToRun, onEditSuite, onEditTes
         <div className="bg-white border border-slate-200 rounded-xl shadow-sm p-12 text-center">
           <ListChecks className="w-10 h-10 text-slate-300 mx-auto mb-3" />
           <p className="text-slate-500 text-sm">
-            No test suites yet — create one from a validation's test-case list on the
+            No test suites yet — create one from a test layer's test-case list on the
             {' '}<span className="font-medium text-slate-700">Test Cases Validation</span> page.
           </p>
         </div>
@@ -217,7 +217,7 @@ export default function TestSuitesPage({ onNavigateToRun, onEditSuite, onEditTes
                   >
                     <div className="text-sm font-medium text-slate-800 truncate">{s.name}</div>
                     <div className="text-xs text-slate-500 mt-0.5 truncate">
-                      {s.mapping_name || '(deleted validation)'}
+                      {s.mapping_name || '(deleted test layer)'}
                     </div>
                     <div className="text-xs text-slate-400 mt-0.5">
                       {s.test_case_count} test case{s.test_case_count === 1 ? '' : 's'}
@@ -241,7 +241,7 @@ export default function TestSuitesPage({ onNavigateToRun, onEditSuite, onEditTes
                   <div className="min-w-0">
                     <h3 className="text-base font-semibold text-slate-800 truncate">{selectedSuite.name}</h3>
                     <p className="text-xs text-slate-500 mt-0.5">
-                      Validation: <span className="text-slate-700">{selectedSuite.mapping?.name || '(deleted)'}</span>
+                      Test Layer: <span className="text-slate-700">{selectedSuite.mapping?.name || '(deleted)'}</span>
                     </p>
                     {selectedSuite.description && (
                       <p className="text-sm text-slate-600 mt-2">{selectedSuite.description}</p>

@@ -205,7 +205,7 @@ function TestSuitesForMapping({ mapping }) {
   if (!mapping) {
     return (
       <div className="bg-white border border-slate-200 rounded-xl shadow-sm p-8 text-center text-sm text-slate-400">
-        Select or create a validation to manage its test suites.
+        Select or create a test layer to manage its test suites.
       </div>
     );
   }
@@ -261,7 +261,7 @@ function TestSuitesForMapping({ mapping }) {
       )}
 
       {!isLoading && suites.length === 0 && (
-        <p className="text-sm text-slate-400 italic">No test suites yet for this validation.</p>
+        <p className="text-sm text-slate-400 italic">No test suites yet for this test layer.</p>
       )}
 
       {!isLoading && suites.length > 0 && (
@@ -402,7 +402,7 @@ export default function MappingsPage() {
               onClick={() => setShowMappings((v) => !v)}
               className="w-full flex items-center justify-between text-xs font-bold text-slate-400 uppercase tracking-wider mb-3 hover:text-slate-600"
             >
-              Validations ({mappings.length})
+              Test Layers ({mappings.length})
               {showMappings ? <ChevronDown className="w-3.5 h-3.5" /> : <ChevronRight className="w-3.5 h-3.5" />}
             </button>
             {showMappings && (
@@ -504,7 +504,7 @@ export default function MappingsPage() {
             onClick={() => setShowForm((v) => !v)}
             className="w-full flex items-center justify-between text-xs font-bold text-slate-400 uppercase tracking-wider mb-3 hover:text-slate-600"
           >
-            Create New Validation
+            Create New Test Layer
             {isFormOpen ? <ChevronDown className="w-3.5 h-3.5" /> : <ChevronRight className="w-3.5 h-3.5" />}
           </button>
 
@@ -513,7 +513,7 @@ export default function MappingsPage() {
               onClick={() => setShowForm(true)}
               className="w-full flex items-center justify-center gap-2 px-4 py-2 text-sm font-medium text-mastek-primary bg-mastek-primary/10 rounded-lg hover:bg-mastek-primary/20"
             >
-              <Plus className="w-4 h-4" /> New Validation Configuration 
+              <Plus className="w-4 h-4" /> New Test Layer Configuration
             </button>
           )}
 
@@ -522,7 +522,7 @@ export default function MappingsPage() {
               <input
                 value={name}
                 onChange={(e) => setName(e.target.value)}
-                placeholder="Validation name"
+                placeholder="Test layer name"
                 className="w-full mb-4 px-2.5 py-1.5 text-sm border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-mastek-accent"
               />
 
@@ -570,7 +570,7 @@ export default function MappingsPage() {
 
               {(source.tables.length > 0 || destination.tables.length > 0) && (
                 <div className="mt-4 p-3 rounded-lg bg-slate-50 border border-slate-200 text-xs space-y-2">
-                  <span className="text-slate-400 block font-semibold">Active Validation Rule:</span>
+                  <span className="text-slate-400 block font-semibold">Active Test Layer Rule:</span>
                   <div className="font-mono text-slate-600 bg-white p-2 rounded border border-slate-200 space-y-1">
                     <p className="text-mastek-highlight truncate">
                       {source.tables.length > 0 ? source.tables.join(', ') : '...'}
@@ -595,7 +595,7 @@ export default function MappingsPage() {
                 className="w-full mt-4 flex items-center justify-center gap-2 px-4 py-2 text-sm font-medium text-white bg-mastek-primary rounded-lg hover:brightness-110 disabled:opacity-50 disabled:cursor-not-allowed"
               >
                 {isSaving ? <Loader2 className="w-4 h-4 animate-spin" /> : <Plus className="w-4 h-4" />}
-                Create Validation
+                Create Test Layer
               </button>
             </>
           )}
