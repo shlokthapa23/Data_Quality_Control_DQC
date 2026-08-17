@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { Plug, DownloadCloud, LayoutGrid, Waypoints, GitCompareArrows, ListChecks, CalendarClock, History, Workflow } from 'lucide-react';
+import { Plug, DownloadCloud, LayoutGrid, Waypoints, GitCompareArrows, ListChecks, CalendarClock, History, Workflow, BarChart3 } from 'lucide-react';
 import ConnectPage from './pages/ConnectPage';
 import PipelinesPage from './pages/PipelinesPage';
 import HarvestWizard from './pages/HarvestWizard';
@@ -10,6 +10,7 @@ import TestSuitesPage from './pages/TestSuitesPage';
 import SchedulesDashboard from './pages/SchedulesDashboard';
 import AnalyticsPage from './pages/AnalyticsPage';
 import HistoryPage from './pages/HistoryPage';
+import DashboardPage from './pages/DashboardPage';
 import mastekLogo from './images/logo.png'
 const NAV_PAGES = [
   { id: 'connect', label: 'Connect', icon: Plug },
@@ -24,6 +25,7 @@ const NAV_PAGES = [
   { id: 'suites', label: 'Test Suite Execution', icon: ListChecks },
   { id: 'schedules', label: 'Test Suite & Harvest Schedule', icon: CalendarClock },
   { id: 'history', label: 'Test Run History', icon: History },
+  { id: 'dashboard', label: 'Data Quality Dashboard', icon: BarChart3 },
 ];
 
 function App() {
@@ -104,6 +106,8 @@ function App() {
     );
   } else if (activePage === 'schedules') {
     content = <SchedulesDashboard />;
+  } else if (activePage === 'dashboard') {
+    content = <DashboardPage />;
   } else {
     content = (
       <S2DPage

@@ -1567,6 +1567,161 @@ def run_s2d_pipeline(mapping_id):
     return jsonify({"run_id": run_id})
 
 
+NULL_CHECK_TYPE = "Null Value Constraint"
+
+
+def _row_quality(results):
+    """
+    Row-level data quality: clean rows / rows examined.
+
+    Two rules matter more than the arithmetic:
+
+    * A result with no total_rows is EXCLUDED, not counted as zero. Roughly a
+      third of checks (dual-script comparisons, freshness, categorical) report
+      no row counts at all; treating them as zero-row would drag the score
+      toward a number that means nothing. The count of exclusions is returned
+      so the figure is never quoted without saying what it covers.
+    * violations are CLAMPED to total_rows. A cross-table check can legitimately
+      report more violations than the table has rows (a referential check here
+      reports 82,660 against 41,330), and an unclamped ratio would produce a
+      negative percentage - a number that would quietly destroy trust in the
+      whole dashboard.
+    """
+    examined = clean = violations = 0
+    excluded = 0
+    for r in results:
+        total = r.get("total_rows")
+        if not total or total <= 0:
+            excluded += 1
+            continue
+        bad = min(max(r.get("violations") or 0, 0), total)
+        examined += total
+        violations += bad
+        clean += total - bad
+    return {
+        "examined": examined,
+        "clean": clean,
+        "violations": violations,
+        "quality_pct": round(clean / examined * 100, 2) if examined else None,
+        "excluded_results": excluded,
+    }
+
+
+@app.route('/api/s2d/analytics', methods=['GET'])
+def s2d_analytics():
+    """
+    Aggregated data-quality analytics.
+
+    ?mapping_ids=a,b  - restrict to those test layers; omitted means all of them
+    ?basis=latest|all - latest run per layer (default) or the full history
+
+    Aggregation lives here rather than in SQL because the two rules that make
+    the numbers honest - clamping violations and excluding results with no row
+    counts - need to be readable, and they'd be buried in a CASE expression.
+    """
+    raw_ids = (request.args.get("mapping_ids") or "").strip()
+    mapping_ids = [i for i in raw_ids.split(",") if i] or None
+    basis = request.args.get("basis") or "latest"
+    if basis not in ("latest", "all"):
+        return jsonify({"error": "basis must be 'latest' or 'all'"}), 400
+
+    # With no layer filter the question is "everything that has ever run", so
+    # runs whose layer was later deleted belong in the answer - most of this
+    # workspace's history is those. Once a layer IS named, they can't be part
+    # of it, and including them would make the totals irreconcilable.
+    include_orphans = mapping_ids is None
+    results = s2d_db.analytics_results(
+        mapping_ids=mapping_ids, basis=basis, include_orphans=include_orphans)
+    runs = s2d_db.analytics_runs(mapping_ids=mapping_ids, include_orphans=include_orphans)
+
+    counts = {"pass": 0, "fail": 0, "error": 0}
+    for r in results:
+        key = {"PASS": "pass", "FAIL": "fail", "ERROR": "error"}.get(r["status"])
+        if key:
+            counts[key] += 1
+
+    by_type = {}
+    for r in results:
+        entry = by_type.setdefault(r["validation_type"], {
+            "type": r["validation_type"], "pass": 0, "fail": 0, "error": 0,
+            "violations": 0, "rows": 0,
+        })
+        entry[{"PASS": "pass", "FAIL": "fail", "ERROR": "error"}.get(r["status"], "pass")] += 1
+        total = r.get("total_rows") or 0
+        entry["violations"] += min(max(r.get("violations") or 0, 0), total) if total else 0
+        entry["rows"] += total
+    for entry in by_type.values():
+        # Normalised, so one huge check can't flatten every other bar.
+        entry["violation_pct"] = (round(entry["violations"] / entry["rows"] * 100, 2)
+                                  if entry["rows"] else None)
+
+    DELETED = "(deleted test layer)"
+    by_layer = {}
+    for r in results:
+        # Deleted layers collapse into ONE bucket. Keyed by mapping_id they'd
+        # produce a dozen separate bars all labelled "(deleted test layer)",
+        # which is unreadable and implies distinctions the reader can't act on.
+        key = DELETED if r["mapping_name"] == DELETED else r["mapping_id"]
+        entry = by_layer.setdefault(key, {
+            "mapping_id": None if key == DELETED else r["mapping_id"], "name": r["mapping_name"],
+            "pass": 0, "fail": 0, "error": 0, "results": [], "last_run_at": None,
+        })
+        entry[{"PASS": "pass", "FAIL": "fail", "ERROR": "error"}.get(r["status"], "pass")] += 1
+        entry["results"].append(r)
+        if not entry["last_run_at"] or r["run_started_at"] > entry["last_run_at"]:
+            entry["last_run_at"] = r["run_started_at"]
+    for entry in by_layer.values():
+        entry["quality_pct"] = _row_quality(entry.pop("results"))["quality_pct"]
+
+    nulls = [r for r in results if r["validation_type"] == NULL_CHECK_TYPE]
+    null_quality = _row_quality(nulls)
+
+    # Worst offenders: most violations first, and only checks that actually
+    # found something - a passing check with 0 violations isn't an offender.
+    offenders = sorted(
+        (r for r in results if (r.get("violations") or 0) > 0),
+        key=lambda r: r["violations"], reverse=True,
+    )[:10]
+
+    trend = [{
+        "run_id": r["id"], "mapping_id": r["mapping_id"], "mapping_name": r["mapping_name"],
+        "started_at": r["started_at"], "status": r["status"],
+        "pass_count": r["pass_count"], "fail_count": r["fail_count"],
+        "total_checkpoints": r["total_checkpoints"],
+        "pass_pct": (round(r["pass_count"] / r["total_checkpoints"] * 100, 2)
+                     if r["total_checkpoints"] else None),
+    } for r in runs]
+
+    return jsonify({
+        "basis": basis,
+        "summary": {
+            "checks": {**counts, "total": sum(counts.values())},
+            "rows": _row_quality(results),
+            "nulls": {
+                "violations": null_quality["violations"],
+                "rows": null_quality["examined"],
+                "checks": len(nulls),
+            },
+            "layers_covered": len(by_layer),
+            "runs_covered": len({r["run_id"] for r in results}),
+            "last_run_at": max((r["run_started_at"] for r in results), default=None),
+            # Shown so the reader knows whether history from deleted layers is
+            # part of what they're looking at, rather than guessing.
+            "orphaned_runs": s2d_db.analytics_orphaned_run_count(),
+            "orphaned_runs_included": include_orphans,
+        },
+        "by_validation_type": sorted(by_type.values(), key=lambda e: -(e["pass"] + e["fail"] + e["error"])),
+        "by_layer": sorted(by_layer.values(), key=lambda e: e["name"] or ""),
+        "worst_offenders": [{
+            "test_name": r["test_name"], "rule_target": r["rule_target"],
+            "validation_type": r["validation_type"], "status": r["status"],
+            "violations": r["violations"], "total_rows": r["total_rows"],
+            "mapping_name": r["mapping_name"], "run_id": r["run_id"],
+        } for r in offenders],
+        "trend": trend,
+    })
+
+
 @app.route('/api/s2d/runs', methods=['GET'])
 def list_s2d_runs():
     mapping_id = request.args.get('mapping_id')

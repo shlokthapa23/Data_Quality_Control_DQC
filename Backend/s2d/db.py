@@ -719,6 +719,82 @@ def get_run(run_id):
         return run
 
 
+def analytics_results(mapping_ids=None, basis="latest", include_orphans=False):
+    """
+    The result rows a dashboard should aggregate, with their run and test layer
+    attached.
+
+    basis='latest' takes only each layer's most recent run, so the numbers
+    describe the data as it is NOW - re-running a layer after a fix moves them.
+    basis='all' pools every run for those layers, which is what you want when a
+    layer has only been run once or twice and the latest run alone says little.
+
+    include_orphans covers runs whose test layer has since been deleted. They
+    are excluded whenever a layer filter is applied - they cannot belong to a
+    layer that was named, and counting them would make the totals impossible to
+    reconcile with the filter. They ARE included in the unfiltered view, because
+    "every test case that has been run" is exactly what that view answers, and
+    this workspace's history is overwhelmingly made of them. They appear under
+    "(deleted test layer)" rather than being folded into a surviving one.
+    """
+    where, params = [], []
+    if mapping_ids:
+        where.append(f"r.mapping_id IN ({','.join('?' * len(mapping_ids))})")
+        params.extend(mapping_ids)
+    if basis == "latest":
+        # One run per layer: the most recent by started_at.
+        where.append("""r.started_at = (
+            SELECT MAX(r2.started_at) FROM s2d_test_runs r2 WHERE r2.mapping_id = r.mapping_id
+        )""")
+    clause = f"WHERE {' AND '.join(where)}" if where else ""
+    join = "LEFT JOIN" if include_orphans else "JOIN"
+
+    with get_conn() as conn:
+        rows = conn.execute(f"""
+            SELECT tr.*, r.mapping_id, r.started_at AS run_started_at, r.id AS run_id,
+                   COALESCE(m.name, '(deleted test layer)') AS mapping_name
+            FROM s2d_test_results tr
+            JOIN s2d_test_runs r ON r.id = tr.run_id
+            {join} s2d_mappings m ON m.id = r.mapping_id
+            {clause}
+            ORDER BY r.started_at ASC
+        """, params).fetchall()
+        return [dict(r) for r in rows]
+
+
+def analytics_runs(mapping_ids=None, include_orphans=False):
+    """
+    Run-level history for the trend line. Always the full history for the layers
+    in scope, whatever the basis - a trend across a single run isn't a trend.
+    """
+    where, params = [], []
+    if mapping_ids:
+        where.append(f"r.mapping_id IN ({','.join('?' * len(mapping_ids))})")
+        params.extend(mapping_ids)
+    clause = f"WHERE {' AND '.join(where)}" if where else ""
+    join = "LEFT JOIN" if include_orphans else "JOIN"
+    with get_conn() as conn:
+        rows = conn.execute(f"""
+            SELECT r.id, r.mapping_id, r.started_at, r.status, r.pass_count, r.fail_count,
+                   r.total_checkpoints, COALESCE(m.name, '(deleted test layer)') AS mapping_name
+            FROM s2d_test_runs r
+            {join} s2d_mappings m ON m.id = r.mapping_id
+            {clause}
+            ORDER BY r.started_at ASC
+        """, params).fetchall()
+        return [dict(r) for r in rows]
+
+
+def analytics_orphaned_run_count():
+    """Runs whose test layer has been deleted - excluded everywhere above."""
+    with get_conn() as conn:
+        return conn.execute("""
+            SELECT COUNT(*) FROM s2d_test_runs r
+            LEFT JOIN s2d_mappings m ON m.id = r.mapping_id
+            WHERE m.id IS NULL
+        """).fetchone()[0]
+
+
 def list_runs(mapping_id=None):
     """
     Powers the History tab - joins in the mapping name and suite name so the

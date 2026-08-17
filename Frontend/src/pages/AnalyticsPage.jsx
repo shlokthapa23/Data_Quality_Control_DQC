@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import {
   ArrowLeft, CheckCircle2, XCircle, AlertTriangle, Loader2, Search,
-  ListChecks, LineChart, Gauge, History as HistoryIcon,
+  ListChecks, Gauge, History as HistoryIcon,
 } from 'lucide-react';
 import { fetchS2DRun } from '../api';
 
@@ -89,20 +89,6 @@ export default function AnalyticsPage({ runId, onBackToS2D, onGoToHistory }) {
           </button>
           <button className="px-4 py-1.5 rounded-md flex items-center gap-1.5 bg-mastek-primary text-white shadow">
             <Gauge className="w-3.5 h-3.5" /> Results
-          </button>
-          <button
-            disabled
-            title="Coming soon: needs a historical time-series data model that doesn't exist yet"
-            className="px-4 py-1.5 rounded-md flex items-center gap-1.5 text-slate-300 cursor-not-allowed"
-          >
-            <LineChart className="w-3.5 h-3.5" /> Trends
-          </button>
-          <button
-            disabled
-            title="Coming soon: needs an aggregate scoring model that doesn't exist yet"
-            className="px-4 py-1.5 rounded-md flex items-center gap-1.5 text-slate-300 cursor-not-allowed"
-          >
-            <Gauge className="w-3.5 h-3.5" /> Scorecard
           </button>
           <button
             onClick={onGoToHistory}

@@ -228,6 +228,14 @@ export function validateS2DSql(mappingId, { target, sql }) {
   });
 }
 
+// Dashboard aggregates. mappingIds empty = every layer, including runs whose
+// layer was later deleted; basis 'latest' = each layer's most recent run only.
+export function fetchS2DAnalytics({ mappingIds = [], basis = 'latest' } = {}) {
+  const params = new URLSearchParams({ basis });
+  if (mappingIds.length) params.set('mapping_ids', mappingIds.join(','));
+  return request(`/api/s2d/analytics?${params}`);
+}
+
 export function fetchS2DTestCases(mappingId) {
   return request(`/api/s2d/mappings/${mappingId}/test-cases`);
 }
