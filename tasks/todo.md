@@ -48,6 +48,40 @@ Everything from **"Custom SQL now shows the numbers your query computed"** downw
 
 ## Feature changelog (newest first)
 
+### Data Quality Dashboard — 2026-08-17
+
+New **Data Quality Dashboard** tab (`4df22dc`). Pick one or more test layers from a checkbox
+dropdown, or none for everything rolled up; a **Latest run / All runs** toggle switches between
+current state and full history. `GET /api/s2d/analytics?mapping_ids=&basis=` does the aggregation.
+
+**Two headline numbers, kept apart**: checks passed (are my rules holding) and row-level quality
+(how much data is clean). Merging them hides one behind the other.
+
+> ### Three data realities that shaped it — measure before defining a metric
+> 1. **Violations can exceed rows** (82,660 against 41,330 on a referential check, which counts
+>    violating *pairs*). Unclamped that renders as **-100% good**. Clamped per result.
+> 2. **A third of checks report no row counts** — excluded from row-level quality and the count
+>    of exclusions stated, never zeroed.
+> 3. **133 of 151 runs belong to deleted layers.** Excluding them left 28 checks instead of 338,
+>    so the unfiltered view includes them as "(deleted test layer)", collapsed into one bucket.
+>    A layer filter drops them.
+
+**Charts** (Recharts 3.10.1, the one new dependency): donut of outcomes, stacked bar by quality
+dimension, normalised violation-rate bars, pass-rate trend, layer comparison, and a worst-offenders
+table. Palettes were **validated with the dataviz skill's script, not by eye** — the brand's green
+and amber separate by only dE 5.9 under protanopia, and amber-700 vs red-600 fails normal vision at
+dE 9.9. Two caps are stated in the UI rather than applied silently: the trend pools past 6 layers,
+the comparison shows the 8 busiest.
+
+Retired the disabled **Trends** and **Scorecard** tabs on Analytics, now that both are real.
+
+**Verified**: every aggregate recomputed with independent SQL and matched exactly; the clamp keeps
+all dimensions inside 0–100%; filtering preserves totals; picker, multi-select and basis toggle each
+move the numbers; no page overflow at 768px after adding `min-w-0` to the chart cards (a chart
+measured at desktop width had been sitting 927px wide in a 513px column). Lint at the 9-problem
+baseline; production build succeeds.
+
+
 ### Renames, layout, any-file-type SQL, and source-only validations — 2026-08-16
 
 Four commits: `55c817f` (renames + layout), `a3fd086` (file formats), `6517ef4` (source-only),
