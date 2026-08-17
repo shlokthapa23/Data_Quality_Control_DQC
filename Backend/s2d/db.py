@@ -487,6 +487,31 @@ def rename_mapping(mapping_id, name):
         conn.execute("UPDATE s2d_mappings SET name = ? WHERE id = ?", (name, mapping_id))
 
 
+def update_mapping_tables(mapping_id, source_tables=None, destination_tables=None):
+    """
+    Change which tables a test layer covers, without touching its connectors or
+    containers - adding a newly-uploaded file to an existing layer, or dropping
+    one that's no longer relevant.
+
+    Each side is optional and updated independently, so passing only
+    source_tables leaves the destination exactly as it was. Callers pass the
+    full list for a side, not a delta: the picker always knows the whole
+    selection, and a full replace can't drift out of step with it.
+    """
+    sets, params = [], []
+    if source_tables is not None:
+        sets.append("source_tables = ?")
+        params.append(json.dumps(source_tables))
+    if destination_tables is not None:
+        sets.append("destination_tables = ?")
+        params.append(json.dumps(destination_tables))
+    if not sets:
+        return
+    params.append(mapping_id)
+    with get_conn() as conn:
+        conn.execute(f"UPDATE s2d_mappings SET {', '.join(sets)} WHERE id = ?", params)
+
+
 def set_column_map(mapping_id, column_map):
     """
     Full replace - the editor always submits the whole map, same as suite

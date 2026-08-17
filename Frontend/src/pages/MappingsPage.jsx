@@ -5,8 +5,8 @@ import {
 } from 'lucide-react';
 import {
   fetchConnectors, fetchConnectorContainers, fetchContainerTables,
-  fetchS2DMappings, createS2DMapping, renameS2DMapping, deleteS2DMapping,
-  fetchTestSuitesForMapping, createTestSuite, deleteTestSuite,
+  fetchS2DMappings, createS2DMapping, updateS2DMapping, deleteS2DMapping,
+  fetchTestSuitesForMapping, createTestSuite, deleteTestSuite, fetchS2DTestCases,
 } from '../api';
 import ColumnMapModal from '../components/s2d/ColumnMapModal';
 import { formatRowCount, rowCountStyle, rowCountTitle } from '../rowCount';
@@ -146,6 +146,91 @@ function EndpointPicker({ label, connectors, endpoint, onChange }) {
 }
 
 const EMPTY_ENDPOINT = { connectorId: '', connectorName: '', containerId: '', containerName: '', tables: [] };
+
+/**
+ * Tick/untick which tables a side of an existing test layer covers.
+ *
+ * Purely presentational - the options are fetched by whoever opens the editor,
+ * so this adds no effect of its own. Tables already used by a test case are
+ * marked, because unticking one silently breaks that check the next time it
+ * runs; that's a decision the tester should make knowingly, not discover later.
+ */
+function EditableTableList({ label, options, selected, usage, onToggle }) {
+  const removedInUse = options.filter((t) => !selected.has(t.name) && usage[t.name]);
+
+  return (
+    <div>
+      <div className="flex items-center gap-2 mb-1">
+        <p className="text-[11px] font-bold text-slate-400 uppercase tracking-wider">{label}</p>
+        <span className="text-[11px] text-slate-400">{selected.size} selected</span>
+        {options.length > 1 && (
+          <label className="ml-auto flex items-center gap-1.5 text-[11px] text-slate-500 cursor-pointer">
+            <input
+              type="checkbox"
+              checked={options.every((t) => selected.has(t.name))}
+              ref={(el) => {
+                if (el) {
+                  el.indeterminate = options.some((t) => selected.has(t.name))
+                    && !options.every((t) => selected.has(t.name));
+                }
+              }}
+              onChange={() => onToggle(
+                options.every((t) => selected.has(t.name)) ? [] : options.map((t) => t.name),
+              )}
+              className="rounded border-slate-300 text-mastek-primary focus:ring-mastek-accent"
+            />
+            Select all
+          </label>
+        )}
+      </div>
+
+      <div className="border border-slate-200 rounded-lg max-h-44 overflow-y-auto bg-white">
+        {options.length === 0 && (
+          <p className="text-xs text-slate-400 italic px-3 py-2">No tables found.</p>
+        )}
+        {options.map((t) => (
+          <label
+            key={t.name}
+            className="flex items-center gap-2 px-3 py-1.5 text-xs font-mono hover:bg-slate-50 cursor-pointer border-b border-slate-100 last:border-b-0"
+          >
+            <input
+              type="checkbox"
+              checked={selected.has(t.name)}
+              onChange={() => onToggle(null, t.name)}
+              className="rounded border-slate-300 text-mastek-primary focus:ring-mastek-accent shrink-0"
+            />
+            <span className="truncate">{t.name}</span>
+            {usage[t.name] > 0 && (
+              <span
+                className="shrink-0 text-[10px] px-1.5 py-0.5 rounded bg-mastek-primary/10 text-mastek-primary"
+                title={`${usage[t.name]} test case${usage[t.name] === 1 ? '' : 's'} reference this table`}
+              >
+                {usage[t.name]} in use
+              </span>
+            )}
+            {t.row_count !== undefined && (
+              <span
+                className={`shrink-0 ml-auto text-[10px] px-1.5 py-0.5 rounded ${rowCountStyle(t.row_count)}`}
+                title={rowCountTitle(t.row_count)}
+              >
+                {formatRowCount(t.row_count)}
+              </span>
+            )}
+          </label>
+        ))}
+      </div>
+
+      {removedInUse.length > 0 && (
+        <p className="mt-1 flex items-start gap-1.5 text-[11px] text-amber-700">
+          <AlertCircle className="w-3 h-3 shrink-0 mt-0.5" />
+          Removing {removedInUse.map((t) => t.name).join(', ')} will leave{' '}
+          {removedInUse.reduce((n, t) => n + usage[t.name], 0)} test case(s) pointing at a table
+          this layer no longer covers.
+        </p>
+      )}
+    </div>
+  );
+}
 
 function TestSuitesForMapping({ mapping }) {
   const [suites, setSuites] = useState([]);
@@ -305,9 +390,9 @@ export default function MappingsPage() {
   const [error, setError] = useState(null);
   const [showForm, setShowForm] = useState(false);
   const [showMappings, setShowMappings] = useState(true);
-  const [renamingId, setRenamingId] = useState(null);
-  const [renameValue, setRenameValue] = useState('');
-  const [isRenaming, setIsRenaming] = useState(false);
+  // The layer currently open for editing: its name, which tables each side
+  // covers, and how many test cases already reference each table.
+  const [editing, setEditing] = useState(null);
   const [columnMapMappingId, setColumnMapMappingId] = useState(null);
 
   const loadMappings = () => {
@@ -365,28 +450,101 @@ export default function MappingsPage() {
     loadMappings();
   };
 
-  const startRename = (m) => {
-    setRenamingId(m.id);
-    setRenameValue(m.name);
+  /** Every table name a test case points at, however it records them. */
+  const tableUsage = (testCases) => {
+    const usage = {};
+    testCases.forEach((tc) => {
+      const named = [
+        ...(tc.target_tables || []), ...(tc.source_tables || []), ...(tc.destination_tables || []),
+        tc.target_table, tc.source_table, tc.destination_table,
+      ].filter(Boolean);
+      new Set(named).forEach((name) => { usage[name] = (usage[name] || 0) + 1; });
+    });
+    return usage;
   };
 
-  const cancelRename = () => {
-    setRenamingId(null);
-    setRenameValue('');
+  // Loading happens here, in the click handler, rather than in an effect
+  // watching an "editing" id - this page already carries one setState-in-effect
+  // violation and shouldn't gain another.
+  const startEdit = async (m) => {
+    setError(null);
+    setEditing({
+      mapping: m,
+      name: m.name,
+      sourceTables: new Set(m.source_tables),
+      destinationTables: new Set(m.destination_tables),
+      sourceOptions: [],
+      destinationOptions: [],
+      usage: {},
+      isLoading: true,
+      isSaving: false,
+    });
+
+    const sourceOnly = m.validation_kind === 'source_only';
+    const [source, destination, testCases] = await Promise.all([
+      fetchContainerTables(m.source_connector_id, m.source_container_id, { includeRowCounts: true })
+        .catch(() => ({ tables: [] })),
+      sourceOnly
+        ? Promise.resolve({ tables: [] })
+        : fetchContainerTables(m.destination_connector_id, m.destination_container_id, { includeRowCounts: true })
+          .catch(() => ({ tables: [] })),
+      fetchS2DTestCases(m.id).catch(() => []),
+    ]);
+
+    // Drop the result if the tester has already moved on to another layer.
+    setEditing((prev) => (prev && prev.mapping.id === m.id ? {
+      ...prev,
+      sourceOptions: source.tables || [],
+      destinationOptions: destination.tables || [],
+      usage: tableUsage(testCases || []),
+      isLoading: false,
+    } : prev));
   };
 
-  const saveRename = async (id) => {
-    const trimmed = renameValue.trim();
+  const cancelEdit = () => setEditing(null);
+
+  // side: 'sourceTables' | 'destinationTables'. Pass `all` to replace the whole
+  // selection (select-all / clear), or `one` to flip a single table.
+  const toggleEditTable = (side, all, one) => {
+    setEditing((prev) => {
+      if (!prev) return prev;
+      if (all) return { ...prev, [side]: new Set(all) };
+      if (all !== null && all !== undefined) return { ...prev, [side]: new Set() };
+      const next = new Set(prev[side]);
+      next.has(one) ? next.delete(one) : next.add(one);
+      return { ...prev, [side]: next };
+    });
+  };
+
+  const saveEdit = async () => {
+    if (!editing) return;
+    const { mapping: m } = editing;
+    const trimmed = editing.name.trim();
     if (!trimmed) return;
-    setIsRenaming(true);
+
+    const patch = {};
+    if (trimmed !== m.name) patch.name = trimmed;
+
+    const nextSource = [...editing.sourceTables];
+    if (nextSource.join(' ') !== [...m.source_tables].join(' ')) {
+      patch.source_tables = nextSource;
+    }
+    if (m.validation_kind !== 'source_only') {
+      const nextDestination = [...editing.destinationTables];
+      if (nextDestination.join(' ') !== [...m.destination_tables].join(' ')) {
+        patch.destination_tables = nextDestination;
+      }
+    }
+    if (Object.keys(patch).length === 0) { cancelEdit(); return; }
+
+    setEditing((prev) => (prev ? { ...prev, isSaving: true } : prev));
     try {
-      await renameS2DMapping(id, trimmed);
-      cancelRename();
+      await updateS2DMapping(m.id, patch);
+      cancelEdit();
       loadMappings();
     } catch (err) {
       setError(err.message);
-    } finally {
-      setIsRenaming(false);
+      setEditing((prev) => (prev ? { ...prev, isSaving: false } : prev));
     }
   };
 
@@ -410,43 +568,75 @@ export default function MappingsPage() {
                 {mappings.map((m) => (
                   <div
                     key={m.id}
-                    onClick={() => renamingId !== m.id && setSelectedMappingId(m.id)}
-                    className={`group p-2 rounded-lg border flex items-center justify-between cursor-pointer text-sm transition-colors ${
+                    onClick={() => editing?.mapping.id !== m.id && setSelectedMappingId(m.id)}
+                    className={`group p-2 rounded-lg border text-sm transition-colors ${
+                      editing?.mapping.id === m.id ? 'block' : 'flex items-center justify-between cursor-pointer'
+                    } ${
                       selectedMappingId === m.id
                         ? 'bg-mastek-primary/5 border-mastek-primary/40'
                         : 'border-slate-200 hover:border-slate-300'
                     }`}
                   >
-                    {renamingId === m.id ? (
-                      <div
-                        className="flex items-center gap-1.5 flex-1 min-w-0"
-                        onClick={(e) => e.stopPropagation()}
-                      >
-                        <input
-                          autoFocus
-                          value={renameValue}
-                          onChange={(e) => setRenameValue(e.target.value)}
-                          onKeyDown={(e) => {
-                            if (e.key === 'Enter') saveRename(m.id);
-                            if (e.key === 'Escape') cancelRename();
-                          }}
-                          className="flex-1 min-w-0 px-2 py-1 text-sm border border-mastek-primary/40 rounded focus:outline-none focus:ring-2 focus:ring-mastek-accent"
-                        />
-                        <button
-                          onClick={() => saveRename(m.id)}
-                          disabled={isRenaming || !renameValue.trim()}
-                          className="p-1 text-mastek-success hover:bg-mastek-success/10 rounded shrink-0 disabled:opacity-50"
-                          title="Save"
-                        >
-                          {isRenaming ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Check className="w-3.5 h-3.5" />}
-                        </button>
-                        <button
-                          onClick={cancelRename}
-                          className="p-1 text-slate-400 hover:text-red-600 rounded shrink-0"
-                          title="Cancel"
-                        >
-                          <X className="w-3.5 h-3.5" />
-                        </button>
+                    {editing?.mapping.id === m.id ? (
+                      <div className="space-y-3" onClick={(e) => e.stopPropagation()}>
+                        <div className="flex items-center gap-1.5">
+                          <input
+                            autoFocus
+                            value={editing.name}
+                            onChange={(e) => setEditing((prev) => (prev ? { ...prev, name: e.target.value } : prev))}
+                            onKeyDown={(e) => {
+                              if (e.key === 'Enter') saveEdit();
+                              if (e.key === 'Escape') cancelEdit();
+                            }}
+                            className="flex-1 min-w-0 px-2 py-1 text-sm border border-mastek-primary/40 rounded focus:outline-none focus:ring-2 focus:ring-mastek-accent"
+                          />
+                          <button
+                            onClick={saveEdit}
+                            disabled={editing.isSaving || editing.isLoading || !editing.name.trim()
+                              || editing.sourceTables.size === 0}
+                            className="p-1 text-mastek-success hover:bg-mastek-success/10 rounded shrink-0 disabled:opacity-50"
+                            title="Save changes"
+                          >
+                            {editing.isSaving ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Check className="w-3.5 h-3.5" />}
+                          </button>
+                          <button
+                            onClick={cancelEdit}
+                            className="p-1 text-slate-400 hover:text-red-600 rounded shrink-0"
+                            title="Cancel"
+                          >
+                            <X className="w-3.5 h-3.5" />
+                          </button>
+                        </div>
+
+                        {editing.isLoading ? (
+                          <p className="flex items-center gap-2 text-xs text-slate-500">
+                            <Loader2 className="w-3.5 h-3.5 animate-spin" /> Reading the available tables...
+                          </p>
+                        ) : (
+                          <>
+                            <EditableTableList
+                              label={`Source · ${m.source_container_name}`}
+                              options={editing.sourceOptions}
+                              selected={editing.sourceTables}
+                              usage={editing.usage}
+                              onToggle={(all, one) => toggleEditTable('sourceTables', all, one)}
+                            />
+                            {m.validation_kind !== 'source_only' && (
+                              <EditableTableList
+                                label={`Destination · ${m.destination_container_name}`}
+                                options={editing.destinationOptions}
+                                selected={editing.destinationTables}
+                                usage={editing.usage}
+                                onToggle={(all, one) => toggleEditTable('destinationTables', all, one)}
+                              />
+                            )}
+                            <p className="text-[11px] text-slate-400">
+                              Newly uploaded files show up here automatically. The connector and
+                              container stay fixed &mdash; changing those would make it a different
+                              layer and leave every test case pointing at the wrong system.
+                            </p>
+                          </>
+                        )}
                       </div>
                     ) : (
                       <>
@@ -476,9 +666,9 @@ export default function MappingsPage() {
                         </button>
                         <div className="flex items-center opacity-0 group-hover:opacity-100 shrink-0">
                           <button
-                            onClick={(e) => { e.stopPropagation(); startRename(m); }}
+                            onClick={(e) => { e.stopPropagation(); startEdit(m); }}
                             className="p-1 text-slate-400 hover:text-mastek-primary"
-                            title="Rename"
+                            title="Edit - rename, and add or remove the tables this layer covers"
                           >
                             <Pencil className="w-3.5 h-3.5" />
                           </button>

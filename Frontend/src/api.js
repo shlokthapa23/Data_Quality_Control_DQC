@@ -194,6 +194,15 @@ export function renameS2DMapping(id, name) {
   });
 }
 
+// Name and/or the tables each side covers. Send only what changed; the tables
+// are a full replace for that side, never a delta.
+export function updateS2DMapping(id, patch) {
+  return request(`/api/s2d/mappings/${id}`, {
+    method: 'PATCH',
+    body: JSON.stringify(patch),
+  });
+}
+
 export function deleteS2DMapping(id) {
   return request(`/api/s2d/mappings/${id}`, { method: 'DELETE' });
 }

@@ -582,13 +582,52 @@ def create_s2d_mapping():
 
 @app.route('/api/s2d/mappings/<mapping_id>', methods=['PATCH'])
 def rename_s2d_mapping(mapping_id):
-    if not s2d_db.get_mapping(mapping_id):
+    """
+    Body: any of { "name", "source_tables", "destination_tables" }.
+
+    Tables are editable so a file uploaded after the layer was built can be
+    added to it, and one that's no longer relevant dropped, without rebuilding
+    the layer and losing its test cases. Connectors and containers are
+    deliberately NOT editable here - changing those makes it a different layer,
+    and every test case's stored SQL would silently be pointing at the wrong
+    system.
+    """
+    mapping = s2d_db.get_mapping(mapping_id)
+    if not mapping:
         return jsonify({"error": "Mapping not found"}), 404
     body = request.get_json(force=True) or {}
-    name = (body.get("name") or "").strip()
-    if not name:
-        return jsonify({"error": "name is required"}), 400
-    s2d_db.rename_mapping(mapping_id, name)
+
+    if "name" in body:
+        name = (body.get("name") or "").strip()
+        if not name:
+            return jsonify({"error": "name is required"}), 400
+        s2d_db.rename_mapping(mapping_id, name)
+
+    source_tables = body.get("source_tables")
+    destination_tables = body.get("destination_tables")
+    if source_tables is not None or destination_tables is not None:
+        for label, value in (("source_tables", source_tables),
+                             ("destination_tables", destination_tables)):
+            if value is not None and not isinstance(value, list):
+                return jsonify({"error": f"{label} must be an array"}), 400
+
+        if source_tables is not None and not source_tables:
+            return jsonify({"error": "Select at least one source table"}), 400
+
+        # A source-only layer has no destination side to populate; every other
+        # kind needs both, or its parity checks have nothing to compare.
+        if mapping.get("validation_kind") != "source_only":
+            resulting_destination = (destination_tables if destination_tables is not None
+                                     else mapping["destination_tables"])
+            if not resulting_destination:
+                return jsonify({"error": "Select at least one destination table"}), 400
+
+        s2d_db.update_mapping_tables(
+            mapping_id,
+            source_tables=source_tables,
+            destination_tables=destination_tables,
+        )
+
     return jsonify(s2d_db.get_mapping(mapping_id))
 
 
