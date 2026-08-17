@@ -1,0 +1,6 @@
+<people>
+  <person><id>1</id><name>alice</name><dept>eng</dept><salary>100</salary></person>
+  <person><id>2</id><name>bob</name><dept>eng</dept><salary>200</salary></person>
+  <person><id>3</id><name>carol</name><dept>ops</dept><salary>300</salary></person>
+  <person><id>4</id><name>dave</name><dept>ops</dept><salary>400</salary></person>
+</people>

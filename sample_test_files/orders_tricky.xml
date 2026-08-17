@@ -1,0 +1,7 @@
+<root>
+  <note>ignore me</note>
+  <note>ignore me too</note>
+  <note>and me</note>
+  <order><ref>A1</ref><qty>5</qty></order>
+  <order><ref>B2</ref><qty>7</qty></order>
+</root>

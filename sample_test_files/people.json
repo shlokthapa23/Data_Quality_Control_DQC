@@ -1,0 +1,4 @@
+[{"id":1,"name":"alice","dept":"eng","salary":100},
+ {"id":2,"name":"bob","dept":"eng","salary":200},
+ {"id":3,"name":"carol","dept":"ops","salary":300},
+ {"id":4,"name":"dave","dept":"ops","salary":400}]

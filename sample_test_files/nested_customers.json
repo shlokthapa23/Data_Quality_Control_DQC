@@ -1,0 +1,2 @@
+[{"id":1,"customer":{"name":"acme","address":{"city":"Leeds","geo":{"lat":53.8}}},"tags":["a","b"]},
+ {"id":2,"customer":{"name":"globex","address":{"city":"Hull","geo":{"lat":53.7}}},"tags":["c"]}]
