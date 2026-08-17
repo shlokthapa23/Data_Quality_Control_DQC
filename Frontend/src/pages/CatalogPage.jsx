@@ -128,7 +128,6 @@ export default function CatalogPage() {
                 <th className="px-6 py-3 font-medium">Name</th>
                 <th className="px-6 py-3 font-medium">Type</th>
                 <th className="px-6 py-3 font-medium">Owner</th>
-                <th className="px-6 py-3 font-medium">Glossary</th>
                 <th className="px-6 py-3 font-medium">Harvested</th>
               </tr>
             </thead>
@@ -148,11 +147,6 @@ export default function CatalogPage() {
                     </span>
                   </td>
                   <td className="px-6 py-3 text-slate-500">{a.owner || '--'}</td>
-                  <td className="px-6 py-3">
-                    <span className={a.glossary_status === 'Unmapped' ? 'text-slate-400' : 'text-emerald-600'}>
-                      {a.glossary_status}
-                    </span>
-                  </td>
                   <td className="px-6 py-3 text-slate-400">
                     {new Date(a.harvested_at).toLocaleString()}
                   </td>
@@ -160,7 +154,7 @@ export default function CatalogPage() {
               ))}
               {assets.length === 0 && (
                 <tr>
-                  <td colSpan={5} className="px-6 py-8 text-center text-slate-400">
+                  <td colSpan={4} className="px-6 py-8 text-center text-slate-400">
                     Nothing harvested yet - run a harvest job first.
                   </td>
                 </tr>

@@ -103,6 +103,17 @@ export default function HarvestWizard() {
     });
   };
 
+  // Per type rather than one global switch: "harvest every Lakehouse" is the
+  // usual intent, and a single toggle would drag warehouses and pipelines in
+  // with them.
+  const toggleGroup = (groupItems, selectAll) => {
+    setCheckedKeys((prev) => {
+      const next = new Set(prev);
+      groupItems.forEach((i) => (selectAll ? next.add(i.id) : next.delete(i.id)));
+      return next;
+    });
+  };
+
   const handleHarvest = async () => {
     const selectedItems = items.filter((i) => checkedKeys.has(i.id));
     setIsHarvesting(true);
@@ -181,6 +192,22 @@ export default function HarvestWizard() {
                 <div className="flex items-center gap-2 text-xs font-semibold uppercase tracking-wide text-slate-400 mb-2">
                   <CategoryIcon type={type} className="w-3.5 h-3.5" />
                   {type} ({groupItems.length})
+                  {groupItems.length > 1 && (() => {
+                    const all = groupItems.every((i) => checkedKeys.has(i.id));
+                    const some = groupItems.some((i) => checkedKeys.has(i.id));
+                    return (
+                      <label className="ml-auto flex items-center gap-1.5 normal-case tracking-normal font-medium text-slate-500 cursor-pointer">
+                        <input
+                          type="checkbox"
+                          checked={all}
+                          ref={(el) => { if (el) el.indeterminate = some && !all; }}
+                          onChange={() => toggleGroup(groupItems, !all)}
+                          className="rounded border-slate-300 text-blue-600 focus:ring-blue-500"
+                        />
+                        {all ? 'Clear all' : 'Select all'}
+                      </label>
+                    );
+                  })()}
                 </div>
                 <div className="space-y-1">
                   {groupItems.map((item) => (

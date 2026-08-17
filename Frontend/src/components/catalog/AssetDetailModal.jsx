@@ -95,8 +95,6 @@ export default function AssetDetailModal({ assetId, onClose }) {
                   <span className="text-slate-700">{asset.type}</span>
                   <span className="text-slate-400">Owner</span>
                   <span className="text-slate-700">{asset.owner || '--'}</span>
-                  <span className="text-slate-400">Glossary</span>
-                  <span className="text-slate-700">{asset.glossary_status}</span>
                   <span className="text-slate-400">Harvested</span>
                   <span className="text-slate-700">{new Date(asset.harvested_at).toLocaleString()}</span>
                 </div>

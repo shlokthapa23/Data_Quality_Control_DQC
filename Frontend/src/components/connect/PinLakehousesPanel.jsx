@@ -48,6 +48,10 @@ export default function PinLakehousesPanel({ connector, onPinned }) {
   };
 
   const pinnedCount = (connector.allowed_containers || []).length;
+  // Measured against what's actually listed, so a stale pinned id for a
+  // Lakehouse that no longer exists can't make "all" look selected.
+  const allSelected = lakehouses.length > 0 && lakehouses.every((lh) => selected.has(lh.id));
+  const someSelected = lakehouses.some((lh) => selected.has(lh.id));
 
   return (
     <div className="border-t border-slate-100 bg-slate-50 p-4">
@@ -59,6 +63,25 @@ export default function PinLakehousesPanel({ connector, onPinned }) {
           <span className="flex items-center gap-1 text-xs text-mastek-success">
             <CheckCircle2 className="w-3.5 h-3.5" /> {pinnedCount} pinned
           </span>
+        )}
+
+        {/* A workspace can hold plenty of Lakehouses, and ticking them one by
+            one to pin the lot is busywork. Indeterminate when only some are
+            chosen, so the box reflects the real state rather than implying
+            all-or-nothing. */}
+        {lakehouses.length > 1 && (
+          <label className="ml-auto flex items-center gap-1.5 text-xs text-slate-500 cursor-pointer shrink-0">
+            <input
+              type="checkbox"
+              checked={allSelected}
+              ref={(el) => { if (el) el.indeterminate = someSelected && !allSelected; }}
+              onChange={() => setSelected(
+                allSelected ? new Set() : new Set(lakehouses.map((lh) => lh.id)),
+              )}
+              className="rounded border-slate-300 text-mastek-primary focus:ring-mastek-accent"
+            />
+            {allSelected ? 'Clear all' : `Select all (${lakehouses.length})`}
+          </label>
         )}
       </div>
 
