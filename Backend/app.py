@@ -244,8 +244,18 @@ def run_connector_pipeline(connector_id, item_id):
     if error:
         return error
 
+    # The client sends the job type it read off the listing. Validated against
+    # the known set rather than trusted, so a bad value can't reach Fabric as a
+    # malformed jobType - and it defaults to Pipeline, which is what every
+    # caller written before dataflows existed sends.
+    body = request.get_json(silent=True) or {}
+    job_type = body.get("job_type") or "Pipeline"
+    valid = {spec["job_type"] for spec in connector.RUNNABLE_TYPES.values()}
+    if job_type not in valid:
+        return jsonify({"error": f"job_type must be one of {', '.join(sorted(valid))}"}), 400
+
     try:
-        run_id = connector.run_pipeline(item_id)
+        run_id = connector.run_pipeline(item_id, job_type=job_type)
     except Exception as e:
         detail = str(e)
         if "401" in detail or "403" in detail:
@@ -2110,8 +2120,14 @@ def create_pipeline_schedule_route(connector_id):
         return jsonify({"error": err}), 400
     trigger_type, trigger_config, timezone_name = parsed
 
+    job_type = body.get("job_type") or "Pipeline"
+    valid_job_types = {spec["job_type"] for spec in connector.RUNNABLE_TYPES.values()}
+    if job_type not in valid_job_types:
+        return jsonify({"error": f"job_type must be one of {', '.join(sorted(valid_job_types))}"}), 400
+
     schedule_id = s2d_db.create_pipeline_schedule(
-        connector_id, item_id, body.get("pipeline_name"), trigger_type, trigger_config, timezone_name)
+        connector_id, item_id, body.get("pipeline_name"), trigger_type, trigger_config,
+        timezone_name, job_type=job_type)
     row = s2d_db.get_pipeline_schedule(schedule_id)
     try:
         _scheduler.add_pipeline_schedule_job(row)

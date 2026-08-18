@@ -356,20 +356,42 @@ class FabricConnector(BaseConnector):
 
     # --- Data pipelines ---------------------------------------------------
 
+    # What Fabric calls the job when you start one. Determined from the live
+    # API, not documentation: a Dataflow's own run history reports
+    # jobType "Refresh", asking for its Pipeline schedules returns 400
+    # InvalidJobType, and asking for its Refresh schedules returns 200.
+    RUNNABLE_TYPES = {
+        "DataPipeline": {"job_type": "Pipeline", "label": "Pipeline"},
+        "Dataflow": {"job_type": "Refresh", "label": "Dataflow Gen2"},
+    }
+
     def list_pipelines(self):
         """
-        The workspace's Data Pipelines as [{"id", "name"}]. Unaffected by
-        Lakehouse pinning - allowed_containers only ever narrows Lakehouses
-        (see list_items), and a pipeline isn't a container.
-        """
-        return [
-            {"id": item.id, "name": item.name}
-            for item in self.list_items() if item.type == "DataPipeline"
-        ]
+        Everything in the workspace this framework can start on demand:
+        Data Pipelines and Dataflow Gen2, as
+        [{"id", "name", "type", "job_type", "label"}].
 
-    def run_pipeline(self, item_id):
+        Unaffected by Lakehouse pinning - allowed_containers only ever narrows
+        Lakehouses (see list_items), and neither of these is a container.
         """
-        Start a pipeline on demand and return the new job-instance id.
+        runnable = []
+        for item in self.list_items():
+            spec = self.RUNNABLE_TYPES.get(item.type)
+            if spec:
+                runnable.append({
+                    "id": item.id, "name": item.name, "type": item.type,
+                    "job_type": spec["job_type"], "label": spec["label"],
+                })
+        # Pipelines first, then dataflows, each alphabetical - a stable order so
+        # the list doesn't reshuffle between loads.
+        runnable.sort(key=lambda i: (i["type"] != "DataPipeline", (i["name"] or "").lower()))
+        return runnable
+
+    def run_pipeline(self, item_id, job_type="Pipeline"):
+        """
+        Start a pipeline or a Dataflow Gen2 refresh on demand and return the new
+        job-instance id. Everything after the POST - polling, run history - is
+        identical for both, so only the job type varies.
 
         Fabric answers 202 Accepted with an empty body, putting the instance id
         in the Location header. Raises RuntimeError with the upstream status and
@@ -377,7 +399,7 @@ class FabricConnector(BaseConnector):
         tester can act on.
         """
         resp = self._api_post(
-            f"/workspaces/{self.workspace_id}/items/{item_id}/jobs/instances?jobType=Pipeline"
+            f"/workspaces/{self.workspace_id}/items/{item_id}/jobs/instances?jobType={job_type}"
         )
         if resp.status_code not in (200, 202):
             detail = (resp.text or "").strip()

@@ -108,8 +108,13 @@ export function fetchPipelines(connectorId) {
   return request(`/api/connectors/${connectorId}/pipelines`);
 }
 
-export function runPipeline(connectorId, itemId) {
-  return request(`/api/connectors/${connectorId}/pipelines/${itemId}/run`, { method: 'POST' });
+// jobType comes off the listing: 'Pipeline' for a Data Pipeline, 'Refresh'
+// for a Dataflow Gen2. Fabric rejects the wrong one outright.
+export function runPipeline(connectorId, itemId, jobType = 'Pipeline') {
+  return request(`/api/connectors/${connectorId}/pipelines/${itemId}/run`, {
+    method: 'POST',
+    body: JSON.stringify({ job_type: jobType }),
+  });
 }
 
 export function fetchPipelineRuns(connectorId, itemId) {
