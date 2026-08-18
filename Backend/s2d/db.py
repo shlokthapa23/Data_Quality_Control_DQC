@@ -523,6 +523,25 @@ def set_column_map(mapping_id, column_map):
         conn.execute("UPDATE s2d_mappings SET column_map = ? WHERE id = ?", (payload, mapping_id))
 
 
+def mappings_using_connector(connector_id):
+    """
+    Every test layer that reads from or writes to this connector, with how much
+    work is stored against each. Deleting a connector out from under these would
+    leave layers pointing at a system that no longer exists, and their test
+    cases erroring on the next run rather than saying why.
+    """
+    with get_conn() as conn:
+        rows = conn.execute("""
+            SELECT m.id, m.name,
+                   (SELECT COUNT(*) FROM s2d_test_cases tc WHERE tc.mapping_id = m.id) AS test_case_count,
+                   (SELECT COUNT(*) FROM s2d_test_suites s WHERE s.mapping_id = m.id) AS suite_count
+            FROM s2d_mappings m
+            WHERE m.source_connector_id = ? OR m.destination_connector_id = ?
+            ORDER BY m.name
+        """, (connector_id, connector_id)).fetchall()
+        return [dict(r) for r in rows]
+
+
 def delete_mapping(mapping_id):
     """Deletes a mapping and everything that lives inside it - test cases,
     test suites, suite membership, and suite schedules. Run history

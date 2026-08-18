@@ -116,6 +116,28 @@ def test_connector_draft():
 
 @app.route('/api/connectors/<connector_id>', methods=['DELETE'])
 def delete_connector(connector_id):
+    """
+    Refuses by default when test layers depend on this connector, answering 409
+    with what would be lost. ?force=1 goes ahead and takes those layers - and
+    their test cases, suites and schedules - with it.
+
+    Blocking first is the point: deleting a connector silently orphaned every
+    layer built on it, leaving test cases that error on their next run instead
+    of saying why. Refusing outright would be worse though - a tester who has
+    genuinely finished with a source must be able to remove it - so the choice
+    is offered with the cost stated rather than made for them.
+    """
+    force = request.args.get("force") in ("1", "true", "yes")
+    dependents = s2d_db.mappings_using_connector(connector_id)
+
+    if dependents and not force:
+        return jsonify({
+            "error": "This connector is used by test layers",
+            "requires_force": True,
+            "dependents": dependents,
+            "test_case_count": sum(d["test_case_count"] for d in dependents),
+        }), 409
+
     # Deregister and delete this connector's schedules BEFORE dropping it.
     # Previously they were left behind entirely, so a deleted connector kept a
     # live APScheduler job firing forever - erroring on every tick against a
@@ -125,8 +147,21 @@ def delete_connector(connector_id):
         _scheduler.remove_harvest_schedule_job(schedule_id)
     for schedule_id in s2d_db.delete_pipeline_schedules_for_connector(connector_id):
         _scheduler.remove_pipeline_schedule_job(schedule_id)
+
+    # Same order as delete_s2d_mapping: live APScheduler jobs go before the rows
+    # they point at, or they fire forever against a suite that can't be found.
+    for mapping in dependents:
+        for suite in s2d_db.list_suites(mapping_id=mapping["id"]):
+            for schedule in s2d_db.list_suite_schedules(suite_id=suite["id"]):
+                _scheduler.remove_suite_schedule_job(schedule["id"])
+        s2d_db.delete_mapping(mapping["id"])
+
     catalog_db.delete_connector_config(connector_id)
-    return jsonify({"deleted": connector_id})
+    return jsonify({
+        "deleted": connector_id,
+        "deleted_test_layers": [d["name"] for d in dependents],
+        "deleted_test_cases": sum(d["test_case_count"] for d in dependents),
+    })
 
 
 @app.route('/api/connectors/<connector_id>/test', methods=['POST'])

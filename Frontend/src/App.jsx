@@ -30,7 +30,9 @@ const NAV_PAGES = [
 ];
 
 function App() {
-  const [activePage, setActivePage] = useState('harvest');
+  // Opens on the dashboard: it answers "is my data healthy" without the
+  // tester having to pick anything first.
+  const [activePage, setActivePage] = useState('dashboard');
   const [activeRunId, setActiveRunId] = useState(null);
   const [analyticsReturnTo, setAnalyticsReturnTo] = useState('s2d'); // where "back" goes from Analytics
   // Cross-page handoff into Test Cases Validation: { mappingId, suiteId } to open

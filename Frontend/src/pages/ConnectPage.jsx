@@ -26,10 +26,35 @@ export default function ConnectPage() {
   useEffect(load, []);
 
   const handleDelete = async (id) => {
-    await deleteConnector(id);
+    setError(null);
+    try {
+      await deleteConnector(id);
+    } catch (err) {
+      if (!err.requiresForce) { setError(err.message); return; }
+      // Spell out exactly what goes with it, by name and count - "are you
+      // sure?" is not a decision anyone can actually make.
+      const layers = err.dependents
+        .map((d) => `  - ${d.name} (${d.test_case_count} test case${d.test_case_count === 1 ? '' : 's'})`)
+        .join('\n');
+      const plural = err.dependents.length === 1 ? '' : 's';
+      const ok = confirm(
+        `This connector is used by ${err.dependents.length} test layer${plural}:\n\n${layers}\n\n`
+        + `Deleting it also deletes ${err.testCaseCount} test case${err.testCaseCount === 1 ? '' : 's'}, `
+        + 'along with those layers, their suites and schedules. Run history is kept.\n\n'
+        + 'Delete anyway?',
+      );
+      if (!ok) return;
+      try {
+        await deleteConnector(id, { force: true });
+      } catch (forceErr) {
+        setError(forceErr.message);
+        return;
+      }
+    }
     if (expandedId === id) setExpandedId(null);
     load();
   };
+
 
   return (
     <div className="max-w-5xl mx-auto space-y-8">

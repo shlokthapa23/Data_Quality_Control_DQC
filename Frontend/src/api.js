@@ -26,8 +26,22 @@ export function createConnector(payload) {
   });
 }
 
-export function deleteConnector(id) {
-  return request(`/api/connectors/${id}`, { method: 'DELETE' });
+export async function deleteConnector(id, { force = false } = {}) {
+  const res = await fetch(`${API_BASE}/api/connectors/${id}${force ? '?force=1' : ''}`, {
+    method: 'DELETE',
+    headers: { 'Content-Type': 'application/json' },
+  });
+  const body = await res.json().catch(() => ({}));
+  if (res.status === 409 && body.requires_force) {
+    // Not a failure - the server is asking whether the tester means it.
+    const err = new Error(body.error);
+    err.requiresForce = true;
+    err.dependents = body.dependents || [];
+    err.testCaseCount = body.test_case_count || 0;
+    throw err;
+  }
+  if (!res.ok) throw new Error(body.error || `Request failed: ${res.status}`);
+  return body;
 }
 
 export function testConnector(id) {
