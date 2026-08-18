@@ -309,7 +309,6 @@ def init_s2d_tables():
                 pipeline_item_id TEXT NOT NULL,   -- the Fabric DataPipeline item id
                 pipeline_name TEXT,               -- display name, cached so a renamed/deleted
                                                   -- pipeline still shows something meaningful
-                job_type TEXT NOT NULL DEFAULT 'Pipeline',  -- 'Pipeline' | 'Refresh' (Dataflow Gen2)
                 trigger_type TEXT NOT NULL,
                 trigger_config TEXT NOT NULL,
                 timezone TEXT NOT NULL DEFAULT 'UTC',
@@ -341,7 +340,6 @@ def init_s2d_tables():
     _add_missing_test_result_columns()
     _add_missing_test_run_columns()
     _add_missing_mapping_columns()
-    _add_missing_pipeline_schedule_columns()
 
 
 def _add_missing_mapping_columns():
@@ -1106,36 +1104,17 @@ def touch_harvest_schedule(schedule_id, last_status):
 # Pipeline schedules - same shape as suite schedules, which also carry a
 # last_run_id (a Fabric job-instance id here, an S2D run id there) ------------
 
-def _add_missing_pipeline_schedule_columns():
-    """
-    Additive: pipeline_schedules gained job_type when Dataflow Gen2 became
-    runnable. Every existing row is a Data Pipeline, which is exactly what the
-    DEFAULT gives them - no backfill needed.
-    """
-    with get_conn() as conn:
-        row = conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name='pipeline_schedules'"
-        ).fetchone()
-        if not row:
-            return  # fresh install - CREATE TABLE above already has the column
-        existing = {r[1] for r in conn.execute("PRAGMA table_info(pipeline_schedules)").fetchall()}
-        if "job_type" not in existing:
-            conn.execute(
-                "ALTER TABLE pipeline_schedules ADD COLUMN job_type TEXT NOT NULL DEFAULT 'Pipeline'")
-
-
 def create_pipeline_schedule(connector_id, pipeline_item_id, pipeline_name,
-                              trigger_type, trigger_config, timezone_name,
-                              job_type="Pipeline"):
+                              trigger_type, trigger_config, timezone_name):
     schedule_id = str(uuid.uuid4())
     now = datetime.now(timezone.utc).isoformat()
     with get_conn() as conn:
         conn.execute("""
             INSERT INTO pipeline_schedules
-                (id, connector_id, pipeline_item_id, pipeline_name, job_type,
+                (id, connector_id, pipeline_item_id, pipeline_name,
                  trigger_type, trigger_config, timezone, active, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
-        """, (schedule_id, connector_id, pipeline_item_id, pipeline_name, job_type,
+            VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)
+        """, (schedule_id, connector_id, pipeline_item_id, pipeline_name,
               trigger_type, json.dumps(trigger_config), timezone_name, now))
     return schedule_id
 

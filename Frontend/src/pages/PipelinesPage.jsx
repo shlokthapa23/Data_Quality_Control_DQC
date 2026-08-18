@@ -432,7 +432,7 @@ export default function PipelinesPage({ onGoToHarvest }) {
       // the snapshot first would delay the run by ~10s on Fabric; the pipeline
       // takes far longer to touch anything than the snapshot takes to finish.
       const [{ run_id }, before] = await Promise.all([
-        runPipeline(connectorId, pipeline.id, pipeline.job_type),
+        runPipeline(connectorId, pipeline.id),
         snapshotWatched(),
       ]);
       setTableDiff(before ? { before, after: null, status: 'waiting' } : null);
@@ -474,8 +474,8 @@ export default function PipelinesPage({ onGoToHarvest }) {
             <Workflow className="w-5 h-5 text-mastek-primary" /> Data Pipelines
           </h2>
           <p className="text-sm text-slate-500 mt-1">
-            Run a Fabric Data Pipeline or Dataflow Gen2 to load data, wait for it to finish, then head
-            to Harvest to pick up the Lakehouse it populated.
+            Run a Fabric pipeline to load data, wait for it to finish, then head to Harvest to pick up
+            the Lakehouse it populated.
           </p>
         </div>
 
@@ -566,19 +566,7 @@ export default function PipelinesPage({ onGoToHarvest }) {
               {pipelines.map((p) => (
                 <div key={p.id} className="flex items-center gap-3 px-3 py-2.5">
                   <div className="min-w-0">
-                    <p className="flex items-center gap-2 text-sm font-medium text-slate-700">
-                      <span className="truncate">{p.name}</span>
-                      {/* Both kinds start the same way and poll the same way,
-                          but they are different things and a tester about to
-                          move real data should see which one they picked. */}
-                      <span className={`shrink-0 text-[10px] px-1.5 py-0.5 rounded ${
-                        p.type === 'Dataflow'
-                          ? 'bg-mastek-highlight/10 text-mastek-highlight'
-                          : 'bg-mastek-primary/10 text-mastek-primary'
-                      }`}>
-                        {p.label || 'Pipeline'}
-                      </span>
-                    </p>
+                    <p className="text-sm font-medium text-slate-700 truncate">{p.name}</p>
                     <p className="text-[11px] text-slate-400 font-mono truncate">{p.id}</p>
                   </div>
                   <button
@@ -786,11 +774,7 @@ export default function PipelinesPage({ onGoToHarvest }) {
               nothing about schedule kinds, so it drops straight in. */}
           <SchedulesSection
             parentId={connectorId}
-            createExtras={{
-              pipeline_item_id: schedulingFor.id,
-              pipeline_name: schedulingFor.name,
-              job_type: schedulingFor.job_type,
-            }}
+            createExtras={{ pipeline_item_id: schedulingFor.id, pipeline_name: schedulingFor.name }}
             headerHint="Runs this pipeline on a timer. The scheduler waits for each run to finish, so the recorded status is the real outcome."
             fetchList={(cid) => fetchPipelineSchedules(cid, schedulingFor.id).then((d) => d.schedules || [])}
             create={createPipelineSchedule}

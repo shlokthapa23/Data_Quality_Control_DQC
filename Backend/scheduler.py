@@ -329,10 +329,7 @@ def _run_pipeline_job(schedule_id):
             raise ValueError("Pipelines can only run on a fabric connector")
         connector = build_connector(config)
 
-        # A dataflow schedule must fire as a Refresh; firing it as a Pipeline
-        # is rejected by Fabric with InvalidJobType. Older rows have no
-        # job_type and are Data Pipelines, which is what the fallback gives.
-        run_id = connector.run_pipeline(item_id, job_type=schedule.get("job_type") or "Pipeline")
+        run_id = connector.run_pipeline(item_id)
         if not run_id:
             # Fabric accepted it but didn't hand back an id, so there's nothing
             # to follow. Say that rather than claiming a clean run.
