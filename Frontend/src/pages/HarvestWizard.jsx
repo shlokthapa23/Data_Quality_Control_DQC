@@ -9,6 +9,8 @@ import {
   deleteHarvestSchedule, fetchHarvestScheduleEvents,
 } from '../api';
 import SchedulesSection from '../components/schedules/SchedulesSection';
+import { ListFilter } from '../components/common/ListFilter';
+import { filterByName, noMatchNote } from '../listFilter';
 
 const CATEGORY_ICON = {
   Lakehouse: Database,
@@ -94,6 +96,8 @@ export default function HarvestWizard() {
       setIsLoadingItems(false);
     }
   };
+
+  const [query, setQuery] = useState('');
 
   const toggleItem = (item) => {
     setCheckedKeys((prev) => {
@@ -186,6 +190,14 @@ export default function HarvestWizard() {
         )}
 
         {!isLoadingItems && !itemsError && items.length > 0 && (
+          <ListFilter
+            value={query} onChange={setQuery} total={items.length}
+            shown={filterByName(items, query, (i) => i.name).length}
+            placeholder="Search assets..." className="mb-2"
+          />
+        )}
+
+        {!isLoadingItems && !itemsError && items.length > 0 && (
           <div className="border border-slate-200 rounded-lg divide-y divide-slate-100 max-h-80 overflow-y-auto mb-5">
             {Object.entries(groups).map(([type, groupItems]) => (
               <div key={type} className="p-3">
@@ -210,7 +222,10 @@ export default function HarvestWizard() {
                   })()}
                 </div>
                 <div className="space-y-1">
-                  {groupItems.map((item) => (
+                  {filterByName(groupItems, query, (i) => i.name).length === 0 && (
+                    <p className="text-xs text-slate-400 italic px-2 py-1">{noMatchNote(query)}</p>
+                  )}
+                  {filterByName(groupItems, query, (i) => i.name).map((item) => (
                     <label
                       key={item.id}
                       className="flex items-center gap-2 px-2 py-1.5 rounded-lg hover:bg-slate-50 cursor-pointer text-sm"

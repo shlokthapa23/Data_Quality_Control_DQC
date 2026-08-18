@@ -1,6 +1,8 @@
 import { useEffect, useState } from 'react';
 import { Database, Loader2, CheckCircle2, AlertCircle } from 'lucide-react';
 import { fetchAllLakehouses, pinConnectorContainers } from '../../api';
+import { ListFilter } from '../common/ListFilter';
+import { filterByName, noMatchNote } from '../../listFilter';
 
 export default function PinLakehousesPanel({ connector, onPinned }) {
   const [lakehouses, setLakehouses] = useState([]);
@@ -10,6 +12,7 @@ export default function PinLakehousesPanel({ connector, onPinned }) {
     new Set((connector.allowed_containers || []).map((c) => c.id))
   );
   const [isSaving, setIsSaving] = useState(false);
+  const [query, setQuery] = useState('');
 
   useEffect(() => {
   fetchAllLakehouses(connector.id)
@@ -98,8 +101,16 @@ export default function PinLakehousesPanel({ connector, onPinned }) {
 
       {!isLoading && !error && (
         <>
+          <ListFilter
+            value={query} onChange={setQuery} total={lakehouses.length}
+            shown={filterByName(lakehouses, query, (l) => l.name).length}
+            placeholder="Search Lakehouses..." className="mb-2"
+          />
           <div className="space-y-1.5 mb-3 max-h-56 overflow-y-auto">
-            {lakehouses.map((lh) => {
+            {lakehouses.length > 0 && filterByName(lakehouses, query, (l) => l.name).length === 0 && (
+              <p className="text-sm text-slate-400 italic">{noMatchNote(query)}</p>
+            )}
+            {filterByName(lakehouses, query, (l) => l.name).map((lh) => {
               const checked = selected.has(lh.id);
               return (
                 <label

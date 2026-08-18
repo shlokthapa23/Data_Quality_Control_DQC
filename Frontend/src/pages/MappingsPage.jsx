@@ -10,6 +10,8 @@ import {
 } from '../api';
 import ColumnMapModal from '../components/s2d/ColumnMapModal';
 import { formatRowCount, rowCountStyle, rowCountTitle } from '../rowCount';
+import { ListFilter } from '../components/common/ListFilter';
+import { filterByName, noMatchNote } from '../listFilter';
 
 function EndpointPicker({ label, connectors, endpoint, onChange }) {
   const [containers, setContainers] = useState([]);
@@ -62,6 +64,9 @@ function EndpointPicker({ label, connectors, endpoint, onChange }) {
     onChange({ ...endpoint, containerId, containerName: container?.name, tables: [] });
   };
 
+  const [query, setQuery] = useState('');
+  const visibleTables = filterByName(tables, query, (t) => t.name);
+
   const toggleTable = (tableName) => {
     const next = endpoint.tables.includes(tableName)
       ? endpoint.tables.filter((t) => t !== tableName)
@@ -94,6 +99,10 @@ function EndpointPicker({ label, connectors, endpoint, onChange }) {
           {containers.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
         </select>
 
+        <ListFilter
+          value={query} onChange={setQuery} total={tables.length} shown={visibleTables.length}
+        />
+
         <div className="border border-slate-300 rounded-lg max-h-40 overflow-y-auto">
           {isLoadingTables && (
             <div className="flex items-center gap-2 text-sm text-slate-500 px-3 py-2">
@@ -106,7 +115,10 @@ function EndpointPicker({ label, connectors, endpoint, onChange }) {
           {!isLoadingTables && !endpoint.containerId && (
             <p className="text-sm text-slate-400 italic px-3 py-2">Select a container first</p>
           )}
-          {!isLoadingTables && tables.map((t) => (
+          {!isLoadingTables && tables.length > 0 && visibleTables.length === 0 && (
+            <p className="text-sm text-slate-400 italic px-3 py-2">{noMatchNote(query)}</p>
+          )}
+          {!isLoadingTables && visibleTables.map((t) => (
             <label
               key={t.name}
               className="flex items-center gap-2 px-3 py-1.5 text-sm font-mono hover:bg-slate-50 cursor-pointer border-b border-slate-100 last:border-b-0"
@@ -156,6 +168,8 @@ const EMPTY_ENDPOINT = { connectorId: '', connectorName: '', containerId: '', co
  * runs; that's a decision the tester should make knowingly, not discover later.
  */
 function EditableTableList({ label, options, selected, usage, onToggle }) {
+  const [query, setQuery] = useState('');
+  const visible = filterByName(options, query, (t) => t.name);
   const removedInUse = options.filter((t) => !selected.has(t.name) && usage[t.name]);
 
   return (
@@ -177,6 +191,7 @@ function EditableTableList({ label, options, selected, usage, onToggle }) {
               onChange={() => onToggle(
                 options.every((t) => selected.has(t.name)) ? [] : options.map((t) => t.name),
               )}
+              title="Selects every table in this container, not just the filtered ones"
               className="rounded border-slate-300 text-mastek-primary focus:ring-mastek-accent"
             />
             Select all
@@ -184,11 +199,19 @@ function EditableTableList({ label, options, selected, usage, onToggle }) {
         )}
       </div>
 
+      <ListFilter
+        value={query} onChange={setQuery} total={options.length} shown={visible.length}
+        className="mb-1.5"
+      />
+
       <div className="border border-slate-200 rounded-lg max-h-44 overflow-y-auto bg-white">
         {options.length === 0 && (
           <p className="text-xs text-slate-400 italic px-3 py-2">No tables found.</p>
         )}
-        {options.map((t) => (
+        {options.length > 0 && visible.length === 0 && (
+          <p className="text-xs text-slate-400 italic px-3 py-2">{noMatchNote(query)}</p>
+        )}
+        {visible.map((t) => (
           <label
             key={t.name}
             className="flex items-center gap-2 px-3 py-1.5 text-xs font-mono hover:bg-slate-50 cursor-pointer border-b border-slate-100 last:border-b-0"

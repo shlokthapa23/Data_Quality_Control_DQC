@@ -14,6 +14,8 @@ import {
 import { commonNamesFor } from '../../columnMap';
 import { lintSql } from '../../sqlLint';
 import { formatRowCount, rowCountStyle, rowCountTitle } from '../../rowCount';
+import { ListFilter } from '../common/ListFilter';
+import { filterByName, noMatchNote } from '../../listFilter';
 import ColumnMapModal from './ColumnMapModal';
 
 const SEVERITY_STYLES = {
@@ -391,10 +393,19 @@ function SqlEditorFooter({ hints, onCheck, checkState }) {
 // Note the ?? rather than ||: an empty table's count is 0, which is falsy, and
 // hiding "0" would suppress exactly the case a tester most wants to notice.
 function TableCheckboxList({ tables, selected, onToggle, rowCounts = {} }) {
+  const [query, setQuery] = useState('');
+  const visible = filterByName(tables, query);
   return (
-    <div className="border border-slate-300 rounded-lg max-h-32 overflow-y-auto">
+    <div className="space-y-1.5">
+      <ListFilter
+        value={query} onChange={setQuery} total={tables.length} shown={visible.length}
+      />
+      <div className="border border-slate-300 rounded-lg max-h-32 overflow-y-auto">
       {tables.length === 0 && <p className="text-sm text-slate-400 italic px-3 py-2">No tables</p>}
-      {tables.map((t) => {
+      {tables.length > 0 && visible.length === 0 && (
+        <p className="text-sm text-slate-400 italic px-3 py-2">{noMatchNote(query)}</p>
+      )}
+      {visible.map((t) => {
         const count = rowCounts[t];
         return (
           <label key={t} className="flex items-center gap-2 px-3 py-1.5 text-sm font-mono hover:bg-slate-50 cursor-pointer border-b border-slate-100 last:border-b-0">
@@ -416,6 +427,7 @@ function TableCheckboxList({ tables, selected, onToggle, rowCounts = {} }) {
           </label>
         );
       })}
+      </div>
     </div>
   );
 }
@@ -1160,10 +1172,24 @@ const [tab, setTab] = useState('ai'); // 'ai' | 'manual'
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-slate-200 pb-4">
         <div>
           <h2 className="text-xl font-bold tracking-tight text-slate-800">Logic Configuration</h2>
+          {/* Counts, not names. A layer can cover 100 tables and listing them
+              all turned this line into a wall of text that pushed the whole
+              header off screen; the names are one click away in any picker. */}
           <p className="text-sm text-slate-500 font-mono">
-            {mapping.source_connector_name}/{mapping.source_tables.join(', ')}
-            <span className="text-slate-300 mx-1">&rarr;</span>
-            {mapping.destination_connector_name}/{mapping.destination_tables.join(', ')}
+            {mapping.source_connector_name}
+            <span className="text-slate-400"> ({mapping.source_tables.length} table{mapping.source_tables.length === 1 ? '' : 's'})</span>
+            {/* A source-only layer has no destination at all, so an arrow
+                pointing at "(0 tables)" would invent one. */}
+            {mapping.validation_kind !== 'source_only' && (
+              <>
+                <span className="text-slate-300 mx-1">&rarr;</span>
+                {mapping.destination_connector_name}
+                <span className="text-slate-400"> ({mapping.destination_tables.length} table{mapping.destination_tables.length === 1 ? '' : 's'})</span>
+              </>
+            )}
+            {mapping.validation_kind === 'source_only' && (
+              <span className="text-slate-400"> &middot; source only</span>
+            )}
           </p>
         </div>
 

@@ -10,6 +10,8 @@ import {
   deletePipelineSchedule, fetchPipelineScheduleEvents,
 } from '../api';
 import { formatRowCount, rowCountStyle, rowCountTitle } from '../rowCount';
+import { ListFilter } from '../components/common/ListFilter';
+import { filterByName, noMatchNote } from '../listFilter';
 import SchedulesSection from '../components/schedules/SchedulesSection';
 
 // Fabric reports NotStarted/InProgress while a job is live; everything else
@@ -119,7 +121,9 @@ function snapshotOf(tables) {
  * anywhere else: this is the page where a tester is about to load data into it.
  */
 function LakehouseTables({ containerName, tables, status, onRefresh }) {
+  const [query, setQuery] = useState('');
   const rows = [...(tables || [])].sort((a, b) => a.name.localeCompare(b.name));
+  const visible = filterByName(rows, query, (t) => t.name);
   // ?? not ||: 0 is a perfectly good reading, and it's the one worth noticing.
   const readable = rows.filter((t) => (t.row_count ?? null) !== null);
   const total = readable.reduce((sum, t) => sum + t.row_count, 0);
@@ -172,8 +176,17 @@ function LakehouseTables({ containerName, tables, status, onRefresh }) {
       )}
 
       {rows.length > 0 && (
+        <ListFilter
+          value={query} onChange={setQuery} total={rows.length} shown={visible.length}
+        />
+      )}
+
+      {rows.length > 0 && (
         <div className="border border-slate-200 rounded-lg divide-y divide-slate-100 max-h-80 overflow-y-auto">
-          {rows.map((t) => (
+          {visible.length === 0 && (
+            <p className="text-sm text-slate-400 italic px-3 py-2">{noMatchNote(query)}</p>
+          )}
+          {visible.map((t) => (
             <div key={t.name} className="flex items-center gap-3 px-3 py-1.5">
               <span className="font-mono text-xs text-slate-700 truncate">{t.name}</span>
               <span
@@ -522,15 +535,23 @@ export default function PipelinesPage({ onGoToHarvest }) {
         )}
 
         <div className="bg-white border border-slate-200 rounded-xl shadow-sm p-4 space-y-3">
-          <h4 className="text-xs font-bold text-slate-400 uppercase tracking-wider flex items-center gap-1.5">
-            <Workflow className="w-3.5 h-3.5" /> Pipelines
-          </h4>
+          <div className="flex items-center gap-2">
+            <h4 className="text-xs font-bold text-slate-400 uppercase tracking-wider flex items-center gap-1.5">
+              <Workflow className="w-3.5 h-3.5" /> Pipelines
+            </h4>
+            {isLoading && <Loader2 className="w-3.5 h-3.5 animate-spin text-mastek-primary" />}
+            {/* The table card has had a Refresh since it was built; a pipeline
+                added in Fabric mid-session needed a full page reload to appear. */}
+            <button
+              onClick={() => loadPipelines(connectorId)}
+              disabled={!connectorId || isLoading}
+              title="Check the workspace for pipelines again"
+              className="ml-auto flex items-center gap-1.5 px-2 py-1 text-xs font-medium text-mastek-primary border border-mastek-primary/40 rounded-md hover:bg-mastek-primary/10 disabled:opacity-50"
+            >
+              <RefreshCw className="w-3 h-3" /> Refresh
+            </button>
+          </div>
 
-          {isLoading && (
-            <p className="flex items-center gap-2 text-sm text-slate-500">
-              <Loader2 className="w-4 h-4 animate-spin" /> Loading pipelines...
-            </p>
-          )}
           {loadError && (
             <p className="flex items-start gap-2 text-sm text-red-600">
               <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" /> {loadError}

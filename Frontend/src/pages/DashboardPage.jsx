@@ -21,7 +21,7 @@ import { captureCharts } from '../chartCapture';
  * amber-700 against red-600 failed even normal vision at dE 9.9. These pass all
  * six checks on a white surface.
  */
-const STATUS_COLOR = { PASS: '#047857', ERROR: '#CA8A04', FAIL: '#DC2626' };
+const STATUS_COLOR = { PASS: '#001499', ERROR: '#CA8A04', FAIL: '#DC2626' };
 
 /**
  * Categorical hues for test layers, assigned in FIXED order and never cycled -

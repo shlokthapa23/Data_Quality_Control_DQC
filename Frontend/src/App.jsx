@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { Plug, DownloadCloud, LayoutGrid, Waypoints, GitCompareArrows, ListChecks, CalendarClock, History, Workflow, BarChart3 } from 'lucide-react';
+import { Plug, DownloadCloud, LayoutGrid, Waypoints, GitCompareArrows, ListChecks, CalendarClock, History, Workflow, BarChart3, PanelLeftClose, PanelLeft } from 'lucide-react';
 import ConnectPage from './pages/ConnectPage';
 import PipelinesPage from './pages/PipelinesPage';
 import HarvestWizard from './pages/HarvestWizard';
@@ -45,6 +45,18 @@ function App() {
   // navigates elsewhere via goToPage, so any StrictMode remount of the
   // S2D subtree still sees the same focus and re-applies it identically.
   const [s2dFocus, setS2dFocus] = useState(null);
+  // Collapsed to icons rather than hidden: the labels are long ("Test Layer &
+  // Test Suite Setup"), so on a laptop the sidebar was eating a fifth of the
+  // width that tables and charts need. Remembered across reloads because it's
+  // a workspace preference, not a per-visit choice.
+  const [navCollapsed, setNavCollapsed] = useState(
+    () => localStorage.getItem('navCollapsed') === '1',
+  );
+
+  const toggleNav = () => setNavCollapsed((v) => {
+    localStorage.setItem('navCollapsed', v ? '0' : '1');
+    return !v;
+  });
 
   const goToPage = (id) => {
     setActiveRunId(null);
@@ -119,30 +131,60 @@ function App() {
 
   return (
     <div className="flex h-screen bg-slate-50 font-sans text-slate-900">
-      <aside className="w-60 bg-white border-r border-slate-200 flex flex-col shrink-0">
-        <div className="flex items-center h-16 px-6 border-b border-slate-200 shrink-0">
-          <img 
-    src={mastekLogo} 
-    alt="Mastek Logo" 
-    className="w-auto h-12 object-contain" 
-  />
+      {/* Width is an inline style, not a swapped w-16/w-60 class: Tailwind's dev
+          server only emits the utility that was in use when the page loaded, so
+          toggling left the rail at its old width until a hard refresh - labels
+          vanishing while the sidebar stayed wide. An inline value always
+          applies and can't depend on what the JIT happened to generate. */}
+      <aside
+        style={{ width: navCollapsed ? '4rem' : '15rem' }}
+        className="bg-white border-r border-slate-200 flex flex-col shrink-0 transition-[width] duration-200 overflow-hidden"
+      >
+        <div className={`flex items-center h-16 border-b border-slate-200 shrink-0 ${
+          navCollapsed ? 'justify-center px-2' : 'px-6'
+        }`}>
+          <img
+            src={mastekLogo}
+            alt="Mastek Logo"
+            className={`object-contain ${navCollapsed ? 'w-9 h-9' : 'w-auto h-12'}`}
+          />
         </div>
+
         <nav className="p-3 space-y-1">
           {NAV_PAGES.map(({ id, label, icon: Icon }) => (
             <button
               key={id}
               onClick={() => goToPage(id)}
-              className={`w-full flex items-center gap-3 px-4 py-2.5 rounded-lg text-sm font-medium transition-colors ${
+              // The label disappears when collapsed, so it moves to the tooltip
+              // - an icon-only rail with no way to identify the icons is worse
+              // than the width it saves.
+              title={navCollapsed ? label : undefined}
+              className={`w-full flex items-center gap-3 py-2.5 rounded-lg text-sm font-medium transition-colors ${
+                navCollapsed ? 'justify-center px-0' : 'px-4'
+              } ${
                 activePage === id
                   ? 'bg-mastek-primary/10 text-mastek-primary'
                   : 'text-slate-600 hover:bg-slate-50'
               }`}
             >
-              <Icon className="w-4 h-4" />
-              {label}
+              <Icon className="w-4 h-4 shrink-0" />
+              {!navCollapsed && <span className="truncate">{label}</span>}
             </button>
           ))}
         </nav>
+
+        <button
+          onClick={toggleNav}
+          title={navCollapsed ? 'Expand sidebar' : 'Collapse sidebar'}
+          aria-expanded={!navCollapsed}
+          className={`mt-auto m-3 flex items-center gap-2 py-2 rounded-lg text-xs font-medium text-slate-500 hover:bg-slate-50 ${
+            navCollapsed ? 'justify-center px-0' : 'px-4'
+          }`}
+        >
+          {navCollapsed
+            ? <PanelLeft className="w-4 h-4 shrink-0" />
+            : <><PanelLeftClose className="w-4 h-4 shrink-0" /> Collapse</>}
+        </button>
       </aside>
 
       <main className="flex-1 overflow-y-auto p-6 sm:p-8">
