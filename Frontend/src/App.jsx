@@ -13,19 +13,20 @@ import HistoryPage from './pages/HistoryPage';
 import DashboardPage from './pages/DashboardPage';
 import mastekLogo from './images/logo.png'
 const NAV_PAGES = [
+  { id: 'dashboard', label: 'Data Quality Dashboard', icon: BarChart3 },
   { id: 'connect', label: 'Connect', icon: Plug },
   // Sits between Connect and Harvest to match the data flow: connect, load the
   // data with a pipeline, then harvest what it produced.
   
   { id: 'harvest', label: 'Harvest MetaData', icon: DownloadCloud },
   { id: 'catalog', label: 'Catalog Viewer', icon: LayoutGrid },
-  { id: 'mapping', label: 'Test Layer & Test Suite Setup', icon: Waypoints },
   { id: 'pipelines', label: 'Test Data Preparation', icon: Workflow },
+  { id: 'mapping', label: 'Test Layer & Test Suite Setup', icon: Waypoints },
   { id: 's2d', label: 'Test Cases Validation', icon: GitCompareArrows },
   { id: 'suites', label: 'Test Suite Execution', icon: ListChecks },
   { id: 'schedules', label: 'Test Suite & Harvest Schedule', icon: CalendarClock },
   { id: 'history', label: 'Test Run History', icon: History },
-  { id: 'dashboard', label: 'Data Quality Dashboard', icon: BarChart3 },
+  
 ];
 
 function App() {
