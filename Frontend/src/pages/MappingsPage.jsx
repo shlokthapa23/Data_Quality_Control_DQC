@@ -15,6 +15,7 @@ import { filterByName, noMatchNote } from '../listFilter';
 
 function EndpointPicker({ label, connectors, endpoint, onChange }) {
   const [containers, setContainers] = useState([]);
+  const [containerSource, setContainerSource] = useState(null);
   const [tables, setTables] = useState([]);
   const [isLoadingContainers, setIsLoadingContainers] = useState(false);
   const [isLoadingTables, setIsLoadingTables] = useState(false);
@@ -27,6 +28,7 @@ function EndpointPicker({ label, connectors, endpoint, onChange }) {
     fetchConnectorContainers(endpoint.connectorId)
       .then((data) => {
         setContainers(data.containers);
+        setContainerSource(data.source);
         setIsLoadingContainers(false);
         if (data.containers.length === 1) {
           onChange({ ...endpoint, containerId: data.containers[0].id, containerName: data.containers[0].name, tables: [] });
@@ -98,6 +100,13 @@ function EndpointPicker({ label, connectors, endpoint, onChange }) {
           </option>
           {containers.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
         </select>
+
+        {containerSource === 'harvested' && (
+          <p className="text-[11px] text-slate-400 -mt-1">
+            Showing the {containers.length} Lakehouse{containers.length === 1 ? '' : 's'} you have
+            harvested. Harvest another, or pin on Connect, to see more.
+          </p>
+        )}
 
         <ListFilter
           value={query} onChange={setQuery} total={tables.length} shown={visibleTables.length}

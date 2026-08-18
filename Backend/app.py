@@ -325,19 +325,47 @@ def pin_connector_containers(connector_id):
 @app.route('/api/connectors/<connector_id>/containers', methods=['GET'])
 def get_connector_containers(connector_id):
     """
-    S2D-facing container list - a Fabric connector's pinned pair of
-    Lakehouses (or every Lakehouse if not pinned yet), or a Local
-    connector's single implicit file store.
+    S2D-facing container list, narrowed by whichever intent the tester has
+    actually expressed, in this order:
+
+      pinned    - Lakehouses pinned on Connect. An explicit choice, so it wins.
+      harvested - nothing pinned, but some Lakehouses have been harvested.
+                  Harvesting one IS the tester saying "this is the one I care
+                  about", and offering the other forty in the workspace buries
+                  it. This is the case a whole-workspace harvest used to fall
+                  into.
+      workspace - neither, so everything (minus Fabric's own staging
+                  Lakehouses) - the only honest answer when nothing has been
+                  chosen.
+
+    `source` is returned so the UI can say which of the three the reader is
+    looking at; a short list with no explanation reads as a missing Lakehouse.
     """
     try:
-        _, connector = get_connector_instance(connector_id)
+        config, connector = get_connector_instance(connector_id)
     except KeyError as e:
         return jsonify({"error": str(e)}), 404
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
 
     try:
-        return jsonify({"containers": connector.list_containers()})
+        containers = connector.list_containers()
+        # The connector object, not the config row: get_connector_config returns
+        # the raw row, where pinning lives in allowed_containers_json - reading
+        # the unparsed key made this look unpinned even when it wasn't, which
+        # would have let harvest narrowing override an explicit pin.
+        pinned = bool(getattr(connector, "allowed_containers", None))
+        source = "pinned" if pinned else "workspace"
+
+        if not pinned and config.get("type") == "fabric":
+            harvested = catalog_db.harvested_container_ids(connector_id)
+            narrowed = [c for c in containers if c["id"] in harvested]
+            # Only narrow when it leaves something. A harvest of a Lakehouse
+            # that has since been deleted must not empty the picker.
+            if narrowed:
+                containers, source = narrowed, "harvested"
+
+        return jsonify({"containers": containers, "source": source})
     except Exception as e:
         return jsonify({"error": "Failed to list containers", "details": str(e)}), 502
 

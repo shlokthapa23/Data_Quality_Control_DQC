@@ -219,6 +219,21 @@ def create_connector_config(name, type, tenant_id=None, client_id=None,
     return config_id
 
 
+def harvested_container_ids(connector_id, item_type="Lakehouse"):
+    """
+    The Fabric item ids of everything of `item_type` this connector has
+    harvested. Harvesting a Lakehouse is a deliberate act - it says "this is one
+    I care about" - so it is a far better answer to "which containers should I
+    be offered" than "every Lakehouse that exists in the workspace".
+    """
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT source_item_id FROM harvested_assets WHERE connector_id = ? AND type = ?",
+            (connector_id, item_type),
+        ).fetchall()
+    return {r["source_item_id"] for r in rows if r["source_item_id"]}
+
+
 def list_connector_configs():
     with get_conn() as conn:
         rows = conn.execute("""

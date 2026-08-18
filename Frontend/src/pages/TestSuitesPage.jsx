@@ -15,11 +15,11 @@ import SchedulesSection from '../components/schedules/SchedulesSection';
 const CHECK_TYPE_LABEL = {
   sql: 'SQL',
   row_count_match: 'Row Count',
-  column_parity: 'Column Parity',
+  column_parity: 'Column check',
 };
 
 function checkTypeLabel(tc) {
-  if (tc.check_type === 'sql' && tc.check_scope === 'cross_table_parity') return 'Cross-Table Parity';
+  if (tc.check_type === 'sql' && tc.check_scope === 'cross_table_parity') return 'Row match';
   return CHECK_TYPE_LABEL[tc.check_type] || tc.check_type;
 }
 

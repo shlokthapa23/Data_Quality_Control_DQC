@@ -1297,7 +1297,7 @@ const [tab, setTab] = useState('ai'); // 'ai' | 'manual'
                 aiMode === 'cross_parity' ? 'bg-white text-mastek-primary shadow' : 'text-slate-500 hover:text-slate-700'
               }`}
             >
-              <GitCompareArrows className="w-3.5 h-3.5" /> Cross-Table Parity
+              <GitCompareArrows className="w-3.5 h-3.5" /> Compare rows
             </button>
           </div>
           <div className="text-xs text-slate-500 -mt-2">
@@ -1468,7 +1468,7 @@ const [tab, setTab] = useState('ai'); // 'ai' | 'manual'
                 className="flex items-center gap-2 px-4 py-2 text-sm font-medium text-white bg-mastek-primary rounded-lg hover:brightness-110 disabled:opacity-50 disabled:cursor-not-allowed"
               >
                 {isSuggestingParity ? <Loader2 className="w-4 h-4 animate-spin" /> : <Sparkles className="w-4 h-4" />}
-                AI Suggest Parity Rules
+                AI Suggest Column Rules
               </button>
 
               {suggestParitySummary && suggestParitySummary.createdCount === 0 && suggestParitySummary.message ? (
@@ -1491,7 +1491,7 @@ const [tab, setTab] = useState('ai'); // 'ai' | 'manual'
               <p className="text-xs text-slate-400">
                 Each saved rule compares a source column against a destination column it identified as
                 the same field - no free-form SQL involved, the same null/uniqueness/range comparison
-                logic used by the Manual tab's Column Parity Check runs it.
+                logic used by the Manual tab's Compare a column check runs it.
               </p>
             </>
           )}
@@ -1555,7 +1555,7 @@ const [tab, setTab] = useState('ai'); // 'ai' | 'manual'
               </p>
 
               <div className="border-t border-slate-200 pt-4 space-y-3">
-                <p className="text-xs font-medium text-slate-500">AI Suggested Parity Rules</p>
+                <p className="text-xs font-medium text-slate-500">AI Suggested Row-Match Rules</p>
                 <div className="flex items-center gap-2 text-sm text-slate-500">
                   <Sparkles className="w-4 h-4 text-mastek-highlight shrink-0" />
                   No description needed - the AI samples random rows from both sides above and
@@ -1576,7 +1576,7 @@ const [tab, setTab] = useState('ai'); // 'ai' | 'manual'
                   className="flex items-center gap-2 px-4 py-2 text-sm font-medium text-white bg-mastek-primary rounded-lg hover:brightness-110 disabled:opacity-50 disabled:cursor-not-allowed"
                 >
                   {isSuggestingCrossParity ? <Loader2 className="w-4 h-4 animate-spin" /> : <Sparkles className="w-4 h-4" />}
-                  AI Suggest Parity Rules
+                  AI Suggest Row-Match Rules
                 </button>
 
                 {suggestCrossParitySummary && suggestCrossParitySummary.createdCount === 0 && suggestCrossParitySummary.message ? (
@@ -1701,7 +1701,7 @@ const [tab, setTab] = useState('ai'); // 'ai' | 'manual'
                 <div className="min-w-0">
                   <div className="text-sm font-medium text-slate-800 flex items-center gap-1.5">
                     <GitCompareArrows className="w-3.5 h-3.5 text-mastek-highlight" />
-                    Column parity
+                    Compare a column
                   </div>
                   <div className="text-xs text-slate-500 mt-0.5">
                     Compares one column between source and destination — nulls, distinct values, range, volume,
@@ -1723,7 +1723,7 @@ const [tab, setTab] = useState('ai'); // 'ai' | 'manual'
                 <div className="min-w-0">
                   <div className="text-sm font-medium text-slate-800 flex items-center gap-1.5">
                     <GitCompareArrows className="w-3.5 h-3.5 text-mastek-highlight" />
-                    Cross-table parity
+                    Compare rows
                   </div>
                   <div className="text-xs text-slate-500 mt-0.5">
                     Checks that every key value on source also exists on destination (and vice versa). Slower but tells you <em>which specific rows</em> are missing.
