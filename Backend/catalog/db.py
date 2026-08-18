@@ -124,6 +124,28 @@ def upsert_asset(connector_id, connector_type, connector_name, item, schema=None
     return asset_id
 
 
+def clear_assets_by_item_ids(connector_type, connector_id, source_item_ids):
+    """
+    Drop the catalog rows for exactly these items, and nothing else.
+
+    This is what "full refresh" now means: re-pull the things you selected from
+    scratch. It used to clear every asset of the selected TYPES, which meant
+    harvesting a second Lakehouse silently deleted the first one - the tester
+    had asked for one more, and got one instead.
+    """
+    if not source_item_ids:
+        return
+    with get_conn() as conn:
+        placeholders = ",".join("?" for _ in source_item_ids)
+        params = [connector_type, connector_id, *source_item_ids]
+        conn.execute(
+            f"""DELETE FROM harvested_assets
+                WHERE connector_type = ? AND connector_id = ?
+                  AND source_item_id IN ({placeholders})""",
+            params,
+        )
+
+
 def full_refresh_clear(connector_type, connector_id=None, asset_types=None):
     """
     Wipe existing catalog entries before a full refresh.

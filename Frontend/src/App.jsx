@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { Plug, DownloadCloud, LayoutGrid, Waypoints, GitCompareArrows, ListChecks, CalendarClock, History, Workflow, BarChart3, PanelLeftClose, PanelLeft } from 'lucide-react';
+import { Plug, DownloadCloud, LayoutGrid, Waypoints, GitCompareArrows, ListChecks, CalendarClock, History, Workflow, BarChart3, PanelLeftClose, PanelLeft, ArrowLeft } from 'lucide-react';
 import ConnectPage from './pages/ConnectPage';
 import PipelinesPage from './pages/PipelinesPage';
 import HarvestWizard from './pages/HarvestWizard';
@@ -46,6 +46,9 @@ function App() {
   // navigates elsewhere via goToPage, so any StrictMode remount of the
   // S2D subtree still sees the same focus and re-applies it identically.
   const [s2dFocus, setS2dFocus] = useState(null);
+  // Where a jump into the test-case editor came from, so the tester can get
+  // back to the run they were reading rather than re-finding it in History.
+  const [s2dReturn, setS2dReturn] = useState(null);
   // Collapsed to icons rather than hidden: the labels are long ("Test Layer &
   // Test Suite Setup"), so on a laptop the sidebar was eating a fifth of the
   // width that tables and charts need. Remembered across reloads because it's
@@ -62,13 +65,24 @@ function App() {
   const goToPage = (id) => {
     setActiveRunId(null);
     setS2dFocus(null);
+    setS2dReturn(null);
     setActivePage(id);
   };
 
-  const goToS2DWithFocus = (focus) => {
+  const goToS2DWithFocus = (focus, returnTo = null) => {
     setActiveRunId(null);
     setS2dFocus(focus);
+    setS2dReturn(returnTo);
     setActivePage('s2d');
+  };
+
+  // Back to the run whose result sent us here.
+  const returnFromS2D = () => {
+    const target = s2dReturn;
+    setS2dFocus(null);
+    setS2dReturn(null);
+    setActiveRunId(target?.runId || null);
+    setActivePage(target?.page || 's2d');
   };
 
   const handleRunComplete = (runId) => {
@@ -95,6 +109,10 @@ function App() {
         runId={activeRunId}
         onBackToS2D={handleBackFromAnalytics}
         onGoToHistory={() => goToPage('history')}
+        onEditTestCase={(mappingId, testCaseId) => goToS2DWithFocus(
+          { mappingId, testCaseId },
+          { page: 'analytics', runId: activeRunId },
+        )}
       />
     );
   } else if (activePage === 'connect') {
@@ -123,10 +141,22 @@ function App() {
     content = <DashboardPage />;
   } else {
     content = (
-      <S2DPage
-        onNavigateToRun={handleRunComplete}
-        focus={s2dFocus}
-      />
+      <>
+        {/* Only when we arrived from a specific run - a Back button with
+            nowhere to go is worse than none. */}
+        {s2dReturn && (
+          <button
+            onClick={returnFromS2D}
+            className="mb-4 flex items-center gap-2 px-3 py-1.5 text-sm font-medium text-mastek-primary border border-mastek-primary/40 rounded-lg hover:bg-mastek-primary/10"
+          >
+            <ArrowLeft className="w-4 h-4" /> Back to results
+          </button>
+        )}
+        <S2DPage
+          onNavigateToRun={handleRunComplete}
+          focus={s2dFocus}
+        />
+      </>
     );
   }
 

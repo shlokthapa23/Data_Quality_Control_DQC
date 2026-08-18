@@ -22,7 +22,7 @@ function rowPassRate(r) {
   return r.status === 'PASS' ? 100 : 0;
 }
 
-export default function AnalyticsPage({ runId, onBackToS2D, onGoToHistory }) {
+export default function AnalyticsPage({ runId, onBackToS2D, onGoToHistory, onEditTestCase }) {
   const [run, setRun] = useState(null);
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState(null);
@@ -246,8 +246,14 @@ export default function AnalyticsPage({ runId, onBackToS2D, onGoToHistory }) {
                 <Search className="w-3.5 h-3.5" /> Isolate Bad Rows
               </button>
               <button
-                onClick={() => onBackToS2D(run.mapping_id)}
-                className="flex-1 bg-mastek-primary hover:brightness-110 text-white text-center py-2 rounded font-medium transition"
+                // Opens THIS check in the editor, rather than dropping the
+                // tester on the test-case list to find it again by name.
+                onClick={() => onEditTestCase(run.mapping_id, selectedResult.test_case_id)}
+                disabled={!selectedResult?.test_case_id}
+                title={selectedResult?.test_case_id
+                  ? 'Edit this test case'
+                  : 'This result has no test case to open - it may have been deleted'}
+                className="flex-1 bg-mastek-primary hover:brightness-110 text-white text-center py-2 rounded font-medium transition disabled:opacity-50 disabled:cursor-not-allowed"
               >
                 Update Test Query
               </button>

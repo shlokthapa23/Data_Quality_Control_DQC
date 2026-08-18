@@ -257,7 +257,7 @@ export default function HarvestWizard() {
                   onChange={() => setMode('incremental')}
                   className="text-blue-600 focus:ring-blue-500"
                 />
-                Incremental <span className="text-slate-400">(append)</span>
+                Incremental <span className="text-slate-400">(add / update)</span>
               </label>
               <label className="flex items-center gap-2 text-sm cursor-pointer">
                 <input
@@ -266,7 +266,7 @@ export default function HarvestWizard() {
                   onChange={() => setMode('full_refresh')}
                   className="text-blue-600 focus:ring-blue-500"
                 />
-                Full Refresh <span className="text-slate-400">(replace)</span>
+                Full Refresh <span className="text-slate-400">(re-read the selected items)</span>
               </label>
             </div>
 

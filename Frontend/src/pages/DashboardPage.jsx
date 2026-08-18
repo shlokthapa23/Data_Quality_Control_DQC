@@ -464,18 +464,21 @@ export default function DashboardPage() {
               isEmpty={statusData.length === 0}
               emptyNote="No checks in scope."
             >
-              <ResponsiveContainer width="100%" height={240}>
-                <PieChart>
+              {/* Taller container and a smaller ring: at 92px the slice labels
+                  sat on top of the legend underneath them. */}
+              <ResponsiveContainer width="100%" height={280}>
+                <PieChart margin={{ top: 4, bottom: 24 }}>
                   <Pie
                     data={statusData} dataKey="value" nameKey="name"
-                    innerRadius={58} outerRadius={92} paddingAngle={2} stroke="#ffffff" strokeWidth={2}
+                    cy="45%"
+                    innerRadius={48} outerRadius={76} paddingAngle={2} stroke="#ffffff" strokeWidth={2}
                     label={({ name, value }) => `${name}: ${value}`}
                     labelLine={false}
                   >
                     {statusData.map((d) => <Cell key={d.key} fill={STATUS_COLOR[d.key]} />)}
                   </Pie>
                   <Tooltip formatter={(v, n) => [`${nf(v)} checks`, n]} />
-                  <Legend verticalAlign="bottom" height={24} />
+                  <Legend verticalAlign="bottom" height={28} wrapperStyle={{ paddingTop: 12 }} />
                 </PieChart>
               </ResponsiveContainer>
             </Panel>
