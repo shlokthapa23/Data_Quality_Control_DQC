@@ -1,5 +1,6 @@
 import os
-from flask import Flask, jsonify, request
+from datetime import datetime, timedelta, timezone
+from flask import Flask, Response, jsonify, request
 from flask_cors import CORS
 from dotenv import load_dotenv
 from s2d.engine import run_pipeline, run_one, run_suite
@@ -7,6 +8,7 @@ from catalog import db as catalog_db
 from connector_factory import build_connector
 from harvest import run_harvest
 from local_files import db as local_db
+import analytics_export
 from s2d import column_map as s2d_column_map
 from s2d import db as s2d_db
 from s2d.engine import run_pipeline
@@ -1569,6 +1571,19 @@ def run_s2d_pipeline(mapping_id):
 
 NULL_CHECK_TYPE = "Null Value Constraint"
 
+# Windows the dashboard offers. Approximate months as 30/90/180/365 days: the
+# question is "roughly how recently", and calendar-exact month arithmetic would
+# imply a precision the answer doesn't have.
+ANALYTICS_RANGES = {"1m": 30, "3m": 90, "6m": 180, "1y": 365, "all": None}
+
+
+def _range_cutoff(range_key):
+    """ISO cutoff for a range key, or None for 'all'."""
+    days = ANALYTICS_RANGES.get(range_key)
+    if not days:
+        return None
+    return (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+
 
 def _row_quality(results):
     """
@@ -1607,8 +1622,14 @@ def _row_quality(results):
     }
 
 
-@app.route('/api/s2d/analytics', methods=['GET'])
-def s2d_analytics():
+def _build_analytics(mapping_ids, basis, range_key, include_detail=False):
+    """
+    Everything the dashboard and its exports display, from one place - so a
+    document can never disagree with the screen because two code paths drifted.
+    include_detail adds the per-check rows, which only the workbook export wants
+    and which would otherwise bloat every dashboard load.
+    """
+    since = _range_cutoff(range_key)
     """
     Aggregated data-quality analytics.
 
@@ -1619,20 +1640,15 @@ def s2d_analytics():
     the numbers honest - clamping violations and excluding results with no row
     counts - need to be readable, and they'd be buried in a CASE expression.
     """
-    raw_ids = (request.args.get("mapping_ids") or "").strip()
-    mapping_ids = [i for i in raw_ids.split(",") if i] or None
-    basis = request.args.get("basis") or "latest"
-    if basis not in ("latest", "all"):
-        return jsonify({"error": "basis must be 'latest' or 'all'"}), 400
-
     # With no layer filter the question is "everything that has ever run", so
     # runs whose layer was later deleted belong in the answer - most of this
     # workspace's history is those. Once a layer IS named, they can't be part
     # of it, and including them would make the totals irreconcilable.
     include_orphans = mapping_ids is None
     results = s2d_db.analytics_results(
-        mapping_ids=mapping_ids, basis=basis, include_orphans=include_orphans)
-    runs = s2d_db.analytics_runs(mapping_ids=mapping_ids, include_orphans=include_orphans)
+        mapping_ids=mapping_ids, basis=basis, include_orphans=include_orphans, since=since)
+    runs = s2d_db.analytics_runs(
+        mapping_ids=mapping_ids, include_orphans=include_orphans, since=since)
 
     counts = {"pass": 0, "fail": 0, "error": 0}
     for r in results:
@@ -1692,8 +1708,10 @@ def s2d_analytics():
                      if r["total_checkpoints"] else None),
     } for r in runs]
 
-    return jsonify({
+    payload = {
         "basis": basis,
+        "range": range_key,
+        "since": since,
         "summary": {
             "checks": {**counts, "total": sum(counts.values())},
             "rows": _row_quality(results),
@@ -1719,6 +1737,91 @@ def s2d_analytics():
             "mapping_name": r["mapping_name"], "run_id": r["run_id"],
         } for r in offenders],
         "trend": trend,
+    }
+
+    if include_detail:
+        payload["checks_detail"] = [{
+            "mapping_name": r["mapping_name"], "test_name": r["test_name"],
+            "rule_target": r["rule_target"], "validation_type": r["validation_type"],
+            "status": r["status"], "violations": r["violations"],
+            "total_rows": r["total_rows"], "run_started_at": r["run_started_at"],
+        } for r in results]
+    return payload
+
+
+def _analytics_args(args):
+    """Shared parsing for the dashboard and its exports. Returns (parsed, error)."""
+    raw_ids = (args.get("mapping_ids") or "").strip()
+    mapping_ids = [i for i in raw_ids.split(",") if i] or None
+    basis = args.get("basis") or "latest"
+    if basis not in ("latest", "all"):
+        return None, "basis must be 'latest' or 'all'"
+    range_key = args.get("range") or "all"
+    if range_key not in ANALYTICS_RANGES:
+        return None, f"range must be one of {', '.join(ANALYTICS_RANGES)}"
+    return (mapping_ids, basis, range_key), None
+
+
+@app.route('/api/s2d/analytics', methods=['GET'])
+def s2d_analytics():
+    """
+    ?mapping_ids=a,b  - restrict to those test layers; omitted means all of them
+    ?basis=latest|all - latest run per layer (default) or the full history
+    ?range=1m|3m|6m|1y|all - how far back to look
+    """
+    parsed, error = _analytics_args(request.args)
+    if error:
+        return jsonify({"error": error}), 400
+    return jsonify(_build_analytics(*parsed))
+
+
+@app.route('/api/s2d/analytics/export', methods=['POST'])
+def s2d_analytics_export():
+    """
+    Body: { format, mapping_ids, basis, range, scope_layers, charts }
+
+    charts are PNG data URLs captured from the rendered dashboard - the document
+    shows the tester the same picture they were looking at, and there is no
+    second chart implementation in Python to drift away from the first.
+
+    The numbers are recomputed here from the same scope rather than trusted from
+    the request, so every figure in one document comes from a single consistent
+    read. Each export stamps its own generation time for that reason.
+    """
+    body = request.get_json(force=True) or {}
+    fmt = (body.get("format") or "").lower()
+    if fmt not in analytics_export.BUILDERS:
+        return jsonify({
+            "error": f"format must be one of {', '.join(analytics_export.BUILDERS)}",
+            "details": "A .pbix cannot be generated - the format is proprietary and has no "
+                       "authoring API. Use 'xlsx' for a Power BI-ready dataset, or 'pbids' for a "
+                       "connection file that opens Power BI against the live endpoint.",
+        }), 400
+
+    parsed, error = _analytics_args(body)
+    if error:
+        return jsonify({"error": error}), 400
+    mapping_ids, basis, range_key = parsed
+
+    try:
+        payload = _build_analytics(mapping_ids, basis, range_key, include_detail=(fmt == "xlsx"))
+        payload["scope_layers"] = body.get("scope_layers") or []
+        payload["scope_mapping_ids"] = mapping_ids or []
+        build, mimetype, extension = analytics_export.BUILDERS[fmt]
+        blob = build(payload, body.get("charts") or [])
+    except Exception as e:
+        # Some document libraries raise with an empty message (python-docx's
+        # image parser does), which would leave the tester staring at a blank
+        # reason. Fall back to the exception type so there is always something.
+        return jsonify({"error": "Couldn't build that export",
+                        "details": str(e) or type(e).__name__}), 500
+
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M")
+    filename = f"data-quality-{range_key}-{stamp}.{extension}"
+    return Response(blob, mimetype=mimetype, headers={
+        "Content-Disposition": f'attachment; filename="{filename}"',
+        # The browser needs to see the header to read the filename off it.
+        "Access-Control-Expose-Headers": "Content-Disposition",
     })
 
 

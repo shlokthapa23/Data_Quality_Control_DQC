@@ -719,7 +719,7 @@ def get_run(run_id):
         return run
 
 
-def analytics_results(mapping_ids=None, basis="latest", include_orphans=False):
+def analytics_results(mapping_ids=None, basis="latest", include_orphans=False, since=None):
     """
     The result rows a dashboard should aggregate, with their run and test layer
     attached.
@@ -741,11 +741,22 @@ def analytics_results(mapping_ids=None, basis="latest", include_orphans=False):
     if mapping_ids:
         where.append(f"r.mapping_id IN ({','.join('?' * len(mapping_ids))})")
         params.extend(mapping_ids)
+    if since:
+        where.append("r.started_at >= ?")
+        params.append(since)
     if basis == "latest":
-        # One run per layer: the most recent by started_at.
-        where.append("""r.started_at = (
-            SELECT MAX(r2.started_at) FROM s2d_test_runs r2 WHERE r2.mapping_id = r.mapping_id
+        # The most recent run per layer WITHIN the window, not the most recent
+        # overall - otherwise narrowing to "last month" would blank a layer whose
+        # newest run predates it, instead of showing that layer's newest run
+        # inside the period actually being asked about.
+        sub_where = "r2.mapping_id = r.mapping_id"
+        if since:
+            sub_where += " AND r2.started_at >= ?"
+        where.append(f"""r.started_at = (
+            SELECT MAX(r2.started_at) FROM s2d_test_runs r2 WHERE {sub_where}
         )""")
+        if since:
+            params.append(since)
     clause = f"WHERE {' AND '.join(where)}" if where else ""
     join = "LEFT JOIN" if include_orphans else "JOIN"
 
@@ -762,7 +773,7 @@ def analytics_results(mapping_ids=None, basis="latest", include_orphans=False):
         return [dict(r) for r in rows]
 
 
-def analytics_runs(mapping_ids=None, include_orphans=False):
+def analytics_runs(mapping_ids=None, include_orphans=False, since=None):
     """
     Run-level history for the trend line. Always the full history for the layers
     in scope, whatever the basis - a trend across a single run isn't a trend.
@@ -771,6 +782,9 @@ def analytics_runs(mapping_ids=None, include_orphans=False):
     if mapping_ids:
         where.append(f"r.mapping_id IN ({','.join('?' * len(mapping_ids))})")
         params.extend(mapping_ids)
+    if since:
+        where.append("r.started_at >= ?")
+        params.append(since)
     clause = f"WHERE {' AND '.join(where)}" if where else ""
     join = "LEFT JOIN" if include_orphans else "JOIN"
     with get_conn() as conn:

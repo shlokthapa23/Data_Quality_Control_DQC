@@ -230,10 +230,27 @@ export function validateS2DSql(mappingId, { target, sql }) {
 
 // Dashboard aggregates. mappingIds empty = every layer, including runs whose
 // layer was later deleted; basis 'latest' = each layer's most recent run only.
-export function fetchS2DAnalytics({ mappingIds = [], basis = 'latest' } = {}) {
-  const params = new URLSearchParams({ basis });
+export function fetchS2DAnalytics({ mappingIds = [], basis = 'latest', range = 'all' } = {}) {
+  const params = new URLSearchParams({ basis, range });
   if (mappingIds.length) params.set('mapping_ids', mappingIds.join(','));
   return request(`/api/s2d/analytics?${params}`);
+}
+
+// Returns { blob, filename } - the server names the file, so the name matches
+// the scope and stamp recorded inside the document itself.
+export async function exportS2DAnalytics(payload) {
+  const res = await fetch(`${API_BASE}/api/s2d/analytics/export`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error(body.details ? `${body.error}: ${body.details}` : (body.error || `Export failed: ${res.status}`));
+  }
+  const disposition = res.headers.get('Content-Disposition') || '';
+  const match = disposition.match(/filename="?([^"]+)"?/);
+  return { blob: await res.blob(), filename: match ? match[1] : 'data-quality-export' };
 }
 
 export function fetchS2DTestCases(mappingId) {

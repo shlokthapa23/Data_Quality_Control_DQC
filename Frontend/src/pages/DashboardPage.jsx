@@ -1,13 +1,15 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   BarChart3, Loader2, AlertCircle, CheckCircle2, XCircle, RefreshCw,
-  ChevronDown, Layers, Database, ShieldAlert,
+  ChevronDown, Layers, Database, ShieldAlert, Download, FileText, FileSpreadsheet,
+  Presentation, PlugZap,
 } from 'lucide-react';
 import {
   PieChart, Pie, Cell, BarChart, Bar, LineChart, Line,
   XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer,
 } from 'recharts';
-import { fetchS2DMappings, fetchS2DAnalytics } from '../api';
+import { fetchS2DMappings, fetchS2DAnalytics, exportS2DAnalytics } from '../api';
+import { captureCharts } from '../chartCapture';
 
 /**
  * Status colours are reserved: they mean pass/error/fail everywhere and are
@@ -30,6 +32,21 @@ const STATUS_COLOR = { PASS: '#047857', ERROR: '#CA8A04', FAIL: '#DC2626' };
 const LAYER_COLORS = ['#2a78d6', '#eb6834', '#1baf7a', '#eda100', '#e87ba4', '#008300'];
 const layerColor = (index) => LAYER_COLORS[index % LAYER_COLORS.length];
 
+// Kept in step with ANALYTICS_RANGES in app.py.
+// A .pbix is not here on purpose: the format is proprietary with no authoring
+// API, so the honest Power BI answer is a dataset plus a connection file.
+const EXPORT_FORMATS = [
+  ['pdf', 'PDF report', FileText, 'Charts and tables, ready to send'],
+  ['docx', 'Word document', FileText, 'Editable write-up with the same figures'],
+  ['pptx', 'PowerPoint deck', Presentation, 'One chart per slide, for a walkthrough'],
+  ['xlsx', 'Power BI dataset (Excel)', FileSpreadsheet, 'One row per check - import and build visuals'],
+  ['pbids', 'Power BI connection file', PlugZap, 'Opens Power BI against the live data'],
+];
+
+const RANGES = [
+  ['1m', 'Last month'], ['3m', '3 months'], ['6m', '6 months'], ['1y', '1 year'], ['all', 'All time'],
+];
+
 const AXIS = { stroke: '#94a3b8', fontSize: 11 };
 const GRID = { stroke: '#e2e8f0', strokeDasharray: '3 3' };
 
@@ -50,7 +67,10 @@ function Panel({ title, hint, isEmpty, emptyNote, children, className = '' }) {
     // width stay 927px inside a 513px column and push the page sideways.
     // overflow-x-auto is the belt to that braces - anything still too wide
     // scrolls inside its own card rather than scrolling the whole page.
-    <div className={`bg-white border border-slate-200 rounded-xl shadow-sm p-4 min-w-0 ${className}`}>
+    <div
+      data-chart-title={title}
+      className={`bg-white border border-slate-200 rounded-xl shadow-sm p-4 min-w-0 ${className}`}
+    >
       <h4 className="text-xs font-bold text-slate-400 uppercase tracking-wider">{title}</h4>
       {hint && <p className="text-[11px] text-slate-400 mt-0.5">{hint}</p>}
       <div className="mt-3 min-w-0 overflow-x-auto">
@@ -161,6 +181,7 @@ export default function DashboardPage() {
   const [layers, setLayers] = useState([]);
   const [selected, setSelected] = useState([]);
   const [basis, setBasis] = useState('latest');
+  const [range, setRange] = useState('all');
   const [data, setData] = useState(null);
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState(null);
@@ -169,12 +190,12 @@ export default function DashboardPage() {
   // in an effect body, and a stale response must never overwrite a newer one.
   const requestRef = useRef(0);
 
-  const load = useCallback(async (mappingIds, nextBasis) => {
+  const load = useCallback(async (mappingIds, nextBasis, nextRange) => {
     const seq = ++requestRef.current;
     setIsLoading(true);
     setError(null);
     try {
-      const result = await fetchS2DAnalytics({ mappingIds, basis: nextBasis });
+      const result = await fetchS2DAnalytics({ mappingIds, basis: nextBasis, range: nextRange });
       if (seq === requestRef.current) { setData(result); setIsLoading(false); }
     } catch (err) {
       if (seq === requestRef.current) { setError(err.message); setIsLoading(false); }
@@ -190,12 +211,48 @@ export default function DashboardPage() {
     // would run its setIsLoading synchronously during the effect, which is
     // exactly the cascading-render pattern this repo lints against. isLoading
     // already starts true, so nothing flickers.
-    Promise.resolve().then(() => load([], 'latest'));
+    Promise.resolve().then(() => load([], 'latest', 'all'));
     return () => { cancelled = true; };
   }, [load]);
 
-  const applySelection = (next) => { setSelected(next); load(next, basis); };
-  const applyBasis = (next) => { setBasis(next); load(selected, next); };
+  const applySelection = (next) => { setSelected(next); load(next, basis, range); };
+  const applyBasis = (next) => { setBasis(next); load(selected, next, range); };
+  const applyRange = (next) => { setRange(next); load(selected, basis, next); };
+
+  const [exporting, setExporting] = useState(null);
+  const [exportOpen, setExportOpen] = useState(false);
+  const [exportError, setExportError] = useState(null);
+
+  const runExport = async (format) => {
+    setExporting(format);
+    setExportError(null);
+    setExportOpen(false);
+    try {
+      // The workbook and the connection file carry no pictures, so don't pay
+      // the capture cost for them.
+      const charts = ['pdf', 'docx', 'pptx'].includes(format) ? await captureCharts() : [];
+      const { blob, filename } = await exportS2DAnalytics({
+        format,
+        mapping_ids: selected.join(','),
+        basis,
+        range,
+        scope_layers: selected.map((id) => layers.find((l) => l.id === id)?.name).filter(Boolean),
+        charts,
+      });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+    } catch (err) {
+      setExportError(err.message);
+    } finally {
+      setExporting(null);
+    }
+  };
 
   const summary = data?.summary;
   const checks = summary?.checks;
@@ -258,8 +315,23 @@ export default function DashboardPage() {
           </p>
         </div>
 
-        <div className="flex items-center gap-2 shrink-0">
+        <div className="flex flex-wrap items-center gap-2 shrink-0">
           <LayerPicker layers={layers} selected={selected} onChange={applySelection} />
+
+          <div className="flex rounded-lg border border-slate-300 overflow-hidden">
+            {RANGES.map(([value, text]) => (
+              <button
+                key={value}
+                onClick={() => applyRange(value)}
+                title={value === 'all' ? 'Every run ever recorded' : `Runs started in the last ${text.toLowerCase()}`}
+                className={`px-2.5 py-1.5 text-xs ${
+                  range === value ? 'bg-mastek-primary text-white' : 'bg-white text-slate-600 hover:bg-slate-50'
+                }`}
+              >
+                {text}
+              </button>
+            ))}
+          </div>
           {/* Latest describes the data as it is now; All is the honest view when
               a layer has only been run once or twice. */}
           <div className="flex rounded-lg border border-slate-300 overflow-hidden">
@@ -276,12 +348,46 @@ export default function DashboardPage() {
             ))}
           </div>
           <button
-            onClick={() => load(selected, basis)}
+            onClick={() => load(selected, basis, range)}
             title="Reload"
             className="p-2 text-slate-500 border border-slate-300 rounded-lg hover:bg-slate-50"
           >
             <RefreshCw className="w-3.5 h-3.5" />
           </button>
+
+          <div className="relative">
+            <button
+              onClick={() => setExportOpen((v) => !v)}
+              disabled={!!exporting || !summary || (summary.checks?.total ?? 0) === 0}
+              className="flex items-center gap-2 px-3 py-1.5 text-sm font-medium text-white bg-mastek-primary rounded-lg hover:brightness-110 disabled:opacity-50"
+            >
+              {exporting
+                ? <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                : <Download className="w-3.5 h-3.5" />}
+              {exporting ? 'Preparing...' : 'Download'}
+            </button>
+
+            {exportOpen && (
+              <div className="absolute right-0 z-20 mt-1 w-80 bg-white border border-slate-200 rounded-lg shadow-lg p-1">
+                {EXPORT_FORMATS.map(([value, label, Icon, hint]) => (
+                  <button
+                    key={value}
+                    onClick={() => runExport(value)}
+                    className="w-full flex items-start gap-2.5 px-2.5 py-2 text-left rounded hover:bg-slate-50"
+                  >
+                    <Icon className="w-4 h-4 text-mastek-primary shrink-0 mt-0.5" />
+                    <span className="min-w-0">
+                      <span className="block text-sm text-slate-700">{label}</span>
+                      <span className="block text-[11px] text-slate-400">{hint}</span>
+                    </span>
+                  </button>
+                ))}
+                <p className="px-2.5 py-2 text-[11px] text-slate-400 border-t border-slate-100">
+                  Exports cover exactly what is on screen &mdash; the same layers, window and charts.
+                </p>
+              </div>
+            )}
+          </div>
         </div>
       </div>
 
@@ -293,9 +399,9 @@ export default function DashboardPage() {
         </p>
       )}
 
-      {error && (
+      {(error || exportError) && (
         <p className="flex items-start gap-2 text-sm text-red-600 bg-red-50 border border-red-200 rounded-lg px-3 py-2">
-          <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" /> {error}
+          <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" /> {error || exportError}
         </p>
       )}
 
