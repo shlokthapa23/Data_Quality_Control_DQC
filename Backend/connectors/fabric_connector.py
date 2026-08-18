@@ -21,6 +21,25 @@ ATTACHED_DB_ALIAS = "fabric_db"
 # A Fabric job instance is finished in every state except these two.
 PIPELINE_ACTIVE_STATUSES = ("NotStarted", "InProgress")
 
+# Lakehouses Fabric creates for ITSELF, which are type "Lakehouse" like any
+# other and so survive a plain type filter. Every Dataflow Gen2 configuration
+# spawns a StagingLakehouseForDataflows_<timestamp>, so a workspace that uses
+# dataflows accumulates them indefinitely - one workspace here already has four,
+# outnumbering the Lakehouses anyone would actually validate. They hold Fabric's
+# intermediate spill, never user data, so offering them as a validation target
+# is offering somewhere a test can only ever be meaningless.
+FABRIC_INTERNAL_LAKEHOUSE_PREFIXES = (
+    "staginglakehousefordataflows",
+    "dataflowsstaginglakehouse",
+    "dataflowsstagingwarehouse",
+)
+
+
+def is_fabric_internal_container(name):
+    """True for a Lakehouse Fabric created for its own plumbing."""
+    lowered = (name or "").strip().lower()
+    return any(lowered.startswith(p) for p in FABRIC_INTERNAL_LAKEHOUSE_PREFIXES)
+
 # Microsoft Fabric currently refuses to let a service principal refresh a
 # Dataflow Gen2 at all: the trigger POST succeeds (a job instance is created)
 # but the run itself always fails with this exact message, regardless of the
@@ -256,14 +275,21 @@ class FabricConnector(BaseConnector):
         items = self._api_get(f"/workspaces/{self.workspace_id}/items")
         return [
             AssetItem(id=i.get("id"), name=i.get("displayName"), type=i.get("type", "Other"))
-            for i in items if i.get("type") == "Lakehouse"
+            for i in items
+            if i.get("type") == "Lakehouse" and not is_fabric_internal_container(i.get("displayName"))
         ]
 
     def list_containers(self):
         """
-        S2D-facing container list - only the pinned Lakehouses, once
-        pinning has been configured via the Connect page. Falls back to
-        every Lakehouse in the workspace if nothing's pinned yet.
+        S2D-facing container list - only the pinned Lakehouses, once pinning has
+        been configured via the Connect page. Falls back to every Lakehouse in
+        the workspace if nothing's pinned yet.
+
+        Fabric's own staging Lakehouses are excluded from the fallback: they are
+        real Lakehouses by type, but they hold dataflow spill rather than data
+        anyone would validate, and a workspace that uses Dataflow Gen2 breeds
+        them. An explicitly pinned one is still honoured - if somebody
+        deliberately pinned it, that is their call to make, not this list's.
         """
         if self.allowed_containers:
             return [
@@ -272,7 +298,8 @@ class FabricConnector(BaseConnector):
             ]
         return [
             {"id": i.id, "name": i.name, "type": "Lakehouse"}
-            for i in self.list_items() if i.type == "Lakehouse"
+            for i in self.list_items()
+            if i.type == "Lakehouse" and not is_fabric_internal_container(i.name)
         ]
 
     def _build_table_entry(self, con, schema, name, kind):
