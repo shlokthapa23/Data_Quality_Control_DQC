@@ -2,6 +2,8 @@ import time
 from datetime import datetime, timezone
 
 from s2d import column_map
+from collections import Counter
+
 from s2d import db as s2d_db
 
 
@@ -621,6 +623,157 @@ def _run_categorical_parity(mapping, source_connector, destination_connector,
     return ("PASS" if passed else "FAIL"), evaluated_query, details, None, rule_target, violations, total_rows
 
 
+ALL_COLUMNS = "*"
+
+# Whole-row comparison pulls both sides into memory to diff them, so it needs a
+# ceiling. Past this it stops and names the check to use instead, rather than
+# stalling the run or quietly comparing a truncated slice - a parity check that
+# silently compared half a table would be worse than no check at all.
+MAX_ROWS_PER_SIDE = 100000
+
+
+def _normalise_cell(value):
+    """
+    One text form per value, so 5 and "5" - or a DATE and a TIMESTAMP at
+    midnight - don't read as a mismatch just because the two systems typed them
+    differently. Mirrors the date handling the single-key path already does.
+    """
+    if value is None:
+        return ""
+    text = str(value).strip()
+    if len(text) == 19 and text[4:5] == "-" and text.endswith("00:00:00"):
+        return text[:10]                      # midnight timestamp == that date
+    if text.endswith(".0"):                   # 5.0 from a float vs 5 from an int
+        head = text[:-2]
+        if head.lstrip("-").isdigit():
+            return head
+    return text
+
+
+def _rename_to_common(mapping, side, table, row):
+    """
+    Re-key one row by the validation's common names wherever the column map
+    covers this table, so "OrderID" here and "order_no" there line up. Columns
+    the map doesn't mention keep their own name.
+    """
+    names = column_map.common_names(mapping, side, [table])
+    if not names:
+        return row
+    physical_to_common = {}
+    for common in names:
+        physical = column_map.physical_column(mapping, side, table, common)
+        if physical:
+            physical_to_common[physical] = common
+    return {physical_to_common.get(k, k): v for k, v in row.items()}
+
+
+def _collect_side(connector, container_id, tables, mapping, side):
+    """
+    Every row of every selected table on one side, keyed by common name.
+    Returns (rows, error).
+
+    One query per table rather than a UNION: the selected tables need not share
+    a shape, and unioning mismatched shapes is exactly the kind of silent wrong
+    answer this check exists to catch.
+    """
+    rows = []
+    for table in tables:
+        try:
+            fetched = connector.run_query_all(container_id, "SELECT * FROM " + table)
+        except Exception as e:
+            return None, "%s query failed on %s: %s" % (side.capitalize(), table, e)
+        rows.extend(_rename_to_common(mapping, side, table, r) for r in fetched)
+        if len(rows) > MAX_ROWS_PER_SIDE:
+            return None, (
+                "The %s side has more than %s rows, which is too many to compare row by row. "
+                "Use Row count match for volume, or Column parity on a key column - both "
+                "compare without transporting every row." % (side, format(MAX_ROWS_PER_SIDE, ",")))
+    return rows, None
+
+
+def _run_full_row_parity(tc, mapping, source_connector, destination_connector):
+    """
+    Does every row exist, identically, on both sides - across ALL columns?
+
+    The single-key mode answers "is every key present". This answers "did the
+    data arrive unchanged", which is the question a tester actually has after a
+    load. Rows are compared as MULTISETS, so a row duplicated on one side only
+    counts as a difference instead of being absorbed by set semantics.
+
+    Only columns present on both sides are compared, and any skipped are named:
+    a destination carrying an extra audit column shouldn't fail every row, but
+    nobody should have to guess that it was ignored.
+    """
+    source_tables = tc["source_target_tables"]
+    destination_tables = tc["destination_target_tables"]
+    rule_target = "%s -> %s (all columns)" % (", ".join(source_tables), ", ".join(destination_tables))
+    evaluated_query = "[source] SELECT * FROM %s  |  [destination] SELECT * FROM %s" % (
+        ", ".join(source_tables), ", ".join(destination_tables))
+
+    source_rows, error = _collect_side(
+        source_connector, mapping["source_container_id"], source_tables, mapping, "source")
+    if error:
+        return "ERROR", evaluated_query, None, error, rule_target, None, None
+    destination_rows, error = _collect_side(
+        destination_connector, mapping["destination_container_id"], destination_tables,
+        mapping, "destination")
+    if error:
+        return "ERROR", evaluated_query, None, error, rule_target, None, None
+
+    if not source_rows and not destination_rows:
+        return ("PASS", evaluated_query, "Both sides are empty - nothing to compare.",
+                None, rule_target, 0, 0)
+
+    source_columns = set().union(*(r.keys() for r in source_rows)) if source_rows else set()
+    destination_columns = set().union(*(r.keys() for r in destination_rows)) if destination_rows else set()
+    shared = sorted(source_columns & destination_columns)
+    if not shared:
+        return ("ERROR", evaluated_query, None,
+                "The two sides share no column names, so their rows can't be lined up. "
+                "Map the columns first, or compare a single key column instead.",
+                rule_target, None, None)
+
+    def fingerprint(row):
+        return tuple(_normalise_cell(row.get(c)) for c in shared)
+
+    source_counts = Counter(fingerprint(r) for r in source_rows)
+    destination_counts = Counter(fingerprint(r) for r in destination_rows)
+    missing = source_counts - destination_counts
+    extra = destination_counts - source_counts
+
+    missing_total = sum(missing.values())
+    extra_total = sum(extra.values())
+    matched = len(source_rows) - missing_total
+    skipped = sorted((source_columns | destination_columns) - set(shared))
+
+    def sample(counter, n=3):
+        out = []
+        for row in list(counter)[:n]:
+            pairs = ", ".join("%s=%s" % (c, v) for c, v in zip(shared, row) if v != "")
+            out.append("(" + pairs[:120] + ")")
+        return "; ".join(out)
+
+    if not missing_total and not extra_total:
+        details = ("All %s rows are present on both sides, identical across %d compared column(s)."
+                   % (format(len(source_rows), ","), len(shared)))
+    else:
+        parts = ["%s of %s source rows matched" % (format(matched, ","), format(len(source_rows), ","))]
+        if missing_total:
+            parts.append("%s row(s) missing from destination e.g. %s"
+                         % (format(missing_total, ","), sample(missing)))
+        if extra_total:
+            parts.append("%s row(s) in destination with no source match e.g. %s"
+                         % (format(extra_total, ","), sample(extra)))
+        details = ". ".join(parts) + "."
+    if skipped:
+        details += (" Columns on only one side, so not compared: %s%s."
+                    % (", ".join(skipped[:8]), " ..." if len(skipped) > 8 else ""))
+
+    passed = not missing_total and not extra_total
+    return (("PASS" if passed else "FAIL"), evaluated_query, details, None, rule_target,
+            missing_total + extra_total, len(source_rows))
+
+
 def _run_cross_table_parity_check(tc, mapping, source_connector, destination_connector):
     """
     Engine-computed key-based existence check: fetches the full set of
@@ -638,6 +791,9 @@ def _run_cross_table_parity_check(tc, mapping, source_connector, destination_con
     AND per table below, which is what makes "3 source tables + 1 destination,
     same data under different column names" checkable.
     """
+    if tc.get("key_column") == ALL_COLUMNS:
+        return _run_full_row_parity(tc, mapping, source_connector, destination_connector)
+
     key_column = tc["key_column"]
     source_tables = tc["source_target_tables"]
     destination_tables = tc["destination_target_tables"]
@@ -675,16 +831,22 @@ def _run_cross_table_parity_check(tc, mapping, source_connector, destination_con
     def _sample(values, n=5):
         return ", ".join(str(v) for v in list(values)[:n])
 
-    details_parts = []
-    if missing_in_destination:
-        details_parts.append(
-            f"{len(missing_in_destination)} key(s) in source missing from destination (e.g. {_sample(missing_in_destination)})"
-        )
-    if extra_in_destination:
-        details_parts.append(
-            f"{len(extra_in_destination)} key(s) in destination with no matching source row (e.g. {_sample(extra_in_destination)})"
-        )
-    details = "; ".join(details_parts) if details_parts else f"all {len(source_keys)} key(s) matched on both sides"
+    # Say what held, not only what broke: a bare count reads as a warning even
+    # when everything is fine.
+    if passed:
+        details = "All %s '%s' values are present on both sides." % (
+            format(len(source_keys), ","), key_column)
+    else:
+        matched = len(source_keys) - len(missing_in_destination)
+        parts = ["%s of %s source '%s' values matched" % (
+            format(matched, ","), format(len(source_keys), ","), key_column)]
+        if missing_in_destination:
+            parts.append("%s missing from destination (e.g. %s)" % (
+                format(len(missing_in_destination), ","), _sample(missing_in_destination)))
+        if extra_in_destination:
+            parts.append("%s in destination with no source row (e.g. %s)" % (
+                format(len(extra_in_destination), ","), _sample(extra_in_destination)))
+        details = ". ".join(parts) + "."
 
     violations = len(missing_in_destination) + len(extra_in_destination)
     total_rows = len(source_keys)

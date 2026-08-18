@@ -1110,8 +1110,11 @@ const [tab, setTab] = useState('ai'); // 'ai' | 'manual'
         : [...f[tablesField], table];
       const sourceTables = side === 'source' ? nextTables : f.sourceTargetTables;
       const destinationTables = side === 'destination' ? nextTables : f.destinationTargetTables;
-      const stillValid = commonColumns(sourceSchema, sourceTables).some((c) => c.name === f.keyColumn)
-        && commonColumns(destinationSchema, destinationTables).some((c) => c.name === f.keyColumn);
+      // '*' is whole-row mode - it doesn't name a column, so changing the
+      // table selection can never invalidate it.
+      const stillValid = f.keyColumn === '*'
+        || (commonColumns(sourceSchema, sourceTables).some((c) => c.name === f.keyColumn)
+          && commonColumns(destinationSchema, destinationTables).some((c) => c.name === f.keyColumn));
       return { ...f, [tablesField]: nextTables, keyColumn: stillValid ? f.keyColumn : '' };
     });
   };
@@ -1851,10 +1854,21 @@ const [tab, setTab] = useState('ai'); // 'ai' | 'manual'
           {isCrossTableParity && (
             <div className="space-y-3">
               <p className="text-sm text-slate-500">
-                Fetches every {form.keyColumn ? <code className="font-mono text-xs">{form.keyColumn}</code> : 'key column'} value
-                from the source table(s) and the destination table(s) separately, then verifies every source
-                row's key actually exists in the destination (and vice versa) - a real existence check, not
-                a free-form SQL script.
+                {form.keyColumn === '*' ? (
+                  <>
+                    Compares <strong>whole rows across every shared column</strong>: each side is read
+                    separately and the rows are matched as multisets, so a changed value, a missing row or
+                    a duplicate on one side only all show up. Columns that exist on just one side are
+                    listed and skipped rather than failing every row.
+                  </>
+                ) : (
+                  <>
+                    Fetches every {form.keyColumn ? <code className="font-mono text-xs">{form.keyColumn}</code> : 'key column'} value
+                    from the source table(s) and the destination table(s) separately, then verifies every source
+                    row&rsquo;s key actually exists in the destination (and vice versa) - a real existence check, not
+                    a free-form SQL script.
+                  </>
+                )}
               </p>
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                 <div className="space-y-1">
@@ -1889,6 +1903,11 @@ const [tab, setTab] = useState('ai'); // 'ai' | 'manual'
                     ? 'No shared key column - try Map Columns'
                     : 'Select key column'}
                 </option>
+                {/* Whole-row mode needs no shared key, only shared columns, so
+                    it is offered as soon as both sides have tables. */}
+                {form.sourceTargetTables.length > 0 && form.destinationTargetTables.length > 0 && (
+                  <option value="*">All columns - compare whole rows</option>
+                )}
                 {crossParityKeyColumns.map((c) => (
                   <option key={c.name} value={c.name}>{c.name} ({c.data_type})</option>
                 ))}
