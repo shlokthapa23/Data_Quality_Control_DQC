@@ -21,6 +21,36 @@ ATTACHED_DB_ALIAS = "fabric_db"
 # A Fabric job instance is finished in every state except these two.
 PIPELINE_ACTIVE_STATUSES = ("NotStarted", "InProgress")
 
+# Microsoft Fabric currently refuses to let a service principal refresh a
+# Dataflow Gen2 at all: the trigger POST succeeds (a job instance is created)
+# but the run itself always fails with this exact message, regardless of the
+# SP's role - there is no permission that fixes it. Confirmed against a live
+# workspace (SPN-triggered runs on the same dataflow failed with this message
+# every time, interleaved with portal/delegated-login runs that completed
+# fine minutes apart) and against Microsoft's own docs, which list under
+# Dataflow Gen2 API limitations: "Service principal authentication isn't
+# supported... you can invoke Run APIs, but the actual run never succeeds."
+# https://learn.microsoft.com/en-us/fabric/data-factory/dataflow-gen2-public-apis#current-limitations
+_SPN_DATAFLOW_REFRESH_BLOCKED = "spn based refresh is not allowed"
+
+
+def _translate_failure_reason(message):
+    """
+    Rewrites Fabric's own failure text into something actionable when it's a
+    known, unfixable-by-config platform limitation - otherwise passed through
+    unchanged. The original Fabric message is kept in parentheses rather than
+    replaced outright, so nothing is hidden from someone who wants the raw text.
+    """
+    if message and _SPN_DATAFLOW_REFRESH_BLOCKED in message.lower():
+        return (
+            "Fabric doesn't allow a service principal to refresh a Dataflow Gen2 - this is a "
+            "current Fabric platform limitation, not a problem with this connector's permissions, "
+            "and it will fail every time it's triggered from here. Refresh this dataflow manually "
+            "in the Fabric portal (your own sign-in) or via Fabric's own native scheduled refresh "
+            f"instead. (Fabric said: {message})"
+        )
+    return message
+
 
 def _pipeline_run_to_dict(payload):
     """
@@ -44,7 +74,7 @@ def _pipeline_run_to_dict(payload):
         "started_at": payload.get("startTimeUtc"),
         "finished_at": payload.get("endTimeUtc"),
         "invoke_type": payload.get("invokeType"),
-        "failure_reason": failure_message,
+        "failure_reason": _translate_failure_reason(failure_message),
     }
 
 

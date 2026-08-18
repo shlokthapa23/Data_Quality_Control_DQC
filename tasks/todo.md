@@ -26,6 +26,7 @@ Backend imports clean, frontend lints at its **9-problem baseline** (all pre-exi
 - A 29-column checksum SQL for the "all data arrived perfectly" proof was offered and never generated.
 - `Isolate Bad Rows`, Trends and Scorecard are disabled stubs — they read as broken features on screen during a demo.
 - **There are no automated tests.** Everything has been verified by hand. The throwaway verification scripts written this session (parity metric matrix, sqlLint cases, SELECT-guard accept/reject table, schedule CRUD + the three silent spots) already encode the hard parts and would convert to pytest cheaply. Recommended next investment after committing.
+- **Dataflow Gen2 items can never be triggered successfully by this connector's service principal** — a current, unconditional Fabric platform limitation (see below and `tasks/lessons.md` 2026-08-18), not something fixable here. Data Pipelines are unaffected.
 
 ## What went into which commit
 
@@ -47,6 +48,16 @@ Everything from **"Custom SQL now shows the numbers your query computed"** downw
 - `catalog.db` and `local_data_*.duckdb` are no longer tracked — real runtime data, not code.
 
 ## Feature changelog (newest first)
+
+### Dataflow Gen2 SPN-refresh failures now explain themselves — 2026-08-18
+
+Reported: `DF_Filter_Staff_Data` (a Dataflow Gen2) failed every time it was triggered from the Pipelines tab with `"SPN based refresh is not allowed for the dataflow with id ..."`, yet refreshed fine from the Fabric portal.
+
+**Root cause is a current Microsoft Fabric platform limitation, confirmed two ways**: Fabric's own docs list under Dataflow Gen2 API limitations *"Service principal authentication isn't supported... you can invoke Run APIs, but the actual run never succeeds"*, and a live Microsoft `fabric-cicd` GitHub issue (#971) hits the identical error even from inside a pipeline's Dataflow activity. **No service-principal role fixes it** — verified against this connector's own run history, where SPN-triggered `Failed` runs and portal-triggered (delegated login) `Completed` runs on the *same* dataflow interleaved minutes apart. This only affects Dataflow Gen2 items; Data Pipelines trigger via SPN fine (already relied on since the 2026-08-12 Pipelines tab).
+
+Since it can't be fixed, the failure now explains itself instead of surfacing Fabric's bare string. `_translate_failure_reason` in `connectors/fabric_connector.py` rewrites this one known message into an actionable explanation, applied inside `_pipeline_run_to_dict` — the single place every consumer (manual run status poll, run history list, and the pipeline scheduler's stored outcome) reads a job's `failure_reason` through, so one change covers all three. The original Fabric text is kept in parentheses rather than replaced, so nothing is hidden from someone who wants the raw error.
+
+**Verified**: re-fetched this dataflow's real run history from the live backend after the change — every historical `Failed` entry now carries the translated message with the original Fabric text intact in parentheses; `Completed` entries are untouched (`failure_reason: null`). No other pipeline/dataflow error paths changed.
 
 ### Data Quality Dashboard — 2026-08-17
 
