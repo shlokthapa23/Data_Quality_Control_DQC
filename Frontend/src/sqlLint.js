@@ -155,7 +155,18 @@ export function lintSql(sql, { scope } = {}) {
   if (scope === 'dual_script' && !mentionsColumn(selectList(code), 'value')) {
     // One column is unambiguous and the engine just uses it. Several columns
     // with no `value` is the case it can't resolve.
-    if (selectListSize(code) > 1) {
+    // SELECT * is ONE expression, so the several-columns check below never
+    // caught it - and it is the most likely thing to type. A tester hit this
+    // for real: `SELECT * FROM staff` on both sides passed the linter in
+    // silence, then failed at run time with "returns 20 columns and none is
+    // named value".
+    if (/^\s*\*/.test(selectList(code))) {
+      hints.push(
+        'SELECT * returns every column, but this check compares ONE value per side. '
+        + 'Return a single number instead - e.g. SELECT COUNT(*) - or use the '
+        + 'Row count match / Column parity check types to compare whole tables.'
+      );
+    } else if (selectListSize(code) > 1) {
       hints.push(
         'Several columns and none named "value" — the check won\'t know which to '
         + 'compare. Add AS value to the one you mean.'
