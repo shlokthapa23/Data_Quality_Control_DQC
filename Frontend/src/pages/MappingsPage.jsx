@@ -101,6 +101,18 @@ function EndpointPicker({ label, connectors, endpoint, onChange }) {
 
         <ListFilter
           value={query} onChange={setQuery} total={tables.length} shown={visibleTables.length}
+          selectedCount={endpoint.tables.length}
+          allSelected={visibleTables.length > 0 && visibleTables.every((t) => endpoint.tables.includes(t.name))}
+          someSelected={visibleTables.some((t) => endpoint.tables.includes(t.name))}
+          onSelectAll={(on) => {
+            const names = visibleTables.map((t) => t.name);
+            onChange({
+              ...endpoint,
+              tables: on
+                ? [...new Set([...endpoint.tables, ...names])]
+                : endpoint.tables.filter((t) => !names.includes(t)),
+            });
+          }}
         />
 
         <div className="border border-slate-300 rounded-lg max-h-40 overflow-y-auto">
@@ -174,34 +186,20 @@ function EditableTableList({ label, options, selected, usage, onToggle }) {
 
   return (
     <div>
-      <div className="flex items-center gap-2 mb-1">
-        <p className="text-[11px] font-bold text-slate-400 uppercase tracking-wider">{label}</p>
-        <span className="text-[11px] text-slate-400">{selected.size} selected</span>
-        {options.length > 1 && (
-          <label className="ml-auto flex items-center gap-1.5 text-[11px] text-slate-500 cursor-pointer">
-            <input
-              type="checkbox"
-              checked={options.every((t) => selected.has(t.name))}
-              ref={(el) => {
-                if (el) {
-                  el.indeterminate = options.some((t) => selected.has(t.name))
-                    && !options.every((t) => selected.has(t.name));
-                }
-              }}
-              onChange={() => onToggle(
-                options.every((t) => selected.has(t.name)) ? [] : options.map((t) => t.name),
-              )}
-              title="Selects every table in this container, not just the filtered ones"
-              className="rounded border-slate-300 text-mastek-primary focus:ring-mastek-accent"
-            />
-            Select all
-          </label>
-        )}
-      </div>
+      <p className="text-[11px] font-bold text-slate-400 uppercase tracking-wider mb-1">{label}</p>
 
       <ListFilter
         value={query} onChange={setQuery} total={options.length} shown={visible.length}
         className="mb-1.5"
+        selectedCount={selected.size}
+        allSelected={visible.length > 0 && visible.every((t) => selected.has(t.name))}
+        someSelected={visible.some((t) => selected.has(t.name))}
+        onSelectAll={(on) => {
+          const names = visible.map((t) => t.name);
+          const next = new Set(selected);
+          names.forEach((n) => (on ? next.add(n) : next.delete(n)));
+          onToggle([...next]);
+        }}
       />
 
       <div className="border border-slate-200 rounded-lg max-h-44 overflow-y-auto bg-white">

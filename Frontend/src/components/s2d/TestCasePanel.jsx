@@ -16,7 +16,8 @@ import { lintSql } from '../../sqlLint';
 import { formatRowCount, rowCountStyle, rowCountTitle } from '../../rowCount';
 import { ListFilter } from '../common/ListFilter';
 import { filterByName, noMatchNote } from '../../listFilter';
-import ColumnMapModal from './ColumnMapModal';
+import ColumnMapModal from './ColumnMapModal';
+import SqlSuggest from './SqlSuggest';
 
 const SEVERITY_STYLES = {
   critical: 'bg-red-100 text-red-700',
@@ -395,10 +396,22 @@ function SqlEditorFooter({ hints, onCheck, checkState }) {
 function TableCheckboxList({ tables, selected, onToggle, rowCounts = {} }) {
   const [query, setQuery] = useState('');
   const visible = filterByName(tables, query);
+  const allVisibleSelected = visible.length > 0 && visible.every((t) => selected.includes(t));
   return (
     <div className="space-y-1.5">
       <ListFilter
         value={query} onChange={setQuery} total={tables.length} shown={visible.length}
+        selectedCount={selected.length}
+        allSelected={allVisibleSelected}
+        someSelected={visible.some((t) => selected.includes(t))}
+        // Acts on the filtered set, so "select all 3 shown" means exactly that.
+        // Built from the per-item onToggle rather than a bespoke handler at each
+        // of the twelve call sites: every one of those toggles is a functional
+        // setState ((prev) => ...), so a run of them composes correctly under
+        // React's batching and there is no second code path to keep in step.
+        onSelectAll={(on) => visible
+          .filter((t) => selected.includes(t) !== on)
+          .forEach((t) => onToggle(t))}
       />
       <div className="border border-slate-300 rounded-lg max-h-32 overflow-y-auto">
       {tables.length === 0 && <p className="text-sm text-slate-400 italic px-3 py-2">No tables</p>}
@@ -1126,6 +1139,26 @@ const [tab, setTab] = useState('ai'); // 'ai' | 'manual'
   const customSqlTableOptions = sharesConnection
     ? [...new Set([...mapping.source_tables, ...mapping.destination_tables])]
     : targetTableOptions;
+
+  /**
+   * Names a script on this side may legitimately reference. When the two sides
+   * share a connection the tester can join across them, so both schemas are
+   * offered - the same rule the table picker already follows.
+   */
+  const suggestFor = (side) => {
+    const schema = sharesConnection
+      ? [...sourceSchema, ...destinationSchema]
+      : (side === 'destination' ? destinationSchema : sourceSchema);
+    const columnsByTable = {};
+    schema.forEach((t) => { columnsByTable[t.name] = t.columns || []; });
+    return {
+      tables: [...new Set(schema.map((t) => t.name))],
+      columnsByTable,
+      // A common name resolves to a different physical column per table, so
+      // someone writing free SQL needs to see them beside the real ones.
+      commonNames: (mapping.column_map || []).map((c) => c.name).filter(Boolean),
+    };
+  };
 
   const handlePrebuiltChange = (key) => {
     setPrebuiltKey(key);
@@ -1918,13 +1951,13 @@ const [tab, setTab] = useState('ai'); // 'ai' | 'manual'
                         Copy to destination <ArrowRight className="w-3 h-3" />
                       </button>
                     </div>
-                    <textarea
+                    <SqlSuggest
                       value={form.scriptText}
-                      onChange={(e) => setScript('source', e.target.value)}
+                      onChange={(v) => setScript('source', v)}
                       rows={9}
-                      spellCheck={false}
                       placeholder={DUAL_SCRIPT_PLACEHOLDER_SOURCE}
                       className="w-full px-3 py-2 text-xs font-mono border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-mastek-accent"
+                      {...suggestFor('source')}
                     />
                     <SqlEditorFooter
                       hints={sourceHints}
@@ -1947,13 +1980,13 @@ const [tab, setTab] = useState('ai'); // 'ai' | 'manual'
                         <ArrowLeft className="w-3 h-3" /> Copy to source
                       </button>
                     </div>
-                    <textarea
+                    <SqlSuggest
                       value={form.destinationScriptText}
-                      onChange={(e) => setScript('destination', e.target.value)}
+                      onChange={(v) => setScript('destination', v)}
                       rows={9}
-                      spellCheck={false}
                       placeholder={DUAL_SCRIPT_PLACEHOLDER_DESTINATION}
                       className="w-full px-3 py-2 text-xs font-mono border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-mastek-accent"
+                      {...suggestFor('destination')}
                     />
                     <SqlEditorFooter
                       hints={destinationHints}
@@ -2018,11 +2051,14 @@ const [tab, setTab] = useState('ai'); // 'ai' | 'manual'
                     </label>
                   </div>
 
-                  <textarea
+                  <SqlSuggest
                     value={form.scriptText}
-                    onChange={(e) => setScript('single', e.target.value)}
+                    onChange={(v) => setScript('single', v)}
                     placeholder={form.scriptType === 'sql' ? SQL_PLACEHOLDER : 'def validate(df):\n    ...'}
                     className="w-full h-40 bg-slate-950 text-slate-100 border border-slate-800 rounded-lg p-4 text-sm font-mono placeholder-slate-600 focus:outline-none focus:ring-2 focus:ring-mastek-accent"
+                    {...(form.scriptType === 'sql'
+                      ? suggestFor(form.target)
+                      : { tables: [], columnsByTable: {}, commonNames: [] })}
                   />
                   {/* PySpark isn't executable yet, so there's nothing to parse it against. */}
                   {form.scriptType === 'sql' && (
