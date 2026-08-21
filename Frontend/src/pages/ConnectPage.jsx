@@ -4,8 +4,10 @@ import { fetchConnectors, deleteConnector } from '../api';
 import ConnectorForm from '../components/connect/ConnectorForm';
 import PinLakehousesPanel from '../components/connect/PinLakehousesPanel';
 import LocalFilesPanel from '../components/connect/LocalFilesPanel';
+import { useConfirm } from '../components/common/confirmContext';
 
 export default function ConnectPage() {
+  const confirmDialog = useConfirm();
   const [connectors, setConnectors] = useState([]);
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState(null);
@@ -37,11 +39,12 @@ export default function ConnectPage() {
         .map((d) => `  - ${d.name} (${d.test_case_count} test case${d.test_case_count === 1 ? '' : 's'})`)
         .join('\n');
       const plural = err.dependents.length === 1 ? '' : 's';
-      const ok = confirm(
+      const ok = await confirmDialog(
         `This connector is used by ${err.dependents.length} test layer${plural}:\n\n${layers}\n\n`
         + `Deleting it also deletes ${err.testCaseCount} test case${err.testCaseCount === 1 ? '' : 's'}, `
         + 'along with those layers, their suites and schedules. Run history is kept.\n\n'
         + 'Delete anyway?',
+        { tone: 'danger', confirmLabel: 'Delete anyway' },
       );
       if (!ok) return;
       try {

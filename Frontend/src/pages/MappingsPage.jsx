@@ -12,6 +12,7 @@ import ColumnMapModal from '../components/s2d/ColumnMapModal';
 import { formatRowCount, rowCountStyle, rowCountTitle } from '../rowCount';
 import { ListFilter } from '../components/common/ListFilter';
 import { filterByName, noMatchNote } from '../listFilter';
+import { useConfirm } from '../components/common/confirmContext';
 
 function EndpointPicker({ label, connectors, endpoint, onChange }) {
   const [containers, setContainers] = useState([]);
@@ -263,6 +264,7 @@ function EditableTableList({ label, options, selected, usage, onToggle }) {
 }
 
 function TestSuitesForMapping({ mapping }) {
+  const confirmDialog = useConfirm();
   const [suites, setSuites] = useState([]);
   const [isLoading, setIsLoading] = useState(false);
   const [suiteName, setSuiteName] = useState('');
@@ -308,7 +310,7 @@ function TestSuitesForMapping({ mapping }) {
   };
 
   const handleDelete = async (id) => {
-    if (!confirm('Delete this test suite?')) return;
+    if (!(await confirmDialog('Delete this test suite?', { tone: 'danger', confirmLabel: 'Delete' }))) return;
     try {
       await deleteTestSuite(id);
       load();
@@ -406,6 +408,7 @@ function TestSuitesForMapping({ mapping }) {
 }
 
 export default function MappingsPage() {
+  const confirmDialog = useConfirm();
   const [mappings, setMappings] = useState([]);
   const [selectedMappingId, setSelectedMappingId] = useState(null);
   const [connectors, setConnectors] = useState([]);
@@ -506,8 +509,19 @@ export default function MappingsPage() {
       sourceOptions: [],
       destinationOptions: [],
       usage: {},
+      testCaseCount: 0,
       isLoading: true,
       isSaving: false,
+      // "Change Lakehouse" mode per side, and the draft connector/container/
+      // tables it's building - null/false until the tester opts in. Kept
+      // separate from sourceTables/destinationTables (the ordinary table-edit
+      // path) rather than reusing them, since a Lakehouse change always needs
+      // a full re-pick against a freshly-fetched table list, never a diff
+      // against what the OLD container happened to have.
+      sourceChangingLakehouse: false,
+      destinationChangingLakehouse: false,
+      sourceDraftEndpoint: EMPTY_ENDPOINT,
+      destinationDraftEndpoint: EMPTY_ENDPOINT,
     });
 
     const sourceOnly = m.validation_kind === 'source_only';
@@ -527,11 +541,27 @@ export default function MappingsPage() {
       sourceOptions: source.tables || [],
       destinationOptions: destination.tables || [],
       usage: tableUsage(testCases || []),
+      testCaseCount: (testCases || []).length,
       isLoading: false,
     } : prev));
   };
 
   const cancelEdit = () => setEditing(null);
+
+  // Enter/leave "Change Lakehouse" mode for one side. Entering starts the
+  // draft blank (never pre-filled from the current Lakehouse) so the tester
+  // always makes a deliberate, fresh table pick against whatever they choose
+  // next - even if they end up re-selecting the same container.
+  const setChangingLakehouse = (side, on) => {
+    const flagKey = side === 'source' ? 'sourceChangingLakehouse' : 'destinationChangingLakehouse';
+    const draftKey = side === 'source' ? 'sourceDraftEndpoint' : 'destinationDraftEndpoint';
+    setEditing((prev) => (prev ? { ...prev, [flagKey]: on, [draftKey]: EMPTY_ENDPOINT } : prev));
+  };
+
+  const setDraftEndpoint = (side, next) => {
+    const draftKey = side === 'source' ? 'sourceDraftEndpoint' : 'destinationDraftEndpoint';
+    setEditing((prev) => (prev ? { ...prev, [draftKey]: next } : prev));
+  };
 
   // side: 'sourceTables' | 'destinationTables'. Pass `all` to replace the whole
   // selection (select-all / clear), or `one` to flip a single table.
@@ -555,14 +585,34 @@ export default function MappingsPage() {
     const patch = {};
     if (trimmed !== m.name) patch.name = trimmed;
 
-    const nextSource = [...editing.sourceTables];
-    if (nextSource.join(' ') !== [...m.source_tables].join(' ')) {
-      patch.source_tables = nextSource;
+    // A side in "Change Lakehouse" mode sends its draft as a full endpoint
+    // replace; otherwise it's the ordinary table-only diff, unchanged.
+    if (editing.sourceChangingLakehouse) {
+      const d = editing.sourceDraftEndpoint;
+      patch.source_endpoint = {
+        connector_id: d.connectorId, connector_name: d.connectorName,
+        container_id: d.containerId, container_name: d.containerName,
+        tables: d.tables,
+      };
+    } else {
+      const nextSource = [...editing.sourceTables];
+      if (nextSource.join(' ') !== [...m.source_tables].join(' ')) {
+        patch.source_tables = nextSource;
+      }
     }
     if (m.validation_kind !== 'source_only') {
-      const nextDestination = [...editing.destinationTables];
-      if (nextDestination.join(' ') !== [...m.destination_tables].join(' ')) {
-        patch.destination_tables = nextDestination;
+      if (editing.destinationChangingLakehouse) {
+        const d = editing.destinationDraftEndpoint;
+        patch.destination_endpoint = {
+          connector_id: d.connectorId, connector_name: d.connectorName,
+          container_id: d.containerId, container_name: d.containerName,
+          tables: d.tables,
+        };
+      } else {
+        const nextDestination = [...editing.destinationTables];
+        if (nextDestination.join(' ') !== [...m.destination_tables].join(' ')) {
+          patch.destination_tables = nextDestination;
+        }
       }
     }
     if (Object.keys(patch).length === 0) { cancelEdit(); return; }
@@ -573,9 +623,50 @@ export default function MappingsPage() {
       cancelEdit();
       loadMappings();
     } catch (err) {
-      setError(err.message);
+      if (err.requiresConfirm) {
+        // The backend re-counts authoritatively rather than trusting whatever
+        // was fetched when the editor opened - err.testCaseCount is that
+        // fresh number, so the warning can't understate what's about to go.
+        const n = err.testCaseCount;
+        const ok = await confirmDialog(
+          `Changing the Lakehouse for "${m.name}" will permanently delete ${n} `
+          + `test case${n === 1 ? '' : 's'} built against its current location - their SQL/rules `
+          + 'would otherwise silently point at the wrong system.\n\n'
+          + `Delete ${n === 1 ? 'it' : 'them'} and change the Lakehouse?`,
+          { tone: 'danger', confirmLabel: 'Delete and change' },
+        );
+        if (ok) {
+          try {
+            await updateS2DMapping(m.id, { ...patch, confirm_delete_test_cases: true });
+            cancelEdit();
+            loadMappings();
+            return;
+          } catch (err2) {
+            setError(err2.message);
+          }
+        }
+      } else {
+        setError(err.message);
+      }
       setEditing((prev) => (prev ? { ...prev, isSaving: false } : prev));
     }
+  };
+
+  // Whether the current edit state is complete enough to save. A side mid
+  // "Change Lakehouse" needs a container chosen and at least one table picked
+  // in its draft; a side left alone just needs a non-empty existing selection
+  // (destination is left to the server's own source_only-aware check, same as
+  // before this feature existed).
+  const editIsValid = (e) => {
+    if (!e || e.isLoading || !e.name.trim()) return false;
+    const sourceOk = e.sourceChangingLakehouse
+      ? !!(e.sourceDraftEndpoint.containerId && e.sourceDraftEndpoint.tables.length > 0)
+      : e.sourceTables.size > 0;
+    if (!sourceOk) return false;
+    if (e.destinationChangingLakehouse) {
+      return !!(e.destinationDraftEndpoint.containerId && e.destinationDraftEndpoint.tables.length > 0);
+    }
+    return true;
   };
 
   const selectedMapping = mappings.find((m) => m.id === selectedMappingId) || null;
@@ -622,8 +713,7 @@ export default function MappingsPage() {
                           />
                           <button
                             onClick={saveEdit}
-                            disabled={editing.isSaving || editing.isLoading || !editing.name.trim()
-                              || editing.sourceTables.size === 0}
+                            disabled={editing.isSaving || !editIsValid(editing)}
                             className="p-1 text-mastek-success hover:bg-mastek-success/10 rounded shrink-0 disabled:opacity-50"
                             title="Save changes"
                           >
@@ -644,26 +734,89 @@ export default function MappingsPage() {
                           </p>
                         ) : (
                           <>
-                            <EditableTableList
-                              label={`Source · ${m.source_container_name}`}
-                              options={editing.sourceOptions}
-                              selected={editing.sourceTables}
-                              usage={editing.usage}
-                              onToggle={(all, one) => toggleEditTable('sourceTables', all, one)}
-                            />
+                            <div>
+                              <div className="flex items-center justify-between mb-1">
+                                <span className="text-[11px] font-bold text-slate-400 uppercase tracking-wider">
+                                  {editing.sourceChangingLakehouse ? 'New source Lakehouse' : `Source · ${m.source_container_name}`}
+                                </span>
+                                <button
+                                  type="button"
+                                  onClick={() => setChangingLakehouse('source', !editing.sourceChangingLakehouse)}
+                                  className="text-[11px] font-medium text-mastek-primary hover:underline shrink-0"
+                                >
+                                  {editing.sourceChangingLakehouse ? 'Cancel' : 'Change Lakehouse'}
+                                </button>
+                              </div>
+                              {editing.sourceChangingLakehouse ? (
+                                <div className="border border-amber-300 bg-amber-50 rounded-lg p-2">
+                                  <EndpointPicker
+                                    label=""
+                                    connectors={connectors}
+                                    endpoint={editing.sourceDraftEndpoint}
+                                    onChange={(next) => setDraftEndpoint('source', next)}
+                                  />
+                                  <p className="mt-1.5 flex items-start gap-1.5 text-[11px] text-amber-700">
+                                    <AlertCircle className="w-3 h-3 shrink-0 mt-0.5" />
+                                    {editing.testCaseCount > 0
+                                      ? `Saving this permanently deletes all ${editing.testCaseCount} existing test case(s) on this layer - their SQL/rules were written against the current Lakehouse.`
+                                      : 'This layer has no test cases yet, so nothing will be deleted.'}
+                                  </p>
+                                </div>
+                              ) : (
+                                <EditableTableList
+                                  label=""
+                                  options={editing.sourceOptions}
+                                  selected={editing.sourceTables}
+                                  usage={editing.usage}
+                                  onToggle={(all, one) => toggleEditTable('sourceTables', all, one)}
+                                />
+                              )}
+                            </div>
                             {m.validation_kind !== 'source_only' && (
-                              <EditableTableList
-                                label={`Destination · ${m.destination_container_name}`}
-                                options={editing.destinationOptions}
-                                selected={editing.destinationTables}
-                                usage={editing.usage}
-                                onToggle={(all, one) => toggleEditTable('destinationTables', all, one)}
-                              />
+                              <div>
+                                <div className="flex items-center justify-between mb-1">
+                                  <span className="text-[11px] font-bold text-slate-400 uppercase tracking-wider">
+                                    {editing.destinationChangingLakehouse ? 'New destination Lakehouse' : `Destination · ${m.destination_container_name}`}
+                                  </span>
+                                  <button
+                                    type="button"
+                                    onClick={() => setChangingLakehouse('destination', !editing.destinationChangingLakehouse)}
+                                    className="text-[11px] font-medium text-mastek-primary hover:underline shrink-0"
+                                  >
+                                    {editing.destinationChangingLakehouse ? 'Cancel' : 'Change Lakehouse'}
+                                  </button>
+                                </div>
+                                {editing.destinationChangingLakehouse ? (
+                                  <div className="border border-amber-300 bg-amber-50 rounded-lg p-2">
+                                    <EndpointPicker
+                                      label=""
+                                      connectors={connectors}
+                                      endpoint={editing.destinationDraftEndpoint}
+                                      onChange={(next) => setDraftEndpoint('destination', next)}
+                                    />
+                                    <p className="mt-1.5 flex items-start gap-1.5 text-[11px] text-amber-700">
+                                      <AlertCircle className="w-3 h-3 shrink-0 mt-0.5" />
+                                      {editing.testCaseCount > 0
+                                        ? `Saving this permanently deletes all ${editing.testCaseCount} existing test case(s) on this layer - their SQL/rules were written against the current Lakehouse.`
+                                        : 'This layer has no test cases yet, so nothing will be deleted.'}
+                                    </p>
+                                  </div>
+                                ) : (
+                                  <EditableTableList
+                                    label=""
+                                    options={editing.destinationOptions}
+                                    selected={editing.destinationTables}
+                                    usage={editing.usage}
+                                    onToggle={(all, one) => toggleEditTable('destinationTables', all, one)}
+                                  />
+                                )}
+                              </div>
                             )}
                             <p className="text-[11px] text-slate-400">
-                              Newly uploaded files show up here automatically. The connector and
-                              container stay fixed &mdash; changing those would make it a different
-                              layer and leave every test case pointing at the wrong system.
+                              Newly uploaded files show up here automatically. Use &ldquo;Change
+                              Lakehouse&rdquo; above to point a side at a different connector or
+                              container &mdash; doing so deletes this layer&rsquo;s existing test
+                              cases, since their SQL/rules were written against the old one.
                             </p>
                           </>
                         )}

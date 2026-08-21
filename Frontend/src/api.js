@@ -1,16 +1,59 @@
 const API_BASE = 'http://127.0.0.1:5000';
 
+function authHeaders() {
+  const token = localStorage.getItem('access_token');
+  return token ? { Authorization: `Bearer ${token}` } : {};
+}
+
+// A 401 means the token is missing/expired/invalid - every route but /api/auth/*
+// and /api/health requires one (see app.py's before_request gate). Clearing and
+// reloading is the simplest reliable way back to the login screen from any call
+// site, without threading auth state through every page that calls the API.
+function handleUnauthorized(res) {
+  if (res.status === 401) {
+    localStorage.removeItem('access_token');
+    window.location.reload();
+    return true;
+  }
+  return false;
+}
+
 async function request(path, options = {}) {
   const res = await fetch(`${API_BASE}${path}`, {
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
     ...options,
   });
+  if (handleUnauthorized(res)) throw new Error('Session expired');
   const body = await res.json().catch(() => ({}));
   if (!res.ok) {
     const message = body.details ? `${body.error}: ${body.details}` : (body.error || `Request failed: ${res.status}`);
     throw new Error(message);
   }
   return body;
+}
+
+// --- Auth ---
+
+export function login({ email, password }) {
+  return request('/api/auth/login', {
+    method: 'POST',
+    body: JSON.stringify({ email, password }),
+  });
+}
+
+export function register({ email, password, full_name, organization_name }) {
+  return request('/api/auth/register', {
+    method: 'POST',
+    body: JSON.stringify({ email, password, full_name, organization_name }),
+  });
+}
+
+export function fetchCurrentUser() {
+  return request('/api/auth/me');
+}
+
+export function logout() {
+  localStorage.removeItem('access_token');
 }
 
 // --- Connectors ---
@@ -29,8 +72,9 @@ export function createConnector(payload) {
 export async function deleteConnector(id, { force = false } = {}) {
   const res = await fetch(`${API_BASE}/api/connectors/${id}${force ? '?force=1' : ''}`, {
     method: 'DELETE',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
   });
+  if (handleUnauthorized(res)) throw new Error('Session expired');
   const body = await res.json().catch(() => ({}));
   if (res.status === 409 && body.requires_force) {
     // Not a failure - the server is asking whether the tester means it.
@@ -77,9 +121,25 @@ export function pinConnectorContainers(connectorId, containers) {
 // includeRowCounts adds a row_count to every table so pickers can show how big
 // it is. Opt-in because counting costs time against a remote endpoint - callers
 // that only need columns (the column map editor, template dropdowns) omit it.
-export function fetchContainerTables(connectorId, containerId, { includeRowCounts = false } = {}) {
-  const query = includeRowCounts ? '?include_row_counts=1' : '';
+// harvestedOnly narrows the list to tables that came back the last harvest of
+// this connector+container, and the response gains a `harvested` flag - only
+// Test Data Preparation's picker uses this; everything else keeps seeing every
+// live table.
+export function fetchContainerTables(connectorId, containerId, { includeRowCounts = false, harvestedOnly = false } = {}) {
+  const params = new URLSearchParams();
+  if (includeRowCounts) params.set('include_row_counts', '1');
+  if (harvestedOnly) params.set('harvested_only', '1');
+  const query = params.toString() ? `?${params}` : '';
   return request(`/api/connectors/${connectorId}/containers/${containerId}/tables${query}`);
+}
+
+// Pure local-DB read (no live connector call) - which table names came back
+// the last time this connector+container was harvested. Lets a caller that
+// already has a full live table list (e.g. Test Data Preparation, which needs
+// every table for its before/after run diff) filter what it displays without
+// paying for a second live fetch just to do it.
+export function fetchHarvestedTableNames(connectorId, containerId) {
+  return request(`/api/connectors/${connectorId}/containers/${containerId}/harvested-tables`);
 }
 
 export function fetchLocalFiles(connectorId) {
@@ -93,8 +153,10 @@ export async function uploadLocalFile(connectorId, file, displayName) {
 
   const res = await fetch(`${API_BASE}/api/connectors/${connectorId}/local/upload`, {
     method: 'POST',
-    body: formData, // no Content-Type header - browser sets the multipart boundary
+    headers: authHeaders(), // no Content-Type - browser sets the multipart boundary
+    body: formData,
   });
+  if (handleUnauthorized(res)) throw new Error('Session expired');
   const body = await res.json().catch(() => ({}));
   if (!res.ok) {
     const message = body.details ? `${body.error}: ${body.details}` : (body.error || `Request failed: ${res.status}`);
@@ -188,6 +250,18 @@ export function fetchCatalogAsset(id) {
   return request(`/api/catalog/${encodeURIComponent(id)}`);
 }
 
+// Removes the harvested-metadata record only - never the real Lakehouse,
+// table, or file it describes. No dependents/force flow (unlike deleteConnector):
+// nothing in this app references a catalog row by id, only by connector+container.
+export function deleteCatalogAsset(id) {
+  return request(`/api/catalog/${encodeURIComponent(id)}`, { method: 'DELETE' });
+}
+
+// Same metadata-only guarantee, batched - the Catalog Viewer's multi-select delete.
+export function deleteCatalogAssets(ids) {
+  return request('/api/catalog', { method: 'DELETE', body: JSON.stringify({ ids }) });
+}
+
 // --- S2D: Source-to-Destination validation ---
 
 export function fetchS2DMappings() {
@@ -208,13 +282,31 @@ export function renameS2DMapping(id, name) {
   });
 }
 
-// Name and/or the tables each side covers. Send only what changed; the tables
-// are a full replace for that side, never a delta.
-export function updateS2DMapping(id, patch) {
-  return request(`/api/s2d/mappings/${id}`, {
+// Name, the tables each side covers, and/or (via source_endpoint/
+// destination_endpoint) which Lakehouse a side points at. Send only what
+// changed; tables are a full replace for that side, never a delta.
+//
+// Changing a side's endpoint deletes this layer's test cases (their SQL/rules
+// were written against the OLD Lakehouse), so the same not-a-failure 409 flow
+// as deleteConnector's force-delete applies: a first attempt without
+// confirm_delete_test_cases gets a 409 naming the exact count, and the caller
+// resends with confirm_delete_test_cases: true once the tester has seen it.
+export async function updateS2DMapping(id, patch) {
+  const res = await fetch(`${API_BASE}/api/s2d/mappings/${id}`, {
     method: 'PATCH',
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
     body: JSON.stringify(patch),
   });
+  if (handleUnauthorized(res)) throw new Error('Session expired');
+  const body = await res.json().catch(() => ({}));
+  if (res.status === 409 && body.requires_confirm) {
+    const err = new Error(body.error);
+    err.requiresConfirm = true;
+    err.testCaseCount = body.test_case_count || 0;
+    throw err;
+  }
+  if (!res.ok) throw new Error(body.error || `Request failed: ${res.status}`);
+  return body;
 }
 
 export function deleteS2DMapping(id) {
@@ -255,9 +347,10 @@ export function fetchS2DAnalytics({ mappingIds = [], basis = 'latest', range = '
 export async function exportS2DAnalytics(payload) {
   const res = await fetch(`${API_BASE}/api/s2d/analytics/export`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
     body: JSON.stringify(payload),
   });
+  if (handleUnauthorized(res)) throw new Error('Session expired');
   if (!res.ok) {
     const body = await res.json().catch(() => ({}));
     throw new Error(body.details ? `${body.error}: ${body.details}` : (body.error || `Export failed: ${res.status}`));

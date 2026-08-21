@@ -5,6 +5,7 @@ import {
 } from 'lucide-react';
 import SchedulePicker from './SchedulePicker';
 import { humanizeTrigger, STATUS_STYLES } from '../../scheduleFormat';
+import { useConfirm } from '../common/confirmContext';
 
 export default function SchedulesSection({
   parentId,
@@ -19,6 +20,7 @@ export default function SchedulesSection({
   onRefreshSelection, // optional (harvest only): async (schedule) -> void — reconcile stored items with live source
   showItemCount, // optional (harvest only): render "N items" per row when selected_items is set
 }) {
+  const confirmDialog = useConfirm();
   const [schedules, setSchedules] = useState([]);
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState(null);
@@ -79,7 +81,7 @@ export default function SchedulesSection({
   };
 
   const handleDelete = async (scheduleId) => {
-    if (!confirm('Delete this schedule? Past events remain in the log.')) return;
+    if (!(await confirmDialog('Delete this schedule? Past events remain in the log.', { tone: 'danger', confirmLabel: 'Delete' }))) return;
     try {
       await remove(scheduleId);
       reload();

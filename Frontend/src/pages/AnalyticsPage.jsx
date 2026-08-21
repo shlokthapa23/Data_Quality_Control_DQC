@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import {
-  ArrowLeft, CheckCircle2, XCircle, AlertTriangle, Loader2, Search,
-  ListChecks, Gauge, History as HistoryIcon,
+  ArrowLeft, CheckCircle2, XCircle, AlertTriangle, Loader2,
+  ListChecks, Gauge, History as HistoryIcon, GitCompareArrows,
 } from 'lucide-react';
 import { fetchS2DRun } from '../api';
 
@@ -239,11 +239,10 @@ export default function AnalyticsPage({ runId, onBackToS2D, onGoToHistory, onEdi
 
             <div className="pt-2 border-t border-slate-200 flex gap-2">
               <button
-                disabled
-                title="Coming soon: will run a drill-down query to show the exact offending rows"
-                className="flex-1 bg-white border border-slate-300 text-slate-400 py-2 rounded font-medium text-center cursor-not-allowed flex items-center justify-center gap-1.5"
+                onClick={onBackToS2D}
+                className="flex-1 bg-white border border-slate-200 text-slate-600 hover:bg-slate-50 py-2 rounded font-medium text-center flex items-center justify-center gap-1.5 transition"
               >
-                <Search className="w-3.5 h-3.5" /> Isolate Bad Rows
+                <GitCompareArrows className="w-3.5 h-3.5" /> Test Cases Validation
               </button>
               <button
                 // Opens THIS check in the editor, rather than dropping the

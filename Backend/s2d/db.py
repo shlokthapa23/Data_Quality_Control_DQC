@@ -512,6 +512,30 @@ def update_mapping_tables(mapping_id, source_tables=None, destination_tables=Non
         conn.execute(f"UPDATE s2d_mappings SET {', '.join(sets)} WHERE id = ?", params)
 
 
+def update_mapping_endpoint(mapping_id, side, connector_id, connector_name,
+                             container_id, container_name, tables):
+    """
+    Repoints one side of a layer (source or destination) at a different
+    connector+container+tables - a deliberate exception to update_mapping_tables'
+    "connectors and containers stay fixed" rule above. Callers MUST have
+    already deleted this mapping's test cases (delete_test_cases_for_mapping)
+    before calling this: their stored SQL/rules were written against the OLD
+    location, and there is no way to know if it still means anything once the
+    layer points somewhere else.
+    """
+    if side not in ("source", "destination"):
+        raise ValueError(f"Unknown side: {side!r}")
+    with get_conn() as conn:
+        conn.execute(f"""
+            UPDATE s2d_mappings
+            SET {side}_connector_id = ?, {side}_connector_name = ?,
+                {side}_container_id = ?, {side}_container_name = ?,
+                {side}_tables = ?
+            WHERE id = ?
+        """, (connector_id, connector_name, container_id, container_name,
+              json.dumps(tables), mapping_id))
+
+
 def set_column_map(mapping_id, column_map):
     """
     Full replace - the editor always submits the whole map, same as suite
@@ -682,7 +706,38 @@ def get_test_case(test_case_id):
 
 def delete_test_case(test_case_id):
     with get_conn() as conn:
+        # Suite membership first - a dangling s2d_test_suite_cases row pointing
+        # at a deleted test case is exactly the kind of orphan delete_mapping's
+        # own cascade (above) is careful to avoid.
+        conn.execute("DELETE FROM s2d_test_suite_cases WHERE test_case_id = ?", (test_case_id,))
         conn.execute("DELETE FROM s2d_test_cases WHERE id = ?", (test_case_id,))
+
+
+def count_test_cases(mapping_id):
+    """How many test cases a layer has - the number a Lakehouse-change
+    confirmation needs to state honestly before anything is deleted."""
+    with get_conn() as conn:
+        return conn.execute(
+            "SELECT COUNT(*) FROM s2d_test_cases WHERE mapping_id = ?", (mapping_id,)
+        ).fetchone()[0]
+
+
+def delete_test_cases_for_mapping(mapping_id):
+    """
+    Deletes every test case belonging to a mapping, and their suite
+    membership - same cascade delete_mapping already does for test cases,
+    minus the mapping/suites themselves. Used when a Lakehouse change makes a
+    layer's existing test cases' stored SQL/rules point at the wrong system;
+    the suites that contained them survive, just emptied. Returns the count
+    deleted.
+    """
+    with get_conn() as conn:
+        conn.execute("""
+            DELETE FROM s2d_test_suite_cases
+            WHERE test_case_id IN (SELECT id FROM s2d_test_cases WHERE mapping_id = ?)
+        """, (mapping_id,))
+        cursor = conn.execute("DELETE FROM s2d_test_cases WHERE mapping_id = ?", (mapping_id,))
+        return cursor.rowcount
 
 
 # --- Runs + results ---------------------------------------------------------
@@ -826,6 +881,28 @@ def analytics_orphaned_run_count():
             LEFT JOIN s2d_mappings m ON m.id = r.mapping_id
             WHERE m.id IS NULL
         """).fetchone()[0]
+
+
+def prune_test_runs_before(cutoff_iso):
+    """
+    Deletes every s2d_test_run (and its s2d_test_results) started before
+    cutoff_iso. Children before parent, same order delete_mapping already
+    uses for its cascade, since s2d_test_results.run_id references
+    s2d_test_runs.id. Returns the number of runs deleted, so the caller can
+    log something other than silence.
+
+    Retention policy (how far back cutoff_iso reaches) is decided by
+    s2d.results_store, not here - this function only knows how to delete
+    runs older than whatever cutoff it's given.
+    """
+    with get_conn() as conn:
+        conn.execute("""
+            DELETE FROM s2d_test_results WHERE run_id IN (
+                SELECT id FROM s2d_test_runs WHERE started_at < ?
+            )
+        """, (cutoff_iso,))
+        cursor = conn.execute("DELETE FROM s2d_test_runs WHERE started_at < ?", (cutoff_iso,))
+        return cursor.rowcount
 
 
 def list_runs(mapping_id=None):

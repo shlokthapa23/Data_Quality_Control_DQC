@@ -9,6 +9,7 @@ import {
   updatePipelineSchedule, deletePipelineSchedule,
 } from '../api';
 import { humanizeTrigger, STATUS_STYLES } from '../scheduleFormat';
+import { useConfirm } from '../components/common/confirmContext';
 
 function StatusBadges({ sched }) {
   return (
@@ -49,6 +50,7 @@ function ActiveToggle({ active, onToggle }) {
 }
 
 export default function SchedulesDashboard() {
+  const confirmDialog = useConfirm();
   const [suiteSchedules, setSuiteSchedules] = useState([]);
   const [harvestSchedules, setHarvestSchedules] = useState([]);
   const [pipelineSchedules, setPipelineSchedules] = useState([]);
@@ -88,7 +90,7 @@ export default function SchedulesDashboard() {
   };
 
   const handleDeleteSuite = async (sched) => {
-    if (!confirm(`Delete this schedule for "${sched.suite_name || 'suite'}"?`)) return;
+    if (!(await confirmDialog(`Delete this schedule for "${sched.suite_name || 'suite'}"?`, { tone: 'danger', confirmLabel: 'Delete' }))) return;
     try {
       await deleteSuiteSchedule(sched.id);
       reload();
@@ -107,7 +109,7 @@ export default function SchedulesDashboard() {
   };
 
   const handleDeleteHarvest = async (sched) => {
-    if (!confirm(`Delete this schedule for "${sched.connector_name || 'connector'}"?`)) return;
+    if (!(await confirmDialog(`Delete this schedule for "${sched.connector_name || 'connector'}"?`, { tone: 'danger', confirmLabel: 'Delete' }))) return;
     try {
       await deleteHarvestSchedule(sched.id);
       reload();
@@ -126,7 +128,7 @@ export default function SchedulesDashboard() {
   };
 
   const handleDeletePipeline = async (sched) => {
-    if (!confirm(`Delete this schedule for "${sched.pipeline_name || 'pipeline'}"?`)) return;
+    if (!(await confirmDialog(`Delete this schedule for "${sched.pipeline_name || 'pipeline'}"?`, { tone: 'danger', confirmLabel: 'Delete' }))) return;
     try {
       await deletePipelineSchedule(sched.id);
       reload();

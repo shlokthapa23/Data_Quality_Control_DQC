@@ -171,6 +171,41 @@ def full_refresh_clear(connector_type, connector_id=None, asset_types=None):
         conn.execute(f"DELETE FROM harvested_assets WHERE {' AND '.join(clauses)}", params)
 
 
+def delete_asset(asset_id):
+    """
+    Removes one harvested-metadata record from the catalog by its id.
+
+    This only forgets what a past harvest recorded about the item - it never
+    touches the real Lakehouse/table/file the metadata describes, and it
+    doesn't cascade to anything: S2D mappings and test cases reference a
+    connector+container by id, not this row, so they're untouched. The one
+    real consequence is that harvested_table_names() (catalog/db.py) will
+    then report this container as never harvested, so Test Data Preparation's
+    table picker goes back to showing "not harvested yet" for it until it's
+    re-harvested. Returns True if a row was actually deleted.
+    """
+    with get_conn() as conn:
+        cursor = conn.execute("DELETE FROM harvested_assets WHERE id = ?", (asset_id,))
+        return cursor.rowcount > 0
+
+
+def delete_assets(asset_ids):
+    """
+    Bulk version of delete_asset - same "metadata only, nothing cascades"
+    guarantee, for the Catalog Viewer's multi-select delete. Returns the
+    number of rows actually deleted, which can be less than len(asset_ids) if
+    some were already gone (another tab, a concurrent delete).
+    """
+    if not asset_ids:
+        return 0
+    with get_conn() as conn:
+        placeholders = ",".join("?" for _ in asset_ids)
+        cursor = conn.execute(
+            f"DELETE FROM harvested_assets WHERE id IN ({placeholders})", list(asset_ids)
+        )
+        return cursor.rowcount
+
+
 def list_assets(connector_id=None, connector_type=None, asset_type=None, search=None):
     query = "SELECT * FROM harvested_assets WHERE 1=1"
     params = []
@@ -254,6 +289,27 @@ def harvested_container_ids(connector_id, item_type="Lakehouse"):
             (connector_id, item_type),
         ).fetchall()
     return {r["source_item_id"] for r in rows if r["source_item_id"]}
+
+
+def harvested_table_names(connector_id, container_id):
+    """
+    The table names recorded the last time this connector+container was
+    harvested, or None if it has never been harvested at all - deliberately
+    distinct from "harvested, but the harvest found zero tables", which is a
+    real (if unlikely) state a caller needs to tell apart from "go harvest
+    this first". `schema_json` already holds the whole table list from that
+    harvest (`[{table, kind, columns}, ...]`), same shape `get_asset()` above
+    decodes - this just narrows it to names for a membership check.
+    """
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT schema_json FROM harvested_assets WHERE connector_id = ? AND source_item_id = ?",
+            (connector_id, container_id),
+        ).fetchone()
+    if not row or not row["schema_json"]:
+        return None
+    tables = json.loads(row["schema_json"])
+    return {t["table"] for t in tables}
 
 
 def list_connector_configs():

@@ -11,6 +11,7 @@ from local_files import db as local_db
 import analytics_export
 from s2d import column_map as s2d_column_map
 from s2d import db as s2d_db
+from s2d import results_store
 from s2d.engine import run_pipeline
 from ai_service import (
     generate_test_case_sql, generate_rules_from_sample, generate_parity_rules_from_samples,
@@ -21,6 +22,9 @@ from ai_service import (
 from s2d.engine import PARITY_VALIDATION_TYPES, shares_connection
 from connectors.sql_guard import suggest_fix, validate_select_only
 import scheduler as _scheduler
+from auth import db as auth_db
+from auth.routes import auth_bp
+from auth.security import decode_token
 
 
 
@@ -28,9 +32,40 @@ load_dotenv()
 catalog_db.init_db()
 s2d_db.init_s2d_tables()
 local_db.init_local_tables_table()
+auth_db.init_auth_tables()
 
 app = Flask(__name__)
 CORS(app)
+app.register_blueprint(auth_bp)
+
+# Routes reachable with no token - everything else under /api/* requires a
+# valid Bearer token. A single gate here, not a decorator on every route:
+# tasks/lessons.md already recorded exactly this failure shape once (schedule
+# kinds with "no central registry" silently breaking one spot at a time) -
+# a per-route decorator on 50+ routes in this file is the same trap.
+_PUBLIC_PATHS = {"/api/health", "/api/auth/register", "/api/auth/login"}
+
+
+@app.before_request
+def _require_auth():
+    if request.method == "OPTIONS" or request.path in _PUBLIC_PATHS:
+        return None
+    if not request.path.startswith("/api/"):
+        return None
+
+    header = request.headers.get("Authorization", "")
+    token = header[len("Bearer "):] if header.startswith("Bearer ") else None
+    if not token:
+        return jsonify({"error": "Not authenticated"}), 401
+
+    payload = decode_token(token)
+    email = payload.get("sub")
+    user = auth_db.get_user_with_org_by_email(email) if email else None
+    if not user:
+        return jsonify({"error": "Not authenticated"}), 401
+
+    request.current_user = user
+    return None
 
 
 def get_connector_instance(connector_id):
@@ -416,8 +451,18 @@ def get_container_tables_live(connector_id, container_id):
     how big it is before any test case exists. Opt-in: counting costs real time
     against a remote endpoint, and callers that only want columns shouldn't pay
     for it. Omitting the flag returns exactly the original shape.
+
+    ?harvested_only=1 narrows the list to tables that came back the last time
+    this connector+container was harvested (Test Data Preparation's table
+    picker uses this - only tables someone deliberately harvested should show
+    up there). Adds "harvested": true/false to the response so the caller can
+    tell "harvested, but none of its tables matched" apart from "never
+    harvested at all" - those need different empty-state messaging. Every
+    other caller of this route (MappingsPage, TestCasePanel, ...) omits the
+    flag and keeps seeing every live table, unchanged.
     """
     include_row_counts = request.args.get("include_row_counts") in ("1", "true", "yes")
+    harvested_only = request.args.get("harvested_only") in ("1", "true", "yes")
 
     try:
         _, connector = get_connector_instance(connector_id)
@@ -434,9 +479,36 @@ def get_container_tables_live(connector_id, container_id):
             if include_row_counts:
                 entry["row_count"] = t.get("row_count")
             tables.append(entry)
-        return jsonify({"tables": tables})
+
+        if not harvested_only:
+            return jsonify({"tables": tables})
+
+        harvested_names = catalog_db.harvested_table_names(connector_id, container_id)
+        if harvested_names is None:
+            return jsonify({"tables": [], "harvested": False})
+        tables = [t for t in tables if t["name"] in harvested_names]
+        return jsonify({"tables": tables, "harvested": True})
     except Exception as e:
         return jsonify({"error": "Failed to list tables", "details": str(e)}), 502
+
+
+@app.route('/api/connectors/<connector_id>/containers/<container_id>/harvested-tables', methods=['GET'])
+def get_harvested_table_names(connector_id, container_id):
+    """
+    Which table names were recorded the last time this connector+container was
+    harvested - a pure local DB read, no connector/live Fabric call at all.
+
+    Exists separately from get_container_tables_live's own ?harvested_only=1:
+    Test Data Preparation already pays for one full live table listing (with
+    row counts) to drive its before/after run diff, which deliberately needs
+    every live table, harvested or not - a run can create a table that's never
+    been harvested. This route lets that page filter what it *displays* to
+    harvested tables only, without a second ~9s Fabric attach just to do it.
+    """
+    names = catalog_db.harvested_table_names(connector_id, container_id)
+    if names is None:
+        return jsonify({"harvested": False, "tables": []})
+    return jsonify({"harvested": True, "tables": sorted(names)})
 
 
 # --- Local connector: file upload -------------------------------------------
@@ -574,6 +646,34 @@ def get_catalog_asset(asset_id):
     return jsonify(asset)
 
 
+@app.route('/api/catalog/<path:asset_id>', methods=['DELETE'])
+def delete_catalog_asset(asset_id):
+    """
+    Forgets one harvested-metadata record. No dependents check (unlike
+    deleting a connector) - nothing else in the app references a catalog row
+    by id, only by connector+container, so there's nothing to cascade.
+    """
+    deleted = catalog_db.delete_asset(asset_id)
+    if not deleted:
+        return jsonify({"error": "Asset not found"}), 404
+    return jsonify({"deleted": True})
+
+
+@app.route('/api/catalog', methods=['DELETE'])
+def delete_catalog_assets():
+    """
+    Body: { "ids": ["...", "..."] } - the Catalog Viewer's multi-select
+    delete. Same metadata-only guarantee as the single-asset route; this just
+    does it for a batch in one round trip instead of one request per row.
+    """
+    body = request.get_json(force=True) or {}
+    ids = body.get("ids")
+    if not isinstance(ids, list) or not ids:
+        return jsonify({"error": "ids must be a non-empty array"}), 400
+    deleted = catalog_db.delete_assets(ids)
+    return jsonify({"deleted": deleted, "requested": len(ids)})
+
+
 # --- S2D: Source-to-Destination validation ---------------------------------
 
 @app.route('/api/s2d/mappings', methods=['GET'])
@@ -648,14 +748,26 @@ def create_s2d_mapping():
 @app.route('/api/s2d/mappings/<mapping_id>', methods=['PATCH'])
 def rename_s2d_mapping(mapping_id):
     """
-    Body: any of { "name", "source_tables", "destination_tables" }.
+    Body: any of { "name", "source_tables", "destination_tables",
+    "source_endpoint", "destination_endpoint", "confirm_delete_test_cases" }.
 
     Tables are editable so a file uploaded after the layer was built can be
     added to it, and one that's no longer relevant dropped, without rebuilding
-    the layer and losing its test cases. Connectors and containers are
-    deliberately NOT editable here - changing those makes it a different layer,
-    and every test case's stored SQL would silently be pointing at the wrong
-    system.
+    the layer and losing its test cases.
+
+    Connectors and containers are NOT editable via source_tables/
+    destination_tables - changing those makes it a different layer, and every
+    test case's stored SQL would silently be pointing at the wrong system.
+    Repointing a side at a different Lakehouse is instead a deliberate,
+    separate action: pass "source_endpoint" and/or "destination_endpoint" as
+    { connector_id, connector_name, container_id, container_name, tables }.
+    Presence of that key means "the tester used Change Lakehouse", regardless
+    of whether the chosen connector/container happen to match the current
+    one. Because a layer's test cases are validated against its OLD location,
+    every test case belonging to this mapping is deleted before the endpoint
+    changes - if any exist, this requires "confirm_delete_test_cases": true
+    in the body first, or the request 409s with the exact count so the
+    caller can warn honestly instead of guessing.
     """
     mapping = s2d_db.get_mapping(mapping_id)
     if not mapping:
@@ -668,8 +780,53 @@ def rename_s2d_mapping(mapping_id):
             return jsonify({"error": "name is required"}), 400
         s2d_db.rename_mapping(mapping_id, name)
 
-    source_tables = body.get("source_tables")
-    destination_tables = body.get("destination_tables")
+    source_endpoint = body.get("source_endpoint")
+    destination_endpoint = body.get("destination_endpoint")
+    if source_endpoint is not None or destination_endpoint is not None:
+        for label, value in (("source_endpoint", source_endpoint),
+                             ("destination_endpoint", destination_endpoint)):
+            if value is None:
+                continue
+            required = ("connector_id", "connector_name", "container_id", "container_name", "tables")
+            missing = [k for k in required if not value.get(k)]
+            if missing:
+                return jsonify({"error": f"{label} is missing: {', '.join(missing)}"}), 400
+            if not isinstance(value["tables"], list) or not value["tables"]:
+                return jsonify({"error": f"{label}.tables must be a non-empty array"}), 400
+
+        test_case_count = s2d_db.count_test_cases(mapping_id)
+        if test_case_count > 0 and not body.get("confirm_delete_test_cases"):
+            return jsonify({
+                "error": f"This layer has {test_case_count} test case(s) built against its current "
+                         "Lakehouse(s). Changing the Lakehouse deletes them - resend with "
+                         "confirm_delete_test_cases: true to proceed.",
+                "requires_confirm": True,
+                "test_case_count": test_case_count,
+            }), 409
+        if test_case_count > 0:
+            s2d_db.delete_test_cases_for_mapping(mapping_id)
+
+        if source_endpoint is not None:
+            s2d_db.update_mapping_endpoint(
+                mapping_id, "source",
+                source_endpoint["connector_id"], source_endpoint["connector_name"],
+                source_endpoint["container_id"], source_endpoint["container_name"],
+                source_endpoint["tables"],
+            )
+        if destination_endpoint is not None:
+            s2d_db.update_mapping_endpoint(
+                mapping_id, "destination",
+                destination_endpoint["connector_id"], destination_endpoint["connector_name"],
+                destination_endpoint["container_id"], destination_endpoint["container_name"],
+                destination_endpoint["tables"],
+            )
+        # Endpoint changes fully replace a side's tables - the plain
+        # source_tables/destination_tables path below is for the OTHER side,
+        # or doesn't apply at all if both sides changed Lakehouse.
+        mapping = s2d_db.get_mapping(mapping_id)
+
+    source_tables = body.get("source_tables") if source_endpoint is None else None
+    destination_tables = body.get("destination_tables") if destination_endpoint is None else None
     if source_tables is not None or destination_tables is not None:
         for label, value in (("source_tables", source_tables),
                              ("destination_tables", destination_tables)):
@@ -1708,9 +1865,9 @@ def _build_analytics(mapping_ids, basis, range_key, include_detail=False):
     # workspace's history is those. Once a layer IS named, they can't be part
     # of it, and including them would make the totals irreconcilable.
     include_orphans = mapping_ids is None
-    results = s2d_db.analytics_results(
+    results = results_store.analytics_results(
         mapping_ids=mapping_ids, basis=basis, include_orphans=include_orphans, since=since)
-    runs = s2d_db.analytics_runs(
+    runs = results_store.analytics_runs(
         mapping_ids=mapping_ids, include_orphans=include_orphans, since=since)
 
     counts = {"pass": 0, "fail": 0, "error": 0}
@@ -1757,10 +1914,17 @@ def _build_analytics(mapping_ids, basis, range_key, include_detail=False):
 
     # Worst offenders: most violations first, and only checks that actually
     # found something - a passing check with 0 violations isn't an offender.
-    offenders = sorted(
+    # Capped generously (not the old top-10) because the UI now lets someone
+    # search/sort this list for a SPECIFIC test case, which might not be
+    # anywhere near the top by violation count - a tight cap would silently
+    # make it unfindable. offender_count (below) states the true total so a
+    # truncation, if it ever happens, is visible rather than silent.
+    OFFENDER_CAP = 200
+    all_offenders = sorted(
         (r for r in results if (r.get("violations") or 0) > 0),
         key=lambda r: r["violations"], reverse=True,
-    )[:10]
+    )
+    offenders = all_offenders[:OFFENDER_CAP]
 
     trend = [{
         "run_id": r["id"], "mapping_id": r["mapping_id"], "mapping_name": r["mapping_name"],
@@ -1788,7 +1952,7 @@ def _build_analytics(mapping_ids, basis, range_key, include_detail=False):
             "last_run_at": max((r["run_started_at"] for r in results), default=None),
             # Shown so the reader knows whether history from deleted layers is
             # part of what they're looking at, rather than guessing.
-            "orphaned_runs": s2d_db.analytics_orphaned_run_count(),
+            "orphaned_runs": results_store.analytics_orphaned_run_count(),
             "orphaned_runs_included": include_orphans,
         },
         "by_validation_type": sorted(by_type.values(), key=lambda e: -(e["pass"] + e["fail"] + e["error"])),
@@ -1799,6 +1963,7 @@ def _build_analytics(mapping_ids, basis, range_key, include_detail=False):
             "violations": r["violations"], "total_rows": r["total_rows"],
             "mapping_name": r["mapping_name"], "run_id": r["run_id"],
         } for r in offenders],
+        "offender_count": len(all_offenders),
         "trend": trend,
     }
 
@@ -1891,12 +2056,12 @@ def s2d_analytics_export():
 @app.route('/api/s2d/runs', methods=['GET'])
 def list_s2d_runs():
     mapping_id = request.args.get('mapping_id')
-    return jsonify(s2d_db.list_runs(mapping_id=mapping_id))
+    return jsonify(results_store.list_runs(mapping_id=mapping_id))
 
 
 @app.route('/api/s2d/runs/<run_id>', methods=['GET'])
 def get_s2d_run(run_id):
-    run = s2d_db.get_run(run_id)
+    run = results_store.get_run(run_id)
     if not run:
         return jsonify({"error": "Run not found"}), 404
     return jsonify(run)

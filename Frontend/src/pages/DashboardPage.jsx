@@ -10,6 +10,9 @@ import {
 } from 'recharts';
 import { fetchS2DMappings, fetchS2DAnalytics, exportS2DAnalytics } from '../api';
 import { captureCharts } from '../chartCapture';
+import { ListFilter } from '../components/common/ListFilter';
+import { filterByName, noMatchNote } from '../listFilter';
+import { ArrowUp, ArrowDown, ArrowUpDown } from 'lucide-react';
 
 /**
  * Status colours are reserved: they mean pass/error/fail everywhere and are
@@ -51,6 +54,34 @@ const AXIS = { stroke: '#94a3b8', fontSize: 11 };
 const GRID = { stroke: '#e2e8f0', strokeDasharray: '3 3' };
 
 const nf = (n) => (n ?? 0).toLocaleString();
+
+// Column config for "Where the violations are" - one place naming which
+// fields are sortable and how to compare them, so the header row and the
+// sort logic can't drift apart.
+const OFFENDER_COLUMNS = [
+  { key: 'test_name', label: 'Check', type: 'string' },
+  { key: 'mapping_name', label: 'Test layer', type: 'string' },
+  { key: 'validation_type', label: 'Dimension', type: 'string' },
+  { key: 'violations', label: 'Violations', type: 'number', align: 'right' },
+  { key: 'total_rows', label: 'Rows', type: 'number', align: 'right' },
+  { key: 'status', label: 'Status', type: 'string' },
+];
+
+function sortOffenders(rows, { key, dir }) {
+  const col = OFFENDER_COLUMNS.find((c) => c.key === key);
+  const sign = dir === 'asc' ? 1 : -1;
+  return [...rows].sort((a, b) => {
+    if (col?.type === 'number') {
+      // Nulls (e.g. total_rows on a comparison check) sort last regardless of
+      // direction - "unknown" isn't meaningfully high or low.
+      const av = a[key], bv = b[key];
+      if (av === null || av === undefined) return bv === null || bv === undefined ? 0 : 1;
+      if (bv === null || bv === undefined) return -1;
+      return (av - bv) * sign;
+    }
+    return String(a[key] ?? '').localeCompare(String(b[key] ?? '')) * sign;
+  });
+}
 const pct = (n) => (n === null || n === undefined ? '--' : `${n}%`);
 
 function shortDate(iso) {
@@ -223,6 +254,12 @@ export default function DashboardPage() {
   const [exportOpen, setExportOpen] = useState(false);
   const [exportError, setExportError] = useState(null);
 
+  // "Where the violations are" search + sort. Default matches the list's
+  // long-standing behavior (most violations first) so nobody sees a different
+  // order just from this feature landing.
+  const [offenderQuery, setOffenderQuery] = useState('');
+  const [offenderSort, setOffenderSort] = useState({ key: 'violations', dir: 'desc' });
+
   const runExport = async (format) => {
     setExporting(format);
     setExportError(null);
@@ -265,6 +302,11 @@ export default function DashboardPage() {
   const byType = data?.by_validation_type || [];
   const byLayer = data?.by_layer || [];
   const offenders = data?.worst_offenders || [];
+  // Server sends up to OFFENDER_CAP (200), most-violations-first, stating the
+  // true total in offender_count - so a search here can find a specific test
+  // case even when it's nowhere near the top, and a truncation (if the real
+  // count ever exceeds the cap) is visible rather than silent.
+  const offenderTotal = data?.offender_count ?? offenders.length;
 
   /**
    * One line per layer reads well for a handful; this workspace has 32 layers
@@ -574,46 +616,90 @@ export default function DashboardPage() {
 
           <Panel
             title="Where the violations are"
-            hint="The checks that found the most violating rows. Counts are exactly what the check reported - a cross-table check can legitimately report more violations than the table has rows."
+            hint={`The checks that found the most violating rows. Counts are exactly what the check reported - a cross-table check can legitimately report more violations than the table has rows.${
+              offenderTotal > offenders.length ? ` Showing top ${offenders.length} of ${offenderTotal}.` : ''
+            }`}
             isEmpty={offenders.length === 0}
             emptyNote="No check in scope reported any violations."
           >
+            {offenders.length > 0 && (
+              <ListFilter
+                value={offenderQuery} onChange={setOffenderQuery}
+                total={offenders.length} shown={filterByName(offenders, offenderQuery, (o) => o.test_name).length}
+                placeholder="Search by check name..."
+                className="mb-2"
+              />
+            )}
+            {/* Outer wrapper handles horizontal overflow; inner wrapper caps
+                height so a long violations list doesn't stretch the page.
+                thead uses sticky top-0 so it stays visible while scrolling. */}
             <div className="overflow-x-auto">
-              <table className="w-full text-sm">
-                <thead className="text-left text-xs font-medium text-slate-400 border-b border-slate-100">
-                  <tr>
-                    <th className="px-2 py-2">Check</th>
-                    <th className="px-2 py-2">Test layer</th>
-                    <th className="px-2 py-2">Dimension</th>
-                    <th className="px-2 py-2 text-right">Violations</th>
-                    <th className="px-2 py-2 text-right">Rows</th>
-                    <th className="px-2 py-2">Status</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-slate-100">
-                  {offenders.map((o, i) => (
-                    <tr key={`${o.run_id}-${o.test_name}-${i}`}>
-                      <td className="px-2 py-2 text-slate-700 truncate max-w-[220px]" title={o.rule_target}>
-                        {o.test_name}
-                      </td>
-                      <td className="px-2 py-2 text-slate-500 truncate max-w-[160px]">{o.mapping_name}</td>
-                      <td className="px-2 py-2 text-slate-500">{o.validation_type}</td>
-                      <td className="px-2 py-2 text-right font-medium text-slate-700">{nf(o.violations)}</td>
-                      <td className="px-2 py-2 text-right text-slate-500">
-                        {o.total_rows === null ? '--' : nf(o.total_rows)}
-                      </td>
-                      <td className="px-2 py-2">
-                        <span
-                          className="text-xs font-medium px-1.5 py-0.5 rounded"
-                          style={{ color: STATUS_COLOR[o.status], backgroundColor: `${STATUS_COLOR[o.status]}14` }}
-                        >
-                          {o.status}
-                        </span>
-                      </td>
+              <div className="overflow-y-auto max-h-72">
+                <table className="w-full text-sm">
+                  <thead className="sticky top-0 bg-white text-left text-xs font-medium text-slate-400 border-b border-slate-100 z-10">
+                    <tr>
+                      {OFFENDER_COLUMNS.map((col) => {
+                        const active = offenderSort.key === col.key;
+                        const Icon = active ? (offenderSort.dir === 'asc' ? ArrowUp : ArrowDown) : ArrowUpDown;
+                        return (
+                          <th
+                            key={col.key}
+                            className={`px-2 py-2 ${col.align === 'right' ? 'text-right' : ''}`}
+                          >
+                            <button
+                              type="button"
+                              onClick={() => setOffenderSort((prev) => ({
+                                key: col.key,
+                                dir: prev.key === col.key && prev.dir === 'desc' ? 'asc' : 'desc',
+                              }))}
+                              className={`inline-flex items-center gap-1 hover:text-slate-600 ${
+                                col.align === 'right' ? 'flex-row-reverse' : ''
+                              } ${active ? 'text-slate-600' : ''}`}
+                              title={`Sort by ${col.label}`}
+                            >
+                              {col.label}
+                              <Icon className={`w-3 h-3 ${active ? 'text-mastek-primary' : 'text-slate-300'}`} />
+                            </button>
+                          </th>
+                        );
+                      })}
                     </tr>
-                  ))}
-                </tbody>
-              </table>
+                  </thead>
+                  <tbody className="divide-y divide-slate-100">
+                    {(() => {
+                      const visible = sortOffenders(filterByName(offenders, offenderQuery, (o) => o.test_name), offenderSort);
+                      if (visible.length === 0) {
+                        return (
+                          <tr><td colSpan={OFFENDER_COLUMNS.length} className="px-2 py-4 text-sm text-slate-400 italic text-center">
+                            {noMatchNote(offenderQuery)}
+                          </td></tr>
+                        );
+                      }
+                      return visible.map((o, i) => (
+                      <tr key={`${o.run_id}-${o.test_name}-${i}`}>
+                        <td className="px-2 py-2 text-slate-700 truncate max-w-[220px]" title={o.rule_target}>
+                          {o.test_name}
+                        </td>
+                        <td className="px-2 py-2 text-slate-500 truncate max-w-[160px]">{o.mapping_name}</td>
+                        <td className="px-2 py-2 text-slate-500">{o.validation_type}</td>
+                        <td className="px-2 py-2 text-right font-medium text-slate-700">{nf(o.violations)}</td>
+                        <td className="px-2 py-2 text-right text-slate-500">
+                          {o.total_rows === null ? '--' : nf(o.total_rows)}
+                        </td>
+                        <td className="px-2 py-2">
+                          <span
+                            className="text-xs font-medium px-1.5 py-0.5 rounded"
+                            style={{ color: STATUS_COLOR[o.status], backgroundColor: `${STATUS_COLOR[o.status]}14` }}
+                          >
+                            {o.status}
+                          </span>
+                        </td>
+                      </tr>
+                      ));
+                    })()}
+                  </tbody>
+                </table>
+              </div>
             </div>
           </Panel>
 

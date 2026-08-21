@@ -11,6 +11,7 @@ import {
 import SchedulesSection from '../components/schedules/SchedulesSection';
 import { ListFilter } from '../components/common/ListFilter';
 import { filterByName, noMatchNote } from '../listFilter';
+import { useConfirm, useAlert } from '../components/common/confirmContext';
 
 const CATEGORY_ICON = {
   Lakehouse: Database,
@@ -35,6 +36,8 @@ function groupByType(items) {
 }
 
 export default function HarvestWizard() {
+  const confirmDialog = useConfirm();
+  const notify = useAlert();
   const [connectors, setConnectors] = useState([]);
   const [connectorId, setConnectorId] = useState('');
 
@@ -325,12 +328,12 @@ export default function HarvestWizard() {
               const storedIds = new Set((sched.selected_items || []).map((i) => i.id));
               const newlyDiscovered = liveItems.filter((i) => !storedIds.has(i.id));
               if (newlyDiscovered.length === 0) {
-                alert('Selection is already up to date — no new items discovered since this schedule was created.');
+                await notify('Selection is already up to date — no new items discovered since this schedule was created.');
                 return;
               }
               const preview = newlyDiscovered.slice(0, 8).map((i) => `  • ${i.type}: ${i.name}`).join('\n');
               const more = newlyDiscovered.length > 8 ? `\n  … and ${newlyDiscovered.length - 8} more` : '';
-              const ok = confirm(
+              const ok = await confirmDialog(
                 `${newlyDiscovered.length} new item(s) discovered since this schedule was created:\n\n${preview}${more}\n\nAdd them to the schedule?`
               );
               if (!ok) return;

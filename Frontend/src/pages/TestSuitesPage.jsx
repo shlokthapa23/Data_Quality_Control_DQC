@@ -11,6 +11,7 @@ import {
   runSingleS2DTestCase, deleteS2DTestCase,
 } from '../api';
 import SchedulesSection from '../components/schedules/SchedulesSection';
+import { useConfirm } from '../components/common/confirmContext';
 
 const CHECK_TYPE_LABEL = {
   sql: 'SQL',
@@ -24,6 +25,7 @@ function checkTypeLabel(tc) {
 }
 
 export default function TestSuitesPage({ onNavigateToRun, onEditSuite, onEditTestCase }) {
+  const confirmDialog = useConfirm();
   const [validations, setValidations] = useState([]);
   const [selectedValidationId, setSelectedValidationId] = useState('');
   const [suites, setSuites] = useState([]);
@@ -124,7 +126,7 @@ export default function TestSuitesPage({ onNavigateToRun, onEditSuite, onEditTes
   };
 
   const handleDeleteTestCase = async (testCaseId) => {
-    if (!confirm('Delete this test case? This removes it everywhere, not just from this suite.')) return;
+    if (!(await confirmDialog('Delete this test case? This removes it everywhere, not just from this suite.', { tone: 'danger', confirmLabel: 'Delete' }))) return;
     try {
       await deleteS2DTestCase(testCaseId);
       await reloadSelectedSuiteDetail();
@@ -135,7 +137,7 @@ export default function TestSuitesPage({ onNavigateToRun, onEditSuite, onEditTes
   };
 
   const handleDelete = async (suiteId) => {
-    if (!confirm('Delete this test suite? Past run results will remain.')) return;
+    if (!(await confirmDialog('Delete this test suite? Past run results will remain.', { tone: 'danger', confirmLabel: 'Delete' }))) return;
     try {
       await deleteTestSuite(suiteId);
       if (selectedSuiteId === suiteId) setSelectedSuiteId(null);

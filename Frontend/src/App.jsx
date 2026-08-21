@@ -1,5 +1,7 @@
-import { useState } from 'react';
-import { Plug, DownloadCloud, LayoutGrid, Waypoints, GitCompareArrows, ListChecks, CalendarClock, History, Workflow, BarChart3, PanelLeftClose, PanelLeft, ArrowLeft } from 'lucide-react';
+import { useEffect, useState } from 'react';
+import { Plug, DownloadCloud, LayoutGrid, Waypoints, GitCompareArrows, ListChecks, CalendarClock, History, Workflow, BarChart3, PanelLeftClose, PanelLeft, ArrowLeft, LogOut, User } from 'lucide-react';
+import LoginPage from './pages/LoginPage';
+import { fetchCurrentUser, logout as apiLogout } from './api';
 import ConnectPage from './pages/ConnectPage';
 import PipelinesPage from './pages/PipelinesPage';
 import HarvestWizard from './pages/HarvestWizard';
@@ -11,6 +13,7 @@ import SchedulesDashboard from './pages/SchedulesDashboard';
 import AnalyticsPage from './pages/AnalyticsPage';
 import HistoryPage from './pages/HistoryPage';
 import DashboardPage from './pages/DashboardPage';
+import ProfilePage from './pages/ProfilePage';
 import mastekLogo from './images/logo.png'
 const NAV_PAGES = [
   { id: 'dashboard', label: 'Data Quality Dashboard', icon: BarChart3 },
@@ -30,6 +33,30 @@ const NAV_PAGES = [
 ];
 
 function App() {
+  // Auth gate: no valid token -> render LoginPage instead of the app shell.
+  // Checked once per token change, not per render - a fresh register/login
+  // already hands back the user object directly (see LoginPage's onLogin),
+  // so this effect only has to run after a page reload finds a token already
+  // sitting in localStorage.
+  const [token, setToken] = useState(() => localStorage.getItem('access_token'));
+  const [currentUser, setCurrentUser] = useState(null);
+  // No token at mount means there's nothing to check - already "checked".
+  // Kept out of the effect body so there's no synchronous setState call
+  // there (react-hooks/set-state-in-effect, the same rule this codebase's
+  // other data-fetching effects already respect by setting state only
+  // inside a .then/.finally callback).
+  const [authChecked, setAuthChecked] = useState(() => !localStorage.getItem('access_token'));
+
+  useEffect(() => {
+    if (!token) return; // authChecked is already true for this case
+    let cancelled = false;
+    fetchCurrentUser()
+      .then((user) => { if (!cancelled) setCurrentUser(user); })
+      .catch(() => { /* a 401 here already clears the token and reloads via api.js */ })
+      .finally(() => { if (!cancelled) setAuthChecked(true); });
+    return () => { cancelled = true; };
+  }, [token]);
+
   // Opens on the dashboard: it answers "is my data healthy" without the
   // tester having to pick anything first.
   const [activePage, setActivePage] = useState('dashboard');
@@ -63,6 +90,40 @@ function App() {
     localStorage.setItem('navCollapsed', v ? '0' : '1');
     return !v;
   });
+
+  // App itself never unmounts across logout/login (only the LoginPage-vs-shell
+  // branch below changes), so activePage and its handoff state would otherwise
+  // survive into the next session untouched - reopening whatever tab this
+  // account happened to be on instead of the dashboard every fresh session
+  // should land on. Called on both logout and the next successful login,
+  // since either one could be where a stale tab first got carried over.
+  const resetNavigationState = () => {
+    setActivePage('dashboard');
+    setActiveRunId(null);
+    setS2dFocus(null);
+    setS2dReturn(null);
+    setAnalyticsReturnTo('s2d');
+  };
+
+  const handleLogout = () => {
+    apiLogout();
+    setToken(null);
+    setCurrentUser(null);
+    resetNavigationState();
+  };
+
+  // Gate the whole app behind login. Placed after every hook above so the
+  // hook call order stays identical on every render, login or not.
+  if (!token) {
+    return <LoginPage onLogin={(user) => {
+      setCurrentUser(user);
+      setToken(localStorage.getItem('access_token'));
+      resetNavigationState();
+    }} />;
+  }
+  if (!authChecked) {
+    return <div className="flex h-screen items-center justify-center text-slate-400 text-sm">Loading…</div>;
+  }
 
   const goToPage = (id) => {
     setActiveRunId(null);
@@ -141,6 +202,8 @@ function App() {
     content = <SchedulesDashboard />;
   } else if (activePage === 'dashboard') {
     content = <DashboardPage />;
+  } else if (activePage === 'profile') {
+    content = <ProfilePage user={currentUser} />;
   } else {
     content = (
       <>
@@ -206,18 +269,47 @@ function App() {
           ))}
         </nav>
 
-        <button
-          onClick={toggleNav}
-          title={navCollapsed ? 'Expand sidebar' : 'Collapse sidebar'}
-          aria-expanded={!navCollapsed}
-          className={`mt-auto m-3 flex items-center gap-2 py-2 rounded-lg text-xs font-medium text-slate-500 hover:bg-slate-50 ${
-            navCollapsed ? 'justify-center px-0' : 'px-4'
-          }`}
-        >
-          {navCollapsed
-            ? <PanelLeft className="w-4 h-4 shrink-0" />
-            : <><PanelLeftClose className="w-4 h-4 shrink-0" /> Collapse</>}
-        </button>
+        <div className="mt-auto border-t border-slate-200">
+          {currentUser && (
+            <button
+              onClick={() => goToPage('profile')}
+              title={navCollapsed ? `${currentUser.full_name} - View profile` : 'View profile'}
+              className={`w-full flex items-center gap-2 pt-3 pb-1 min-w-0 hover:bg-slate-50 rounded-lg ${
+                navCollapsed ? 'justify-center px-0' : 'px-4 text-left'
+              }`}
+            >
+              <User className="w-4 h-4 shrink-0 text-slate-400" />
+              {!navCollapsed && (
+                <div className="min-w-0">
+                  <p className="text-xs font-medium text-slate-700 truncate">{currentUser.full_name}</p>
+                  <p className="text-[11px] text-slate-400 truncate">{currentUser.organization_name}</p>
+                </div>
+              )}
+            </button>
+          )}
+          <button
+            onClick={handleLogout}
+            title="Log out"
+            className={`flex items-center gap-2 py-2 rounded-lg text-xs font-medium text-slate-500 hover:bg-slate-50 ${
+              navCollapsed ? 'justify-center px-0 mx-3 w-[calc(100%-1.5rem)]' : 'px-4 mx-3'
+            }`}
+          >
+            <LogOut className="w-4 h-4 shrink-0" />
+            {!navCollapsed && 'Log out'}
+          </button>
+          <button
+            onClick={toggleNav}
+            title={navCollapsed ? 'Expand sidebar' : 'Collapse sidebar'}
+            aria-expanded={!navCollapsed}
+            className={`mb-3 mx-3 flex items-center gap-2 py-2 rounded-lg text-xs font-medium text-slate-500 hover:bg-slate-50 ${
+              navCollapsed ? 'justify-center px-0 w-[calc(100%-1.5rem)]' : 'px-4'
+            }`}
+          >
+            {navCollapsed
+              ? <PanelLeft className="w-4 h-4 shrink-0" />
+              : <><PanelLeftClose className="w-4 h-4 shrink-0" /> Collapse</>}
+          </button>
+        </div>
       </aside>
 
       <main className="flex-1 overflow-y-auto p-6 sm:p-8">

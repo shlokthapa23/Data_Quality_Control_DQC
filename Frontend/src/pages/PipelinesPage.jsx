@@ -4,7 +4,7 @@ import {
   ArrowRight, Workflow, CalendarClock, Table2,
 } from 'lucide-react';
 import {
-  fetchConnectors, fetchConnectorContainers, fetchContainerTables,
+  fetchConnectors, fetchConnectorContainers, fetchContainerTables, fetchHarvestedTableNames,
   fetchPipelines, runPipeline, fetchPipelineRun, fetchPipelineRuns,
   fetchPipelineSchedules, createPipelineSchedule, updatePipelineSchedule,
   deletePipelineSchedule, fetchPipelineScheduleEvents,
@@ -120,9 +120,13 @@ function snapshotOf(tables) {
  * empty table reads the same red everywhere. That matters here more than
  * anywhere else: this is the page where a tester is about to load data into it.
  */
-function LakehouseTables({ containerName, tables, status, onRefresh }) {
+function LakehouseTables({ containerName, tables, status, onRefresh, harvestedNames, harvestedStatus, onGoToHarvest }) {
   const [query, setQuery] = useState('');
-  const rows = [...(tables || [])].sort((a, b) => a.name.localeCompare(b.name));
+  // Only tables that came back the last time this Lakehouse was harvested -
+  // deliberately narrower than `tables`, which the before/after run diff
+  // still needs in full (a run can create a table nobody's harvested yet).
+  const allRows = [...(tables || [])].sort((a, b) => a.name.localeCompare(b.name));
+  const rows = harvestedNames ? allRows.filter((t) => harvestedNames.has(t.name)) : [];
   const visible = filterByName(rows, query, (t) => t.name);
   // ?? not ||: 0 is a perfectly good reading, and it's the one worth noticing.
   const readable = rows.filter((t) => (t.row_count ?? null) !== null);
@@ -169,9 +173,23 @@ function LakehouseTables({ containerName, tables, status, onRefresh }) {
           Reading tables and row counts... opening the Fabric connection takes a few seconds.
         </p>
       )}
-      {status === 'idle' && rows.length === 0 && (
+      {harvestedStatus === 'never' && (
+        <p className="flex items-center gap-2 flex-wrap text-sm text-amber-700 bg-amber-50 border border-amber-200 rounded px-2.5 py-2">
+          <AlertCircle className="w-4 h-4 shrink-0" />
+          This Lakehouse hasn&rsquo;t been harvested yet, so there&rsquo;s nothing to show here.
+          {onGoToHarvest && (
+            <button
+              onClick={onGoToHarvest}
+              className="ml-auto shrink-0 text-xs font-medium text-mastek-primary border border-mastek-primary/40 rounded-md px-2 py-1 hover:bg-mastek-primary/10"
+            >
+              Go to Harvest
+            </button>
+          )}
+        </p>
+      )}
+      {harvestedStatus === 'idle' && status === 'idle' && rows.length === 0 && (
         <p className="text-sm text-slate-400 italic">
-          No tables in this Lakehouse yet &mdash; run a pipeline to load some.
+          None of this Lakehouse&rsquo;s harvested tables exist anymore &mdash; re-harvest to refresh the list.
         </p>
       )}
 
@@ -233,6 +251,13 @@ export default function PipelinesPage({ onGoToHarvest }) {
   const [tablesStatus, setTablesStatus] = useState('idle'); // 'idle' | 'loading' | 'error'
   // { before, after, status } - snapshots are table name -> row count.
   const [tableDiff, setTableDiff] = useState(null);
+  // Which of the watched Lakehouse's tables have actually been harvested -
+  // null means "not known yet / never harvested" (LakehouseTables tells those
+  // apart via harvestedStatus below). Deliberately separate from `tables`:
+  // the diff above needs EVERY live table, harvested or not, so this only
+  // narrows what's displayed, never what's measured.
+  const [harvestedNames, setHarvestedNames] = useState(null);
+  const [harvestedStatus, setHarvestedStatus] = useState('idle'); // 'idle' | 'loading' | 'never'
   // Which pipeline's schedules are open, so SchedulesSection knows its parent.
   const [schedulingFor, setSchedulingFor] = useState(null);
 
@@ -246,6 +271,10 @@ export default function PipelinesPage({ onGoToHarvest }) {
   // a reading for a Lakehouse the tester has already switched away from must
   // never overwrite the one they're now looking at.
   const tablesRequestRef = useRef(0);
+  // Same "latest wins" guard for the harvested-names lookup, tracked separately
+  // from tablesRequestRef since the two fetches are independent and can race
+  // against each other, not just against themselves.
+  const harvestedRequestRef = useRef(0);
 
   /**
    * Load the watched Lakehouse's tables WITH row counts, and return them as a
@@ -288,6 +317,42 @@ export default function PipelinesPage({ onGoToHarvest }) {
     }
   }, []);
 
+  // Cheap local-DB read, independent of the (expensive) live table listing
+  // above. Action-driven like loadTables rather than an effect watching
+  // connectorId/watchContainerId - a bare effect calling setState directly in
+  // its body is exactly what this file's other loaders already avoid (see
+  // loadTables' and loadPipelines' comments below), so this is called at each
+  // of the same spots that call loadTables, guarded by the same
+  // "latest request wins" ref pattern. Declared before loadPipelines (which
+  // calls it) rather than relying on it being safe at runtime despite the
+  // textual order - matches this codebase's stated preference for physically
+  // reordering over reasoning about hoisting.
+  const loadHarvestedNames = useCallback(async (cid, containerId) => {
+    if (!cid || !containerId) {
+      harvestedRequestRef.current += 1;
+      setHarvestedNames(null);
+      setHarvestedStatus('idle');
+      return;
+    }
+    const seq = ++harvestedRequestRef.current;
+    setHarvestedStatus('loading');
+    try {
+      const data = await fetchHarvestedTableNames(cid, containerId);
+      if (seq !== harvestedRequestRef.current) return;
+      if (data.harvested) {
+        setHarvestedNames(new Set(data.tables || []));
+        setHarvestedStatus('idle');
+      } else {
+        setHarvestedNames(null);
+        setHarvestedStatus('never');
+      }
+    } catch {
+      if (seq !== harvestedRequestRef.current) return;
+      setHarvestedNames(null);
+      setHarvestedStatus('never');
+    }
+  }, []);
+
   // Wrapped so it's a stable reference the mount effect can legitimately depend
   // on: everything it closes over is either a ref, a setState, or loadTables,
   // all of which are stable, so this is created once and the effect still runs
@@ -299,6 +364,7 @@ export default function PipelinesPage({ onGoToHarvest }) {
       setContainers([]);
       setWatchContainerId('');
       loadTables('', '');
+      loadHarvestedNames('', '');
       return;
     }
     setIsLoading(true);
@@ -328,14 +394,16 @@ export default function PipelinesPage({ onGoToHarvest }) {
         setWatchContainerId(first);
         setTableDiff(null);
         loadTables(id, first);
+        loadHarvestedNames(id, first);
       })
       .catch(() => {
         if (requestedConnectorRef.current !== id) return;
         setContainers([]);
         setWatchContainerId('');
         loadTables('', '');
+        loadHarvestedNames('', '');
       });
-  }, [loadTables]);
+  }, [loadTables, loadHarvestedNames]);
 
   /**
    * Row counts for every table in the watched Lakehouse, or null if unavailable.
@@ -510,6 +578,7 @@ export default function PipelinesPage({ onGoToHarvest }) {
                   setWatchContainerId(e.target.value);
                   setTableDiff(null);
                   loadTables(connectorId, e.target.value);
+                  loadHarvestedNames(connectorId, e.target.value);
                 }}
                 className="flex-1 min-w-0 px-2.5 py-1.5 text-sm border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-mastek-accent"
               >
@@ -531,6 +600,9 @@ export default function PipelinesPage({ onGoToHarvest }) {
             tables={tables}
             status={tablesStatus}
             onRefresh={() => loadTables(connectorId, watchContainerId)}
+            harvestedNames={harvestedNames}
+            harvestedStatus={harvestedStatus}
+            onGoToHarvest={onGoToHarvest}
           />
         )}
 

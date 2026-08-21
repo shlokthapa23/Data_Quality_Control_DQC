@@ -29,6 +29,7 @@ from apscheduler.triggers.interval import IntervalTrigger
 from apscheduler.events import EVENT_JOB_MISSED
 
 from s2d import db as s2d_db
+from s2d import results_store
 from s2d.engine import run_suite
 from catalog import db as catalog_db
 from connector_factory import build_connector
@@ -117,8 +118,29 @@ def init_scheduler():
             except Exception as e:
                 log.error("Failed to register pipeline schedule %s: %s", row["id"], e)
 
+    # A fixed maintenance job, not a user-configurable schedule kind - no DB
+    # row, no entry in s2d_db.SCHEDULE_TABLES, no CRUD routes. It doesn't need
+    # any of that machinery because nobody creates/edits/deletes it through
+    # the UI; it just needs to run daily for as long as the app runs.
+    _scheduler.add_job(
+        _prune_old_results_job,
+        trigger=CronTrigger.from_crontab("0 2 * * *", timezone=ZoneInfo("UTC")),
+        id="retention:prune",
+        replace_existing=True,
+    )
+
     log.info("Scheduler started with %d jobs", len(_scheduler.get_jobs()))
     return _scheduler
+
+
+def _prune_old_results_job():
+    """Deletes test runs/results older than results_store.RETENTION_DAYS. Logged either way - silence here would look identical to "nothing was old enough", which isn't checkable from outside."""
+    try:
+        deleted = results_store.prune_older_than_days()
+        log.info("Retention prune: removed %d test run(s) older than %d days",
+                  deleted, results_store.RETENTION_DAYS)
+    except Exception as e:
+        log.error("Retention prune failed: %s", e)
 
 
 # --- Suite jobs -------------------------------------------------------------

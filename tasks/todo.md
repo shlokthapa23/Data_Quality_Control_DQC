@@ -1,6 +1,71 @@
 # Todo
 
-**Current state (2026-08-14): everything works, nothing is half-finished, and everything is committed.**
+## In progress (2026-08-19): Profile page, harvest-gated tables, retention, dashboard sort/search
+
+Plan at `C:\Users\shlok164201\.claude\plans\modular-strolling-flamingo.md`.
+
+- [ ] Profile page (frontend-only, 3 buttons deliberately inert per user instruction)
+- [ ] Test Data Preparation table list only shows harvested tables (`?harvested_only=1`)
+- [ ] 20-day test-history retention (`retention:prune` scheduler job) + `s2d/results_store.py`
+      seam for a future production DB (no Postgres work now, just the indirection point)
+- [ ] Dashboard "Where the violations are": search + sortable columns, cap raised 10 -> 200
+- [ ] Verify per plan; update this file + lessons.md when done
+
+## Authentication - done, 2026-08-19
+
+Register/login (JWT + bcrypt) now gates the whole app. Ported from a separate project's
+`auth.py`/`Login.tsx`, rebuilt in this app's own stack (plain JSX, Tailwind `mastek-*` theme,
+flat-JSON `api.js`, Flask `before_request` gate) - no new frontend dependencies. Plan at
+`C:\Users\shlok164201\.claude\plans\modular-strolling-flamingo.md`.
+
+- `Backend/auth/db.py` - new `organizations` + `users` tables (additive, brand new tables,
+  nothing to backfill), reusing `catalog.db.get_conn` like every other domain module.
+- `Backend/auth/security.py` - bcrypt hash/verify, JWT create/decode (`python-jose`, HS256).
+- `Backend/auth/routes.py` - `POST /api/auth/register` (creates an org + owner user),
+  `POST /api/auth/login`, `GET /api/auth/me`. Flat JSON responses, matching every other route
+  - no `{data: ...}` envelope.
+- `app.py` - `init_auth_tables()` at startup; **one `before_request` gate**, not per-route
+  decorators. `tasks/lessons.md` already recorded this exact failure shape once (schedule
+  kinds with no central registry silently breaking one spot) - decorating 50+ routes
+  individually would have been the same trap. Allowlist: `/api/health`, `/api/auth/register`,
+  `/api/auth/login`, `OPTIONS`.
+- `requirements.txt` - `bcrypt==4.2.0`, `python-jose[cryptography]==3.3.0` (installed into
+  `Backend/.venv`, the venv `.claude/launch.json` actually runs). `.env` - generated
+  `SECRET_KEY` + `ACCESS_TOKEN_EXPIRE_MINUTES=1440`.
+- `Frontend/src/pages/LoginPage.jsx` (new) - two-panel layout ported from the reference
+  `Login.tsx`, restyled with this app's real `mastek-*` theme colors and logo, no shadcn/no
+  toast lib - plain JSX/Tailwind, hand-rolled tabs, inline error banner.
+- `Frontend/src/api.js` - `login`/`register`/`fetchCurrentUser`/`logout`; all 4 fetch call
+  sites (`request()`, `deleteConnector`, `uploadLocalFile`, `exportS2DAnalytics`) now attach
+  `Authorization: Bearer <token>` and treat a 401 as "clear token + reload" - the simplest
+  reliable bounce-to-login from any call site.
+- `Frontend/src/App.jsx` - gates the whole shell behind a token; sidebar footer shows the
+  signed-in user/org + a Log out button.
+
+**Scope boundary (deliberate)**: authentication only, no per-organization data isolation -
+connectors/mappings/etc. stay global exactly as today, same as before this feature.
+
+**No join-existing-org flow**: each registration always founds a brand new organization
+(mirrors the reference UI, which only offered `organization_name` on register, no "join").
+
+**Verified**: backend compiles clean; curl round-trip (register -> 201+token, login -> token,
+wrong password -> 401, `/me` with/without token -> 200/401, an existing route
+(`/api/connectors`) 401s with no token and returns its normal shape with one, `/api/health`
+still open with none). Browser, through the real UI: registered a throwaway account -> landed
+straight in the app with real data loading (Data Quality Dashboard); reload -> session
+persists; sidebar shows the account's name/org; Log out -> back to Login, token cleared;
+corrupting the stored token -> `/me` 401s, token cleared, bounced to Login automatically.
+`npm run lint` at the existing 9-problem baseline (fixed one new `react-hooks/set-state-in-effect`
+error the first draft introduced, by moving `authChecked`'s no-token case into `useState`'s
+lazy initializer instead of calling `setState` synchronously inside the effect body).
+
+**Left behind, not cleaned up**: two throwaway accounts created during verification
+(`zz-verify@example.com` / `zz-browsertest@example.com`, each with their own new
+organization) - these are now real accounts, not disposable fixtures, so they're flagged
+here rather than silently deleted. Delete via `Backend/auth/db.py`'s `users`/`organizations`
+tables if you don't want them, or say so and I will.
+
+## Previous state (2026-08-14): everything works, nothing is half-finished, and everything is committed.
 
 Backend imports clean, frontend lints at its **9-problem baseline** (all pre-existing), and every feature below was verified against the real Fabric workspace and local DuckDB, not just compiled.
 

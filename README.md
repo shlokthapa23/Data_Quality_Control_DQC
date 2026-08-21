@@ -1,4 +1,4 @@
-# Fabric Explorer Portal
+# Data Quality Control
 
 An internal data platform for Microsoft Fabric (and local CSV/Parquet files):
 connect to workspaces, harvest metadata into a searchable catalog, and run

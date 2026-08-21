@@ -7,8 +7,13 @@ python-dotenv==1.0.1
 duckdb==1.5.4
 APScheduler>=3.10.4,<4.0
 
+# Auth: register/login gate
+bcrypt==4.2.0
+python-jose[cryptography]==3.3.0
+
 # Dashboard exports: Word / PowerPoint / PDF / Power BI-ready workbook
 python-docx==1.2.0
 python-pptx==1.0.2
 reportlab==5.0.0
 openpyxl==3.1.5
+npm install

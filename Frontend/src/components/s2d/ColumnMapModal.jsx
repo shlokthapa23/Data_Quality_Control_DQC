@@ -2,6 +2,8 @@ import { useEffect, useMemo, useState } from 'react';
 import { X, Loader2, Plus, Trash2, Wand2, AlertCircle } from 'lucide-react';
 import { fetchContainerTables, saveS2DColumnMap } from '../../api';
 import { autoMatchEntries, normalizeName } from '../../columnMap';
+import { useConfirm } from '../common/confirmContext';
+import { TableCheckboxList } from '../common/TableCheckboxList';
 
 /**
  * Editor for a validation's opt-in column map.
@@ -27,6 +29,7 @@ const withId = (entry) => ({ ...entry, _id: (nextRowId += 1) });
 const emptyRow = () => withId({ name: '', source: {}, destination: {} });
 
 export default function ColumnMapModal({ mapping, onClose, onSaved }) {
+  const confirmDialog = useConfirm();
   const [schemas, setSchemas] = useState({ source: {}, destination: {} });
   const [isLoading, setIsLoading] = useState(true);
   const [loadError, setLoadError] = useState(null);
@@ -34,6 +37,12 @@ export default function ColumnMapModal({ mapping, onClose, onSaved }) {
   const [isDirty, setIsDirty] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
   const [saveError, setSaveError] = useState(null);
+  // Which of this layer's own tables to show columns for right now - a layer
+  // with 30 tables rendering all 30 as grid columns at once is unusable.
+  // Defaults to every table (today's behavior, unchanged for a small layer);
+  // narrowing it down is opt-in via the pickers below.
+  const [visibleSourceTables, setVisibleSourceTables] = useState(mapping.source_tables);
+  const [visibleDestinationTables, setVisibleDestinationTables] = useState(mapping.destination_tables);
 
   // Same per-selection fetch idiom TestCasePanel uses - a cancelled flag so a
   // slow response for a mapping we've already navigated away from can't land
@@ -71,14 +80,20 @@ export default function ColumnMapModal({ mapping, onClose, onSaved }) {
   }, [mapping]);
 
   // Source tables first, then destination - the order the tester thinks about
-  // the pipeline in.
+  // the pipeline in. Only the tables currently checked below - not every
+  // table this layer has - so the grid stays usable at any layer size.
   const columns = useMemo(
     () => [
-      ...mapping.source_tables.map((table) => ({ side: 'source', table })),
-      ...mapping.destination_tables.map((table) => ({ side: 'destination', table })),
+      ...visibleSourceTables.map((table) => ({ side: 'source', table })),
+      ...visibleDestinationTables.map((table) => ({ side: 'destination', table })),
     ],
-    [mapping]
+    [visibleSourceTables, visibleDestinationTables]
   );
+
+  const toggleVisibleTable = (side, table) => {
+    const setter = side === 'source' ? setVisibleSourceTables : setVisibleDestinationTables;
+    setter((prev) => (prev.includes(table) ? prev.filter((t) => t !== table) : [...prev, table]));
+  };
 
   const updateRow = (id, patch) => {
     setRows((rs) => rs.map((r) => (r._id === id ? { ...r, ...patch } : r)));
@@ -150,13 +165,37 @@ export default function ColumnMapModal({ mapping, onClose, onSaved }) {
       });
   };
 
-  const handleClose = () => {
-    if (isDirty && !confirm('Discard unsaved changes to this column map?')) return;
+  const handleClose = async () => {
+    if (isDirty && !(await confirmDialog('Discard unsaved changes to this column map?'))) return;
     onClose();
   };
 
+  // Coverage is against every table this layer has, not just the ones
+  // currently shown in the grid - hiding a table to declutter the view
+  // shouldn't make a name that only covers what's visible read as "fully
+  // covered".
+  const allTables = useMemo(
+    () => [
+      ...mapping.source_tables.map((table) => ({ side: 'source', table })),
+      ...mapping.destination_tables.map((table) => ({ side: 'destination', table })),
+    ],
+    [mapping]
+  );
   const coverageOf = (row) =>
-    columns.filter(({ side, table }) => (row[side] || {})[table]).length;
+    allTables.filter(({ side, table }) => (row[side] || {})[table]).length;
+
+  // Narrowing the table pickers above should narrow which ROWS are worth
+  // looking at too - a name mapped only on tables you just hid is noise
+  // while you're focused on a different table, not something to keep
+  // staring at as a wall of "--" dropdowns. A row with no mappings at all
+  // yet is always kept, though - it's either brand new (Add common name)
+  // or mid-edit, and hiding it the instant it's created would be jarring.
+  const visibleRows = rows.filter((row) => {
+    const totalMapped = coverageOf(row);
+    if (totalMapped === 0) return true;
+    return columns.some(({ side, table }) => (row[side] || {})[table]);
+  });
+  const hiddenRowCount = rows.length - visibleRows.length;
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4">
@@ -189,11 +228,48 @@ export default function ColumnMapModal({ mapping, onClose, onSaved }) {
 
           {!isLoading && !loadError && (
             <>
+              {/* Which tables actually render as grid columns - opt-in
+                  narrowing, so a layer with 30 tables doesn't force all 30
+                  onto the grid at once. Defaults to every table (unchanged
+                  behavior for a small layer). */}
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 mb-4">
+                <div>
+                  <p className="text-xs font-medium text-slate-500 mb-1">
+                    Source tables to show <span className="text-slate-400">({visibleSourceTables.length} of {mapping.source_tables.length})</span>
+                  </p>
+                  <TableCheckboxList
+                    tables={mapping.source_tables}
+                    selected={visibleSourceTables}
+                    onToggle={(t) => toggleVisibleTable('source', t)}
+                  />
+                </div>
+                <div>
+                  <p className="text-xs font-medium text-slate-500 mb-1">
+                    Destination tables to show <span className="text-slate-400">({visibleDestinationTables.length} of {mapping.destination_tables.length})</span>
+                  </p>
+                  <TableCheckboxList
+                    tables={mapping.destination_tables}
+                    selected={visibleDestinationTables}
+                    onToggle={(t) => toggleVisibleTable('destination', t)}
+                  />
+                </div>
+              </div>
+
+              {columns.length === 0 ? (
+                <p className="text-sm text-slate-400 italic border border-slate-200 rounded-lg px-3 py-8 text-center">
+                  No tables selected above - pick at least one to map its columns.
+                </p>
+              ) : (
+              // A hard cap on visible columns is deliberately NOT here - the
+              // tester already narrowed it down above. This scrolls
+              // horizontally past 3-4 tables (min-w-[10rem] each), with the
+              // "Common name" column pinned via sticky so it never scrolls
+              // out of view while comparing many tables side by side.
               <div className="overflow-x-auto border border-slate-200 rounded-lg">
                 <table className="w-full text-sm">
                   <thead className="text-left text-xs font-medium text-slate-400 border-b border-slate-100 bg-white">
                     <tr>
-                      <th className="px-3 py-3 min-w-[11rem]">Common name</th>
+                      <th className="sticky left-0 z-10 bg-white px-3 py-3 min-w-[11rem]">Common name</th>
                       {columns.map(({ side, table }) => (
                         <th key={`${side}:${table}`} className="px-3 py-3 min-w-[10rem]" title={table}>
                           <span className="block text-slate-600 font-mono truncate">{shortTableName(table)}</span>
@@ -217,9 +293,16 @@ export default function ColumnMapModal({ mapping, onClose, onSaved }) {
                         </td>
                       </tr>
                     )}
-                    {rows.map((row) => (
+                    {rows.length > 0 && visibleRows.length === 0 && (
+                      <tr>
+                        <td colSpan={columns.length + 2} className="px-3 py-8 text-center text-sm text-slate-400">
+                          None of your {rows.length} common name{rows.length === 1 ? '' : 's'} are mapped on the table{columns.length === 1 ? '' : 's'} shown above.
+                        </td>
+                      </tr>
+                    )}
+                    {visibleRows.map((row) => (
                       <tr key={row._id}>
-                        <td className="px-3 py-2">
+                        <td className="sticky left-0 z-10 bg-white px-3 py-2">
                           <input
                             value={row.name}
                             onChange={(e) => updateRow(row._id, { name: e.target.value })}
@@ -227,7 +310,7 @@ export default function ColumnMapModal({ mapping, onClose, onSaved }) {
                             className="w-full px-2.5 py-1.5 text-sm font-mono border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-mastek-accent"
                           />
                           <span className="block mt-1 text-[10px] text-slate-400">
-                            covers {coverageOf(row)} of {columns.length} tables
+                            covers {coverageOf(row)} of {allTables.length} tables
                           </span>
                         </td>
                         {columns.map(({ side, table }) => (
@@ -260,6 +343,14 @@ export default function ColumnMapModal({ mapping, onClose, onSaved }) {
                   </tbody>
                 </table>
               </div>
+              )}
+
+              {hiddenRowCount > 0 && (
+                <p className="mt-3 text-xs text-amber-600">
+                  {hiddenRowCount} common name{hiddenRowCount === 1 ? '' : 's'} not mapped on any table shown above
+                  {' '}&mdash; hidden here, not deleted. Check more tables above to see them again.
+                </p>
+              )}
 
               <p className="mt-3 text-xs text-slate-400">
                 A common name only appears in a test case&rsquo;s column dropdown once it covers every table that

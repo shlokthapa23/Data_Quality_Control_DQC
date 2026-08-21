@@ -1,3 +1,4 @@
+import re
 import time
 from datetime import datetime, timezone
 
@@ -5,6 +6,7 @@ from s2d import column_map
 from collections import Counter
 
 from s2d import db as s2d_db
+from s2d import results_store
 
 
 def _interpret_row(row):
@@ -632,11 +634,52 @@ ALL_COLUMNS = "*"
 MAX_ROWS_PER_SIDE = 100000
 
 
+# Pre-filter: only try strptime when the string *looks* like a date (digit
+# groups separated by - or /).  This avoids accidentally re-formatting IDs or
+# version numbers that happen to share the same character pattern.
+_DATE_LIKE = re.compile(r'^\d{1,4}[-/]\d{1,2}[-/]\d{1,4}$')
+
+# Ordered from most-specific to least-specific. %y (2-digit year) is tried
+# after all %Y variants so 2001-09-25 is matched as YYYY-MM-DD, not re-parsed
+# as a 2-digit-year format by accident.
+_DATE_FORMATS = [
+    '%Y-%m-%d',   # 2001-09-25  (ISO — source DuckDB)
+    '%Y/%m/%d',   # 2001/09/25
+    '%d-%m-%Y',   # 25-09-2001
+    '%d/%m/%Y',   # 25/09/2001
+    '%m-%d-%Y',   # 09-25-2001  (US)
+    '%m/%d/%Y',   # 09/25/2001  (US)
+    '%y-%m-%d',   # 01-09-25    (Fabric 2-digit-year — the common mismatch)
+    '%d-%m-%y',   # 25-09-01
+    '%d/%m/%y',   # 25/09/01
+]
+
+
+def _try_iso_date(text):
+    """
+    Parse a date-like string from any of the formats the two sides commonly
+    use and return it as YYYY-MM-DD, or None if it doesn't match any of them.
+    Python's %y: 00-68 -> 2000-2068, 69-99 -> 1969-1999 — good enough for
+    the business-data range this app handles.
+    """
+    if not _DATE_LIKE.match(text):
+        return None
+    for fmt in _DATE_FORMATS:
+        try:
+            return datetime.strptime(text, fmt).date().isoformat()
+        except ValueError:
+            continue
+    return None
+
+
 def _normalise_cell(value):
     """
     One text form per value, so 5 and "5" - or a DATE and a TIMESTAMP at
     midnight - don't read as a mismatch just because the two systems typed them
-    differently. Mirrors the date handling the single-key path already does.
+    differently. Also normalises date strings to ISO YYYY-MM-DD regardless of
+    the format the source connector chose (e.g. DuckDB returns 2001-09-25 while
+    Fabric may store 01-09-25 as a 2-digit-year string) — enforced here on
+    every whole-row parity check so callers never need per-test workarounds.
     """
     if value is None:
         return ""
@@ -647,6 +690,9 @@ def _normalise_cell(value):
         head = text[:-2]
         if head.lstrip("-").isdigit():
             return head
+    iso = _try_iso_date(text)
+    if iso:
+        return iso
     return text
 
 
@@ -878,7 +924,7 @@ def _persist_run(mapping_id, results, compute_time_seconds, suite_id=None):
     fail_count = len(results) - pass_count
     overall_status = "passed" if fail_count == 0 else "failed"
 
-    run_id = s2d_db.create_run(
+    run_id = results_store.create_run(
         mapping_id=mapping_id, status=overall_status,
         total_checkpoints=len(results), pass_count=pass_count, fail_count=fail_count,
         compute_time_seconds=compute_time_seconds,
@@ -886,7 +932,7 @@ def _persist_run(mapping_id, results, compute_time_seconds, suite_id=None):
         suite_id=suite_id,
     )
     for r in results:
-        s2d_db.add_result(run_id=run_id, **r)
+        results_store.add_result(run_id=run_id, **r)
     return run_id
 
 

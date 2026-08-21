@@ -62,4 +62,25 @@ Reviewed at every session start. Applied before touching anything.
 
 ## 2026-08-18
 
+## 2026-08-19 (incident)
+
+- **[2026-08-19]** | Verified a new retention-prune function (`results_store.prune_older_than_days(20)`) by calling it **directly against the live `catalog.db`** to confirm it worked - it did, and permanently deleted 68 real test runs + their results (everything before 2026-07-30), with no backup to recover from (`catalog.db` is gitignored, real runtime data). The mistake was treating a function whose entire purpose is deletion as safe to "just try" because it was expected to delete something - the same carelessness the earlier destructive-migration and disposable-fixture lessons already warned about, in a new shape. | **Never call a real delete/prune function against a live database to verify it, even one built in this same session.** First: count what it would affect (`SELECT COUNT(*) ... WHERE <the same condition>`) and look at the number before running it for real. For anything that deletes based on a computed cutoff (age, date range, etc.), verify against an isolated copy of the DB file or synthetic rows in a temp table/file - never the live one. If a live run is unavoidable, tell the user what it's about to affect and get a yes first, treating it exactly like the "delete a mapping" cascade-delete verification already does (a dedicated throwaway fixture, never real rows).
+
+## 2026-08-19
+
+- **[2026-08-19]** | Porting a reference file's snippet (`useState(false)` then `setState(true)`
+  synchronously inside a `useEffect` for the "nothing to check" branch of an auth gate) tripped
+  a real `react-hooks/set-state-in-effect` error and would have pushed the frontend past its
+  9-problem lint baseline. | When an effect's only job in one branch is "there's nothing to do,
+  so the derived state is already known at mount," compute that in the `useState` lazy
+  initializer instead of `setState`-ing it from inside the effect body. Reserve the effect for
+  the branch that genuinely needs an async round trip (there, `setState` inside `.then()`/
+  `.finally()` is fine - it's synchronous-in-effect-body specifically that the rule catches).
+- **[2026-08-19]** | `.claude/launch.json` runs the backend via a **dedicated venv**
+  (`Backend/.venv/Scripts/python.exe`), not whatever `python`/`pip` resolves to on PATH. Installing
+  a new dependency (`bcrypt`, `python-jose`) into the PATH interpreter left the actual launch
+  target still missing them - `preview_start` failed with `ModuleNotFoundError` even though a
+  bare `pip install` had "worked." | Always install into `Backend/.venv/Scripts/python.exe -m pip
+  install ...` for this repo, not the ambient interpreter - check `.claude/launch.json`'s
+  `runtimeExecutable` first when adding any new Python package.
 - **[2026-08-18]** | A Dataflow Gen2 triggered from the Pipelines tab (`run_pipeline(item_id, job_type="Refresh")`) failed with `"SPN based refresh is not allowed for the dataflow with id ..."`, but the same dataflow refreshed fine when the user clicked Refresh manually in the Fabric portal. Nearly investigated as a permissions/role problem on the service principal. | **This is a current, unconditional Microsoft Fabric platform limitation, not a config or permissions bug** - confirmed in Fabric's own docs ("Service principal authentication isn't supported... you can invoke Run APIs, but the actual run never succeeds") and in a live Microsoft `fabric-cicd` GitHub issue (#971) hitting the identical error even from *inside* a pipeline's Dataflow activity. **No SP role grants a fix**, and wrapping the dataflow in a Data Pipeline activity does not reliably route around it either. Verified live: this connector's run history for one dataflow showed `Failed` (SPN-triggered) and `Completed` (portal/delegated) runs interleaved minutes apart on the same item. `_pipeline_run_to_dict` in `fabric_connector.py` now rewrites this specific Fabric message into an actionable one via `_translate_failure_reason` - the single point every consumer (manual run poll, run history, scheduler outcome) reads through - rather than leaving the raw string to look like a mystery failure. If asked to "fix" a Dataflow Gen2 SPN trigger failure again: don't re-diagnose, don't try granting more Fabric roles - point at this entry.
