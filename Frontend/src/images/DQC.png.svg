@@ -1,0 +1,132 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 500 500" width="100%" height="100%">
+  <defs>
+    <!-- Gradient for the line art and outer circle -->
+    <linearGradient id="primaryGradient" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#00bcd4" />
+      <stop offset="50%" stop-color="#3b82f6" />
+      <stop offset="100%" stop-color="#6366f1" />
+    </linearGradient>
+
+    <!-- Gradient specifically for typography to match deep indigo/purple tone -->
+    <linearGradient id="textGradient" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#4f46e5" />
+      <stop offset="100%" stop-color="#6366f1" />
+    </linearGradient>
+  </defs>
+
+  <!-- Outer Dashed Concept Circle -->
+  <circle 
+    cx="250" 
+    cy="200" 
+    r="160" 
+    fill="none" 
+    stroke="url(#primaryGradient)" 
+    stroke-width="3.5" 
+    stroke-linecap="round"
+    stroke-dasharray="16 14"
+  />
+
+  <!-- Main Illustration Group -->
+  <g fill="none" stroke="url(#primaryGradient)" stroke-width="4" stroke-linecap="round" stroke-linejoin="round">
+
+    <!-- TOP-RIGHT: Charts Area -->
+    <!-- Base shelf/axis -->
+    <line x1="230" y1="185" x2="365" y2="185" />
+    
+    <!-- Vertical Bar 1 -->
+    <rect x="240" y="65" width="28" height="120" rx="3" />
+    
+    <!-- Vertical Bar 2 -->
+    <rect x="285" y="140" width="28" height="45" rx="3" />
+    
+    <!-- Vertical Bar 3 (Right) -->
+    <rect x="325" y="140" width="32" height="45" rx="3" />
+    
+    <!-- Pie Chart -->
+    <g transform="translate(325, 100)">
+      <circle cx="0" cy="0" r="38" />
+      <path d="M 0,-38 L 0,0 L 27,27" />
+      <path d="M 0,0 L 38,-3" />
+    </g>
+
+
+    <!-- TOP-LEFT: Quality Rosette / Badge -->
+    <!-- Ribbon tails -->
+    <path d="M 115 190 L 100 245 L 140 230 L 160 255 L 175 210" />
+    <path d="M 185 210 L 200 255 L 220 230 L 260 245 L 245 190" />
+    
+    <!-- Rosette Scalloped Outer Border -->
+    <path d="
+      M 160 70
+      C 166 60, 179 60, 185 70
+      C 194 65, 206 70, 210 80
+      C 221 80, 229 90, 228 100
+      C 238 105, 241 118, 236 128
+      C 243 136, 240 149, 232 156
+      C 234 167, 226 177, 216 180
+      C 213 190, 201 196, 192 192
+      C 184 200, 171 200, 165 192
+      C 156 196, 144 190, 141 180
+      C 131 177, 123 167, 125 156
+      C 117 149, 114 136, 121 128
+      C 116 118, 119 105, 129 100
+      C 128 90, 136 80, 147 80
+      C 151 70, 163 65, 172 70 Z
+    " />
+    
+    <!-- Badge Inner Ring -->
+    <circle cx="178" cy="132" r="36" />
+    
+    <!-- Checkmark Inside Badge -->
+    <path d="M 160 133 L 173 147 L 202 117" stroke-width="5" />
+
+
+    <!-- BOTTOM-RIGHT: Dashboard / Application Window -->
+    <!-- Window Outline -->
+    <rect x="230" y="208" width="135" height="112" rx="7" />
+    
+    <!-- Header Divider -->
+    <line x1="230" y1="238" x2="365" y2="238" />
+    
+    <!-- Window Control Dots -->
+    <circle cx="248" cy="223" r="3.5" />
+    <circle cx="263" cy="223" r="3.5" />
+    <circle cx="278" cy="223" r="3.5" />
+    
+    <!-- Mini Line Chart inside Window -->
+    <path d="M 305 264 L 322 254 L 338 268 L 354 246" />
+    
+    <!-- Mini Bar Chart inside Window -->
+    <rect x="306" y="278" width="14" height="28" rx="1.5" />
+    <rect x="326" y="290" width="14" height="16" rx="1.5" />
+    <rect x="344" y="270" width="14" height="36" rx="1.5" />
+
+
+    <!-- CENTER-BOTTOM: Magnifying Glass with Eye -->
+    <!-- Lens Outer Circle (covers behind handle) -->
+    <circle cx="260" cy="292" r="35" fill="#ffffff" />
+    
+    <!-- Eye Shape inside Lens -->
+    <path d="M 238 292 Q 260 274 282 292 Q 260 310 238 292 Z" />
+    <circle cx="260" cy="292" r="6" fill="url(#primaryGradient)" />
+    
+    <!-- Magnifier Handle -->
+    <g transform="rotate(-40 228 322)">
+      <path d="M 223 318 L 223 344 C 223 350 233 350 233 344 L 233 318" fill="#ffffff" />
+    </g>
+
+  </g>
+
+  <!-- Typography -->
+  <g 
+    font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" 
+    font-weight="700" 
+    font-size="21" 
+    fill="url(#textGradient)" 
+    text-anchor="middle"
+    letter-spacing="1.5"
+  >
+    <text x="250" y="415">DATA QUALITY</text>
+    <text x="250" y="445">CONTROL</text>
+  </g>
+</svg>

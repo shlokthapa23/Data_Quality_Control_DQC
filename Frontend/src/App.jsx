@@ -14,7 +14,7 @@ import AnalyticsPage from './pages/AnalyticsPage';
 import HistoryPage from './pages/HistoryPage';
 import DashboardPage from './pages/DashboardPage';
 import ProfilePage from './pages/ProfilePage';
-import mastekLogo from './images/logo.png'
+import DQClogo from './images/DQC.png';
 const NAV_PAGES = [
   { id: 'dashboard', label: 'Data Quality Dashboard', icon: BarChart3 },
   { id: 'connect', label: 'Connect', icon: Plug },
@@ -240,7 +240,7 @@ function App() {
           navCollapsed ? 'justify-center px-2' : 'px-6'
         }`}>
           <img
-            src={mastekLogo}
+            src={DQClogo}
             alt="Mastek Logo"
             className={`object-contain ${navCollapsed ? 'w-9 h-9' : 'w-auto h-12'}`}
           />
