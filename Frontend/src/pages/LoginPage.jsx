@@ -4,6 +4,7 @@ import {
   Eye, EyeOff, Mail, Lock, AlertCircle,
 } from 'lucide-react';
 import { login, register, fetchCurrentUser } from '../api';
+import loginIllustration from '../images/Login_page.png';
 
 // ── "Remember me" persistence ───────────────────────────────────────────────
 // Stored in localStorage so it survives browser/frontend/backend restarts.
@@ -56,58 +57,6 @@ const STATS = [
   { value: '8', label: 'Parity Metrics', icon: ShieldCheck },
   { value: '24/7', label: 'Scheduled Runs', icon: Zap },
 ];
-
-function GlobeDecoration() {
-  const rows = 12;
-  const cols = 15;
-  const dots = [];
-
-  for (let row = 1; row < rows; row++) {
-    for (let col = 0; col < cols; col++) {
-      const phi = (row / rows) * Math.PI;
-      const theta = (col / cols) * 2 * Math.PI;
-      const x = 50 + 40 * Math.sin(phi) * Math.cos(theta);
-      const y = 50 + 40 * Math.cos(phi);
-      const z = Math.sin(phi) * Math.sin(theta);
-      if (z > -0.15) {
-        const size = Math.max(1.2, 1.5 + z * 3.2);
-        const opacity = Math.max(0.12, 0.22 + z * 0.7);
-        const isAccent = row >= 7 && row <= 9 && col >= 3 && col <= 7;
-        dots.push({ x, y, size, opacity, isAccent, key: `${row}-${col}` });
-      }
-    }
-  }
-
-  return (
-    <div style={{ position: 'relative', width: 270, height: 270 }}>
-      <svg
-        style={{ position: 'absolute', inset: 0, width: '100%', height: '100%', overflow: 'visible' }}
-        viewBox="0 0 270 270"
-      >
-        <circle cx="135" cy="135" r="128" fill="none" stroke="#BFDBFE" strokeWidth="1" opacity="0.35" />
-        <ellipse cx="135" cy="215" rx="128" ry="26" fill="none" stroke="var(--color-mastek-primary)" strokeWidth="2.5" opacity="0.55" />
-      </svg>
-
-      {dots.map(({ x, y, size, opacity, isAccent, key }) => (
-        <div
-          key={key}
-          style={{
-            position: 'absolute',
-            left: `${x}%`, top: `${y}%`,
-            width: size, height: size,
-            borderRadius: '50%',
-            background: isAccent ? 'var(--color-mastek-accent)' : `rgba(0,22,137,${opacity})`,
-            transform: 'translate(-50%,-50%)',
-          }}
-        />
-      ))}
-
-      <div style={{ position: 'absolute', top: '6%', right: '10%', width: 17, height: 17, background: 'var(--color-mastek-accent)', borderRadius: 4, opacity: 0.9 }} />
-      <div style={{ position: 'absolute', top: '16%', right: '2%', width: 23, height: 23, background: 'var(--color-mastek-primary)', borderRadius: 5, opacity: 0.85 }} />
-      <div style={{ position: 'absolute', top: '26%', right: '18%', width: 12, height: 12, background: 'var(--color-mastek-primary)', borderRadius: 3, opacity: 0.65 }} />
-    </div>
-  );
-}
 
 export default function LoginPage({ onLogin }) {
   const [loading, setLoading] = useState(false);
@@ -232,7 +181,7 @@ export default function LoginPage({ onLogin }) {
             </div>
 
             <div className="shrink-0 flex items-center justify-center" style={{ width: 270 }}>
-              <GlobeDecoration />
+              <img src={loginIllustration} alt="" className="max-w-full max-h-full object-contain" />
             </div>
           </div>
 
