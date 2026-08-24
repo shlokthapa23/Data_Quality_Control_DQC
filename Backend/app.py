@@ -1,3 +1,4 @@
+import json
 import os
 from datetime import datetime, timedelta, timezone
 from flask import Flask, Response, jsonify, request
@@ -67,10 +68,37 @@ def _require_auth():
     return None
 
 
+def _assert_connector_access(config):
+    """
+    A connector with owner_user_id set is someone's PERSONAL test-data
+    connector (see catalog_db.get_or_create_test_data_connector) - only that
+    person may touch it, through ANY route that accepts a raw connector_id,
+    not just the test-data-specific ones added alongside this check. Every
+    ordinary org-shared connector (owner_user_id NULL) is completely
+    unaffected. Without this, a connector_id alone - if guessed or leaked -
+    would grant access to someone else's private synthetic tables through
+    routes that predate the ownership concept entirely (local file
+    list/upload/delete/reingest, harvest schedules, etc).
+
+    Raises PermissionError, handled globally below as a 403 - so every
+    existing get_connector_instance() caller (there are many) is covered by
+    this one change without editing each of their except-blocks.
+    """
+    owner = config.get("owner_user_id") if config else None
+    if owner and owner != request.current_user.get("id"):
+        raise PermissionError("Not authorized for this connector")
+
+
+@app.errorhandler(PermissionError)
+def _handle_permission_error(e):
+    return jsonify({"error": str(e) or "Not authorized"}), 403
+
+
 def get_connector_instance(connector_id):
     config = catalog_db.get_connector_config(connector_id)
     if not config:
         raise KeyError(f"Unknown connector: {connector_id}")
+    _assert_connector_access(config)
     return config, build_connector(config)
 
 
@@ -83,7 +111,9 @@ def health_check():
 
 @app.route('/api/connectors', methods=['GET'])
 def list_connectors():
-    return jsonify(catalog_db.list_connector_configs())
+    # Scoped so every tester sees every org-shared connector plus their own
+    # personal test-data connector, and never anyone else's.
+    return jsonify(catalog_db.list_connector_configs(request.current_user["id"]))
 
 
 @app.route('/api/connectors', methods=['POST'])
@@ -526,6 +556,7 @@ def upload_local_file(connector_id):
         return jsonify({"error": "Unknown connector"}), 404
     if config["type"] != "local":
         return jsonify({"error": "This connector isn't a Local connector"}), 400
+    _assert_connector_access(config)
 
     if 'file' not in request.files:
         return jsonify({"error": "No file provided"}), 400
@@ -559,6 +590,7 @@ def reingest_local_table(connector_id, table_id):
         return jsonify({"error": "Unknown connector"}), 404
     if config["type"] != "local":
         return jsonify({"error": "This connector isn't a Local connector"}), 400
+    _assert_connector_access(config)
 
     body = request.get_json(force=True) or {}
     element = (body.get("xml_record_element") or "").strip()
@@ -588,14 +620,196 @@ def list_local_files(connector_id):
         return jsonify({"error": "Unknown connector"}), 404
     if config["type"] != "local":
         return jsonify({"error": "This connector isn't a Local connector"}), 400
+    _assert_connector_access(config)
 
     return jsonify({"tables": local_db.list_local_tables(connector_id)})
 
 
 @app.route('/api/connectors/<connector_id>/local/tables/<table_id>', methods=['DELETE'])
 def delete_local_file(connector_id, table_id):
+    # Previously deleted with no connector check at all - not even a 404 for
+    # an unknown connector. Now fetches + checks ownership first, same as
+    # every other local-connector route, before touching the DuckDB file.
+    config = catalog_db.get_connector_config(connector_id)
+    if not config:
+        return jsonify({"error": "Unknown connector"}), 404
+    _assert_connector_access(config)
     local_db.delete_local_table(connector_id, table_id)
     return jsonify({"deleted": table_id})
+
+
+# --- Personal synthetic test data --------------------------------------------
+# Lets a tester clone a real table's SCHEMA (never real rows - see the source
+# fetch below, which reads only column metadata) into a table they build and
+# populate by hand, in their own personal, lazily-created Local connector.
+# Surfaced from the Test Data Preparation page, per-table.
+
+def _live_columns_for(connector_id, container_id, table_name):
+    """
+    Fetch one table's live column list straight from its real connector -
+    never trust a client-submitted column list for this, since that list
+    becomes a CREATE TABLE's column definitions. Returns None if the
+    connector/container/table can't be resolved right now (deleted, renamed,
+    unreachable) rather than raising, so callers can degrade to a clean
+    "source unavailable" response.
+    """
+    try:
+        _, connector = get_connector_instance(connector_id)
+        schema = connector.list_tables_in_container(container_id)
+    except Exception:
+        return None
+    entry = next((t for t in schema if t["table"] == table_name), None)
+    if not entry:
+        return None
+    return [{"name": c["name"], "data_type": c.get("data_type")} for c in entry["columns"]]
+
+
+@app.route('/api/test-data/connectors/finalize', methods=['POST'])
+def finalize_synthetic_table():
+    """
+    The one call the "Finalize"/"Generate Test Data" button makes. Body:
+    { "display_name": "...",
+      "source": {"connector_id","container_id","table_name"},
+      "rows": [{col: value, ...}, ...] }
+
+    Nothing is created until this call - the draft grid up to this point is
+    pure frontend state. Get-or-creates the tester's personal test-data
+    connector (first time only), re-fetches the source table's columns live
+    (never the client's draft schema), and creates the table + finalized
+    rows in one transaction.
+    """
+    body = request.get_json(force=True) or {}
+    display_name = (body.get("display_name") or "").strip()
+    source = body.get("source") or {}
+    rows = body.get("rows") or []
+    if not display_name:
+        return jsonify({"error": "display_name is required"}), 400
+    src_connector_id = source.get("connector_id")
+    src_container_id = source.get("container_id")
+    src_table_name = source.get("table_name")
+    if not (src_connector_id and src_container_id and src_table_name):
+        return jsonify({"error": "source.connector_id, source.container_id and source.table_name are required"}), 400
+
+    columns = _live_columns_for(src_connector_id, src_container_id, src_table_name)
+    if columns is None:
+        return jsonify({"error": f"Couldn't read the live schema of {src_table_name} - it may have been deleted or renamed"}), 404
+
+    user = request.current_user
+    test_data_connector_id = catalog_db.get_or_create_test_data_connector(
+        user["id"], f"Test Data — {user['full_name']}"
+    )
+    try:
+        result = local_db.create_synthetic_table(
+            test_data_connector_id, display_name, columns, rows,
+            provenance={
+                "connector_id": src_connector_id, "container_id": src_container_id,
+                "table_name": src_table_name,
+            },
+        )
+        return jsonify({**result, "connector_id": test_data_connector_id}), 201
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+
+
+@app.route('/api/connectors/<connector_id>/synthetic-tables/<table_id>/rows', methods=['GET'])
+def get_synthetic_table_rows_route(connector_id, table_id):
+    config = catalog_db.get_connector_config(connector_id)
+    if not config:
+        return jsonify({"error": "Unknown connector"}), 404
+    _assert_connector_access(config)
+    try:
+        return jsonify({"rows": local_db.get_synthetic_table_rows(connector_id, table_id)})
+    except KeyError:
+        return jsonify({"error": "Unknown table"}), 404
+
+
+@app.route('/api/connectors/<connector_id>/synthetic-tables/<table_id>/rows', methods=['PUT'])
+def save_synthetic_table_rows_route(connector_id, table_id):
+    """Full-replace save - body: { "rows": [{col: value, ...}, ...] }.
+    An empty array is accepted (a tester may genuinely want to clear a
+    table), but the frontend should confirm that explicitly before sending
+    it - this route does exactly what it's told."""
+    config = catalog_db.get_connector_config(connector_id)
+    if not config:
+        return jsonify({"error": "Unknown connector"}), 404
+    _assert_connector_access(config)
+    body = request.get_json(force=True) or {}
+    rows = body.get("rows")
+    if rows is None:
+        return jsonify({"error": "rows is required"}), 400
+    try:
+        return jsonify(local_db.replace_table_rows(connector_id, table_id, rows))
+    except KeyError:
+        return jsonify({"error": "Unknown table"}), 404
+    except Exception as e:
+        return jsonify({"error": "Couldn't save those rows", "details": str(e)}), 400
+
+
+@app.route('/api/connectors/<connector_id>/synthetic-tables/<table_id>/download', methods=['GET'])
+def download_synthetic_table_route(connector_id, table_id):
+    config = catalog_db.get_connector_config(connector_id)
+    if not config:
+        return jsonify({"error": "Unknown connector"}), 404
+    _assert_connector_access(config)
+    try:
+        rows = local_db.get_synthetic_table_rows(connector_id, table_id, limit=100000)
+    except KeyError:
+        return jsonify({"error": "Unknown table"}), 404
+
+    import csv as _csv
+    import io as _io
+    buf = _io.StringIO()
+    fieldnames = list(rows[0].keys()) if rows else []
+    writer = _csv.DictWriter(buf, fieldnames=fieldnames)
+    writer.writeheader()
+    writer.writerows(rows)
+    blob = buf.getvalue().encode("utf-8")
+
+    filename = f"{table_id}.csv"
+    return Response(blob, mimetype="text/csv", headers={
+        "Content-Disposition": f'attachment; filename="{filename}"',
+        "Access-Control-Expose-Headers": "Content-Disposition",
+    })
+
+
+@app.route('/api/connectors/<connector_id>/synthetic-tables/<table_id>/resync', methods=['POST'])
+def resync_synthetic_table_route(connector_id, table_id):
+    """
+    ?dry_run=1 (default) previews the additive diff without applying it;
+    dry_run=0 applies it. Never drops/renames/retypes a column the tester
+    already has rows against - see local_db.resync_schema's docstring.
+    """
+    config = catalog_db.get_connector_config(connector_id)
+    if not config:
+        return jsonify({"error": "Unknown connector"}), 404
+    _assert_connector_access(config)
+
+    rows = local_db.list_local_tables(connector_id)
+    table_row = next((r for r in rows if r["id"] == table_id), None)
+    if not table_row:
+        return jsonify({"error": "Unknown table"}), 404
+    provenance = None
+    if table_row.get("provenance_json"):
+        provenance = json.loads(table_row["provenance_json"])
+    if not provenance:
+        return jsonify({"error": "This table has no recorded source to resync against"}), 400
+
+    live_columns = _live_columns_for(
+        provenance["connector_id"], provenance["container_id"], provenance["table_name"]
+    )
+    if live_columns is None:
+        return jsonify({
+            "source_available": False,
+            "message": "The original source table couldn't be read - it may have been deleted, "
+                        "renamed, or its connector removed. This test table is untouched.",
+        }), 200
+
+    dry_run = request.args.get("dry_run", "1") not in ("0", "false", "no")
+    try:
+        result = local_db.resync_schema(connector_id, table_id, live_columns, dry_run=dry_run)
+    except KeyError:
+        return jsonify({"error": "Unknown table"}), 404
+    return jsonify({"source_available": True, **result})
 
 
 # --- Harvest -----------------------------------------------------------
@@ -2160,8 +2374,10 @@ def _validate_selected_items(items):
 
 @app.route('/api/connectors/<connector_id>/schedules', methods=['POST'])
 def create_harvest_schedule_route(connector_id):
-    if not catalog_db.get_connector_config(connector_id):
+    config = catalog_db.get_connector_config(connector_id)
+    if not config:
         return jsonify({"error": "Connector not found"}), 404
+    _assert_connector_access(config)
     body = request.get_json(force=True) or {}
     err, parsed = _validate_schedule_body(body)
     if err:

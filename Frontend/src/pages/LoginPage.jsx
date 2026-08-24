@@ -4,7 +4,7 @@ import {
   Eye, EyeOff, Mail, Lock, AlertCircle,
 } from 'lucide-react';
 import { login, register, fetchCurrentUser } from '../api';
-import loginIllustration from '../images/Login_page.png';
+import loginIllustration from '../images/DQC_logo_new.png';
 
 // ── "Remember me" persistence ───────────────────────────────────────────────
 // Stored in localStorage so it survives browser/frontend/backend restarts.

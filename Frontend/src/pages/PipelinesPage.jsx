@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   PlayCircle, Loader2, AlertCircle, CheckCircle2, XCircle, RefreshCw,
-  ArrowRight, Workflow, CalendarClock, Table2,
+  ArrowRight, Workflow, CalendarClock, Table2, FlaskConical,
 } from 'lucide-react';
 import {
   fetchConnectors, fetchConnectorContainers, fetchContainerTables, fetchHarvestedTableNames,
@@ -13,6 +13,7 @@ import { formatRowCount, rowCountStyle, rowCountTitle } from '../rowCount';
 import { ListFilter } from '../components/common/ListFilter';
 import { filterByName, noMatchNote } from '../listFilter';
 import SchedulesSection from '../components/schedules/SchedulesSection';
+import TestDataDraftModal from '../components/testdata/TestDataDraftModal';
 
 // Fabric reports NotStarted/InProgress while a job is live; everything else
 // (Completed, Failed, Cancelled, Deduped) is terminal. The backend already
@@ -120,7 +121,10 @@ function snapshotOf(tables) {
  * empty table reads the same red everywhere. That matters here more than
  * anywhere else: this is the page where a tester is about to load data into it.
  */
-function LakehouseTables({ containerName, tables, status, onRefresh, harvestedNames, harvestedStatus, onGoToHarvest }) {
+function LakehouseTables({
+  containerName, tables, status, onRefresh, harvestedNames, harvestedStatus, onGoToHarvest,
+  onCreateTestData,
+}) {
   const [query, setQuery] = useState('');
   // Only tables that came back the last time this Lakehouse was harvested -
   // deliberately narrower than `tables`, which the before/after run diff
@@ -213,6 +217,15 @@ function LakehouseTables({ containerName, tables, status, onRefresh, harvestedNa
               >
                 {formatRowCount(t.row_count)}
               </span>
+              {onCreateTestData && (
+                <button
+                  onClick={() => onCreateTestData(t)}
+                  title="Clone this table's columns (never its rows) into your own hand-built test data"
+                  className="shrink-0 p-1 text-slate-400 hover:text-mastek-primary hover:bg-mastek-primary/10 rounded"
+                >
+                  <FlaskConical className="w-3.5 h-3.5" />
+                </button>
+              )}
             </div>
           ))}
         </div>
@@ -229,6 +242,10 @@ function LakehouseTables({ containerName, tables, status, onRefresh, harvestedNa
 }
 
 export default function PipelinesPage({ onGoToHarvest }) {
+  // Draft-then-finalize test data: set only while the modal is open, cleared
+  // on close/finalize - nothing is created until the tester actually
+  // finalizes inside the modal.
+  const [testDataSource, setTestDataSource] = useState(null);
   const [connectors, setConnectors] = useState([]);
   const [connectorId, setConnectorId] = useState('');
   const [pipelines, setPipelines] = useState([]);
@@ -603,6 +620,9 @@ export default function PipelinesPage({ onGoToHarvest }) {
             harvestedNames={harvestedNames}
             harvestedStatus={harvestedStatus}
             onGoToHarvest={onGoToHarvest}
+            onCreateTestData={(t) => setTestDataSource({
+              connectorId, containerId: watchContainerId, tableName: t.name, columns: t.columns || [],
+            })}
           />
         )}
 
@@ -855,6 +875,13 @@ export default function PipelinesPage({ onGoToHarvest }) {
             fetchEvents={fetchPipelineScheduleEvents}
           />
         </div>
+      )}
+
+      {testDataSource && (
+        <TestDataDraftModal
+          source={testDataSource}
+          onClose={() => setTestDataSource(null)}
+        />
       )}
     </div>
   );

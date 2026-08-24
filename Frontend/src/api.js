@@ -178,6 +178,66 @@ export function reingestLocalTable(connectorId, tableId, xmlRecordElement) {
   });
 }
 
+// --- Personal synthetic test data --------------------------------------------
+// Nothing is created until finalizeSyntheticTable is called - the draft grid
+// up to that point is pure frontend state. The tester's personal test-data
+// connector is created lazily on the server, first call only.
+
+// source: { connectorId, containerId, tableName } - the real table whose
+// SCHEMA is being cloned (never its rows). rows: [{col: value, ...}, ...] -
+// the tester's finalized draft.
+export function finalizeSyntheticTable({ displayName, source, rows }) {
+  return request('/api/test-data/connectors/finalize', {
+    method: 'POST',
+    body: JSON.stringify({
+      display_name: displayName,
+      source: {
+        connector_id: source.connectorId,
+        container_id: source.containerId,
+        table_name: source.tableName,
+      },
+      rows,
+    }),
+  });
+}
+
+export function fetchSyntheticTableRows(connectorId, tableId) {
+  return request(`/api/connectors/${connectorId}/synthetic-tables/${tableId}/rows`);
+}
+
+// Full-replace save - same one-shot semantics as ColumnMapModal/suite
+// membership elsewhere in this app.
+export function saveSyntheticTableRows(connectorId, tableId, rows) {
+  return request(`/api/connectors/${connectorId}/synthetic-tables/${tableId}/rows`, {
+    method: 'PUT',
+    body: JSON.stringify({ rows }),
+  });
+}
+
+// Additive-only: dryRun=true (default) previews what would change without
+// applying it; dryRun=false commits the additive part of the diff.
+export function resyncSyntheticTableSchema(connectorId, tableId, dryRun = true) {
+  return request(`/api/connectors/${connectorId}/synthetic-tables/${tableId}/resync?dry_run=${dryRun ? '1' : '0'}`, {
+    method: 'POST',
+  });
+}
+
+// Mirrors exportS2DAnalytics's exact {blob, filename} + Content-Disposition
+// parsing pattern below - same download mechanism, different source route.
+export async function downloadSyntheticTable(connectorId, tableId) {
+  const res = await fetch(`${API_BASE}/api/connectors/${connectorId}/synthetic-tables/${tableId}/download`, {
+    headers: authHeaders(),
+  });
+  if (handleUnauthorized(res)) throw new Error('Session expired');
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error(body.details ? `${body.error}: ${body.details}` : (body.error || `Download failed: ${res.status}`));
+  }
+  const disposition = res.headers.get('Content-Disposition') || '';
+  const match = disposition.match(/filename="?([^"]+)"?/);
+  return { blob: await res.blob(), filename: match ? match[1] : 'test-data.csv' };
+}
+
 // --- Data pipelines (fabric connectors only) ---
 
 export function fetchPipelines(connectorId) {

@@ -42,6 +42,15 @@ def init_local_tables_table():
         existing = {r[1] for r in conn.execute("PRAGMA table_info(local_tables)").fetchall()}
         if "source_options" not in existing:
             conn.execute("ALTER TABLE local_tables ADD COLUMN source_options TEXT")
+        # Additive: tester-authored synthetic test tables (see
+        # create_synthetic_table). source_kind is NULL for every ordinary
+        # upload (unchanged); provenance_json remembers which real
+        # connector/container/table a synthetic table's schema was cloned
+        # from, so "Resync schema" knows what to re-check against.
+        if "source_kind" not in existing:
+            conn.execute("ALTER TABLE local_tables ADD COLUMN source_kind TEXT")
+        if "provenance_json" not in existing:
+            conn.execute("ALTER TABLE local_tables ADD COLUMN provenance_json TEXT")
 
 
 def _duckdb_path(connector_id):
@@ -79,6 +88,58 @@ def _next_available_table_name(con, base_name):
     while _table_exists(con, f"{base_name}_{i}"):
         i += 1
     return f"{base_name}_{i}"
+
+
+def _quote_ident(name):
+    """Double-quote a DuckDB identifier, escaping any embedded quote. Used
+    everywhere a column/table name (rather than a value) is interpolated into
+    SQL for the synthetic-table feature below - unlike ingest_file's table
+    names (always machine-sanitized by _sanitize_base_name), a synthetic
+    table's COLUMN names come from a real table's live schema and could
+    contain a reserved word, spaces, or other characters that would otherwise
+    break unquoted DDL."""
+    return '"' + str(name).replace('"', '""') + '"'
+
+
+# Only a known-safe DuckDB type spelling is ever interpolated into DDL
+# verbatim. Anything else - an exotic Fabric/Delta type (STRUCT, MAP, a wide
+# DECIMAL DuckDB balks at, etc.) or just something unexpected - falls back to
+# VARCHAR (see _safe_duckdb_type) rather than either aborting the whole clone
+# or risking an unchecked string in a CREATE TABLE/ALTER TABLE statement.
+_SAFE_DUCKDB_TYPE_RE = re.compile(
+    r'^(TINYINT|SMALLINT|INTEGER|BIGINT|HUGEINT|UTINYINT|USMALLINT|UINTEGER|UBIGINT|'
+    r'FLOAT|DOUBLE|REAL|DECIMAL(\(\s*\d+\s*,\s*\d+\s*\))?|BOOLEAN|BOOL|'
+    r'VARCHAR(\(\s*\d+\s*\))?|TEXT|BLOB|DATE|TIME|TIMESTAMP(_(TZ|S|MS|NS))?|INTERVAL|UUID)$',
+    re.IGNORECASE,
+)
+
+
+def _safe_duckdb_type(raw):
+    """(safe_type_to_use, was_downgraded_to_varchar)."""
+    raw = (raw or '').strip()
+    if _SAFE_DUCKDB_TYPE_RE.match(raw):
+        return raw.upper(), False
+    return 'VARCHAR', True
+
+
+def _insert_rows(con, table_name, col_names, rows):
+    """
+    Bulk-insert already-typed dict rows into an existing table. Column
+    VALUES always go through parameterized placeholders - never string-
+    interpolated - since these are tester-typed free text; only the table/
+    column NAMES (already quoted+allow-listed by the caller) are ever built
+    into the SQL text itself.
+    """
+    if not rows:
+        return
+    quoted_table = _quote_ident(table_name)
+    quoted_cols = ", ".join(_quote_ident(c) for c in col_names)
+    placeholders = ", ".join(["?"] * len(col_names))
+    values = [[row.get(c) for c in col_names] for row in rows]
+    con.executemany(
+        f'INSERT INTO {quoted_table} ({quoted_cols}) VALUES ({placeholders})',
+        values,
+    )
 
 
 def _reader_sql(ext, path):
@@ -488,6 +549,210 @@ def get_table_schema(connector_id, duckdb_table_name):
     finally:
         if con is not None:
             con.close()
+
+
+def create_synthetic_table(connector_id, display_name, columns, rows, provenance=None):
+    """
+    The one write "Finalize" makes: create a new table from an explicit
+    column list and bulk-insert the tester's finalized draft rows, in one
+    transaction. Mirrors ingest_file's writable-connection pattern.
+
+    columns: [{"name": str, "data_type": str}, ...] - must already be a live
+    schema fetch resolved by the CALLER (app.py re-fetches from the real
+    source connector), never trusted verbatim from client-submitted DDL.
+    rows: [{column_name: value, ...}, ...].
+    provenance: {"connector_id","connector_name","container_id","table_name"}
+    or None - stored so a later "Resync schema" knows what real table to
+    re-check against.
+    """
+    if not columns:
+        raise ValueError("Can't create a test table with no columns")
+
+    seen_lower = set()
+    col_defs, col_names, warnings = [], [], []
+    for c in columns:
+        name = (c.get("name") or "").strip()
+        if not name:
+            raise ValueError("Every column needs a name")
+        key = name.lower()
+        if key in seen_lower:
+            raise ValueError(
+                f'Column "{name}" collides with another column that only differs by case - '
+                "DuckDB identifiers are case-insensitive, so these can't coexist"
+            )
+        seen_lower.add(key)
+        safe_type, downgraded = _safe_duckdb_type(c.get("data_type"))
+        if downgraded:
+            warnings.append(f'"{name}" ({c.get("data_type")}) is stored as VARCHAR - no safe local equivalent')
+        col_defs.append(f'{_quote_ident(name)} {safe_type}')
+        col_names.append(name)
+
+    base_name = _sanitize_base_name(display_name)
+    table_id = str(uuid.uuid4())
+    now = datetime.now(timezone.utc).isoformat()
+
+    db_path = _duckdb_path(connector_id)
+    con = None
+    try:
+        con = duckdb.connect(db_path)
+        table_name = _next_available_table_name(con, base_name)
+        con.execute("BEGIN")
+        con.execute(f'CREATE TABLE {_quote_ident(table_name)} ({", ".join(col_defs)})')
+        _insert_rows(con, table_name, col_names, rows)
+        con.execute("COMMIT")
+        row_count = con.execute(f"SELECT COUNT(*) FROM {_quote_ident(table_name)}").fetchone()[0]
+    except Exception:
+        if con is not None:
+            try:
+                con.execute("ROLLBACK")
+            except Exception:
+                pass
+        raise
+    finally:
+        if con is not None:
+            con.close()
+
+    with get_conn() as conn:
+        conn.execute("""
+            INSERT INTO local_tables (id, connector_id, display_name, duckdb_table_name,
+                                      file_type, uploaded_at, source_options, source_kind, provenance_json)
+            VALUES (?, ?, ?, ?, 'test_data', ?, NULL, 'synthetic', ?)
+        """, (table_id, connector_id, display_name, table_name, now,
+              json.dumps(provenance) if provenance else None))
+
+    return {
+        "id": table_id, "connector_id": connector_id, "display_name": display_name,
+        "duckdb_table_name": table_name, "row_count": row_count,
+        "column_count": len(col_names), "warnings": warnings,
+    }
+
+
+def replace_table_rows(connector_id, table_id, rows):
+    """
+    Full-replace save for an existing synthetic table's rows - the same
+    delete-then-reinsert-everything idiom this codebase already uses for
+    column maps and suite membership, applied here to grid rows. One
+    transaction: a bad value partway through an insert must leave the table
+    exactly as it was, never half-deleted.
+    """
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM local_tables WHERE id = ? AND connector_id = ?", (table_id, connector_id)
+        ).fetchone()
+    if not row:
+        raise KeyError("Unknown table")
+    table_name = dict(row)["duckdb_table_name"]
+
+    db_path = _duckdb_path(connector_id)
+    con = None
+    try:
+        con = duckdb.connect(db_path)
+        col_names = [r[0] for r in con.execute(f"DESCRIBE {_quote_ident(table_name)}").fetchall()]
+        con.execute("BEGIN")
+        con.execute(f"DELETE FROM {_quote_ident(table_name)}")
+        _insert_rows(con, table_name, col_names, rows)
+        con.execute("COMMIT")
+        row_count = con.execute(f"SELECT COUNT(*) FROM {_quote_ident(table_name)}").fetchone()[0]
+    except Exception:
+        if con is not None:
+            try:
+                con.execute("ROLLBACK")
+            except Exception:
+                pass
+        raise
+    finally:
+        if con is not None:
+            con.close()
+    return {"row_count": row_count}
+
+
+def get_synthetic_table_rows(connector_id, table_id, limit=500):
+    """Hydrate the row-grid editor when a tester reopens an existing
+    synthetic table. Capped so a tester who added far more than the
+    intended ~25+ rows can't stall the editor - not a hard ceiling on the
+    table itself, only on what one GET returns."""
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM local_tables WHERE id = ? AND connector_id = ?", (table_id, connector_id)
+        ).fetchone()
+    if not row:
+        raise KeyError("Unknown table")
+    table_name = dict(row)["duckdb_table_name"]
+
+    db_path = _duckdb_path(connector_id)
+    con = None
+    try:
+        con = duckdb.connect(db_path, read_only=True)
+        result = con.execute(f"SELECT * FROM {_quote_ident(table_name)} LIMIT {int(limit)}").fetchall()
+        columns = [d[0] for d in con.description]
+        return [dict(zip(columns, r)) for r in result]
+    finally:
+        if con is not None:
+            con.close()
+
+
+def resync_schema(connector_id, table_id, live_source_columns, dry_run=True):
+    """
+    Additive-only schema resync. Adds columns the real source has gained
+    since this table was cloned/last resynced (nullable, so existing rows
+    are unaffected). Never drops, renames, or retypes a column the tester
+    might already have rows depending on - a column missing at the source,
+    or one whose type changed, is only ever reported back for the tester to
+    handle by hand.
+
+    live_source_columns: [{"name","data_type"}, ...] already fetched fresh by
+    the CALLER (app.py) from the real connector - this function only diffs
+    and (when dry_run=False) applies; it never reaches out to Fabric itself,
+    so it has no opinion on whether the source is still reachable.
+    """
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM local_tables WHERE id = ? AND connector_id = ?", (table_id, connector_id)
+        ).fetchone()
+    if not row:
+        raise KeyError("Unknown table")
+    table_name = dict(row)["duckdb_table_name"]
+
+    db_path = _duckdb_path(connector_id)
+    con = None
+    try:
+        con = duckdb.connect(db_path, read_only=dry_run)
+        existing_rows = con.execute(f"DESCRIBE {_quote_ident(table_name)}").fetchall()
+        existing = {r[0].lower(): {"name": r[0], "data_type": str(r[1])} for r in existing_rows}
+        live_by_lower = {c["name"].lower(): c for c in live_source_columns}
+
+        to_add = [c for key, c in live_by_lower.items() if key not in existing]
+        missing_at_source = [e["name"] for key, e in existing.items() if key not in live_by_lower]
+        type_changed = []
+        for key, e in existing.items():
+            if key in live_by_lower:
+                safe_type, _ = _safe_duckdb_type(live_by_lower[key].get("data_type"))
+                if safe_type.split("(")[0].upper() != e["data_type"].split("(")[0].upper():
+                    type_changed.append({
+                        "name": e["name"], "local_type": e["data_type"],
+                        "source_type": live_by_lower[key].get("data_type"),
+                    })
+
+        added, warnings = [], []
+        if not dry_run:
+            for c in to_add:
+                safe_type, downgraded = _safe_duckdb_type(c.get("data_type"))
+                if downgraded:
+                    warnings.append(f'"{c["name"]}" ({c.get("data_type")}) added as VARCHAR - no safe local equivalent')
+                con.execute(
+                    f'ALTER TABLE {_quote_ident(table_name)} ADD COLUMN {_quote_ident(c["name"])} {safe_type}'
+                )
+                added.append(c["name"])
+    finally:
+        if con is not None:
+            con.close()
+
+    return {
+        "added": added if not dry_run else [c["name"] for c in to_add],
+        "flagged_missing_at_source": missing_at_source,
+        "flagged_type_changed": type_changed,
+        "warnings": warnings,
+    }
 
 
 def sample_rows(connector_id, table_name, limit=20):

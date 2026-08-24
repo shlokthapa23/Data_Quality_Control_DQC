@@ -65,6 +65,26 @@ def init_db():
         except sqlite3.OperationalError:
             pass  # column already exists
 
+        # Additive migration: personal "test data" connectors. owner_user_id
+        # is NULL for every ordinary org-shared connector (unchanged
+        # behavior); purpose='test_data' marks the one lazily-created,
+        # per-tester Local connector that holds synthetic test tables (see
+        # get_or_create_test_data_connector below). The partial unique index
+        # guarantees one tester can never end up with two of these even if
+        # two "create test data" requests race.
+        try:
+            conn.execute("ALTER TABLE connector_configs ADD COLUMN owner_user_id TEXT")
+        except sqlite3.OperationalError:
+            pass  # column already exists
+        try:
+            conn.execute("ALTER TABLE connector_configs ADD COLUMN purpose TEXT")
+        except sqlite3.OperationalError:
+            pass  # column already exists
+        conn.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS ux_connector_owner_test_data
+            ON connector_configs(owner_user_id) WHERE purpose = 'test_data'
+        """)
+
         # Additive migration: harvested_assets gained connector_id so Catalog
         # can scope to one specific connector instance, not just a type -
         # needed once a second connector of the same type (e.g. a second
@@ -312,12 +332,28 @@ def harvested_table_names(connector_id, container_id):
     return {t["table"] for t in tables}
 
 
-def list_connector_configs():
+def list_connector_configs(user_id=None):
+    """
+    user_id, when given, scopes the result to every org-shared connector
+    (owner_user_id IS NULL, unchanged for everyone) PLUS that one user's own
+    personal test-data connector - never anyone else's. Omitting user_id
+    keeps the old unscoped behavior for any internal caller that genuinely
+    wants every connector regardless of ownership (e.g. an admin/background
+    job), but every request-scoped route should pass it.
+    """
+    query = """
+        SELECT id, name, type, workspace_id, allowed_containers_json, created_at,
+               owner_user_id, purpose
+        FROM connector_configs
+    """
+    params = []
+    if user_id is not None:
+        query += " WHERE owner_user_id IS NULL OR owner_user_id = ?"
+        params.append(user_id)
+    query += " ORDER BY created_at DESC"
+
     with get_conn() as conn:
-        rows = conn.execute("""
-            SELECT id, name, type, workspace_id, allowed_containers_json, created_at
-            FROM connector_configs ORDER BY created_at DESC
-        """).fetchall()
+        rows = conn.execute(query, params).fetchall()
         results = []
         for r in rows:
             row = dict(r)
@@ -325,6 +361,62 @@ def list_connector_configs():
             del row["allowed_containers_json"]
             results.append(row)
         return results
+
+
+def get_or_create_test_data_connector(user_id, display_name):
+    """
+    Every tester gets exactly one personal Local connector for their
+    hand-built synthetic test tables, created lazily on their first "Generate
+    Test Data" action - never eagerly, never shared. type='local' so it needs
+    zero changes anywhere else in the app (connector_factory, LocalConnector,
+    every table picker) to behave like any other Local connector; only
+    owner_user_id/purpose distinguish it for ownership checks and UI labeling.
+
+    The unique index on (owner_user_id) WHERE purpose='test_data' is the real
+    guarantee here: if two requests from the same tester race past the SELECT
+    at once, the loser's INSERT hits that index and raises
+    sqlite3.IntegrityError - caught below, re-SELECT picks up the winner's
+    row instead of erroring the request.
+    """
+    import uuid
+
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT id FROM connector_configs WHERE purpose = 'test_data' AND owner_user_id = ?",
+            (user_id,),
+        ).fetchone()
+        if row:
+            return row["id"]
+
+        config_id = str(uuid.uuid4())
+        now = datetime.now(timezone.utc).isoformat()
+        try:
+            conn.execute("""
+                INSERT INTO connector_configs (id, name, type, owner_user_id, purpose, created_at)
+                VALUES (?, ?, 'local', ?, 'test_data', ?)
+            """, (config_id, display_name, user_id, now))
+        except sqlite3.IntegrityError:
+            row = conn.execute(
+                "SELECT id FROM connector_configs WHERE purpose = 'test_data' AND owner_user_id = ?",
+                (user_id,),
+            ).fetchone()
+            return row["id"]
+        return config_id
+
+
+def is_test_data_connector_owned_by(connector_id, user_id):
+    """
+    True only if connector_id exists, is a personal test-data connector, AND
+    belongs to this user - the check every new test-data route runs before
+    touching anything, so one tester's synthetic tables are never reachable
+    through another tester's session even if they learn the connector_id.
+    """
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM connector_configs WHERE id = ? AND purpose = 'test_data' AND owner_user_id = ?",
+            (connector_id, user_id),
+        ).fetchone()
+        return row is not None
 
 
 def get_connector_config(config_id):
