@@ -1,14 +1,13 @@
 import { useEffect, useState } from 'react';
 import {
   ArrowDown, Trash2, Loader2, Plus, ChevronDown, ChevronRight,
-  ListChecks, AlertCircle, CheckCircle2, Pencil, Check, X, Columns3,
+  ListChecks, AlertCircle, CheckCircle2, Pencil, Check, X,
 } from 'lucide-react';
 import {
   fetchConnectors, fetchConnectorContainers, fetchContainerTables,
   fetchS2DMappings, createS2DMapping, updateS2DMapping, deleteS2DMapping,
   fetchTestSuitesForMapping, createTestSuite, deleteTestSuite, fetchS2DTestCases,
 } from '../api';
-import ColumnMapModal from '../components/s2d/ColumnMapModal';
 import { formatRowCount, rowCountStyle, rowCountTitle } from '../rowCount';
 import { ListFilter } from '../components/common/ListFilter';
 import { filterByName, noMatchNote } from '../listFilter';
@@ -194,6 +193,14 @@ function EditableTableList({ label, options, selected, usage, onToggle }) {
   const visible = filterByName(options, query, (t) => t.name);
   const removedInUse = options.filter((t) => !selected.has(t.name) && usage[t.name]);
 
+  // A table this layer is still configured to use, but that no longer shows
+  // up in the live schema at all - deleted (or renamed) at the source since
+  // this layer was last saved. Without a row for it here it could never be
+  // unticked (the checkbox list below only ever rendered live `options`), so
+  // it would silently keep counting as "selected" on this layer forever, and
+  // every test-case table picker downstream trusts that selection verbatim.
+  const missingSelected = [...selected].filter((name) => !options.some((t) => t.name === name));
+
   return (
     <div>
       <p className="text-[11px] font-bold text-slate-400 uppercase tracking-wider mb-1">{label}</p>
@@ -212,13 +219,43 @@ function EditableTableList({ label, options, selected, usage, onToggle }) {
         }}
       />
 
+      {missingSelected.length > 0 && (
+        <p className="mb-1.5 flex items-start gap-1.5 text-[11px] text-red-700">
+          <AlertCircle className="w-3 h-3 shrink-0 mt-0.5" />
+          {missingSelected.length} selected table{missingSelected.length === 1 ? '' : 's'} no longer exist{missingSelected.length === 1 ? 's' : ''} in
+          the live schema - untick below to remove {missingSelected.length === 1 ? 'it' : 'them'} from this layer.
+        </p>
+      )}
+
       <div className="border border-slate-200 rounded-lg max-h-44 overflow-y-auto bg-white">
-        {options.length === 0 && (
+        {options.length === 0 && missingSelected.length === 0 && (
           <p className="text-xs text-slate-400 italic px-3 py-2">No tables found.</p>
         )}
-        {options.length > 0 && visible.length === 0 && (
+        {options.length > 0 && visible.length === 0 && missingSelected.length === 0 && (
           <p className="text-xs text-slate-400 italic px-3 py-2">{noMatchNote(query)}</p>
         )}
+        {/* Always shown regardless of search, so it's never possible to
+            search your way into hiding the one row you need to untick. */}
+        {missingSelected.map((name) => (
+          <label
+            key={name}
+            className="flex items-center gap-2 px-3 py-1.5 text-xs font-mono hover:bg-red-50 cursor-pointer border-b border-slate-100 last:border-b-0 bg-red-50/50"
+          >
+            <input
+              type="checkbox"
+              checked
+              onChange={() => onToggle(null, name)}
+              className="rounded border-red-300 text-red-600 focus:ring-red-400 shrink-0"
+            />
+            <span className="truncate text-red-700">{name}</span>
+            <span
+              className="shrink-0 ml-auto text-[10px] px-1.5 py-0.5 rounded bg-red-100 text-red-700"
+              title="Not found in the live schema - deleted or renamed at the source since this layer last saved."
+            >
+              not found
+            </span>
+          </label>
+        ))}
         {visible.map((t) => (
           <label
             key={t.name}
@@ -426,7 +463,6 @@ export default function MappingsPage() {
   // The layer currently open for editing: its name, which tables each side
   // covers, and how many test cases already reference each table.
   const [editing, setEditing] = useState(null);
-  const [columnMapMappingId, setColumnMapMappingId] = useState(null);
 
   const loadMappings = () => {
     fetchS2DMappings().then((data) => {
@@ -831,22 +867,6 @@ export default function MappingsPage() {
                             {m.destination_connector_name}/{m.destination_tables.length} table{m.destination_tables.length !== 1 ? 's' : ''}
                           </p>
                         </div>
-                        {/* Deliberately outside the hover-reveal cluster below:
-                            an opt-in feature nobody can see isn't opt-in, it's
-                            hidden. The badge shows how many common names are
-                            already declared. */}
-                        <button
-                          onClick={(e) => { e.stopPropagation(); setColumnMapMappingId(m.id); }}
-                          className="flex items-center gap-1 p-1 ml-2 text-slate-400 hover:text-mastek-primary shrink-0"
-                          title="Map columns - give differently-named columns one common name"
-                        >
-                          <Columns3 className="w-3.5 h-3.5" />
-                          {(m.column_map?.length || 0) > 0 && (
-                            <span className="text-[10px] font-medium px-1.5 py-0.5 rounded-full bg-mastek-primary/10 text-mastek-primary">
-                              {m.column_map.length}
-                            </span>
-                          )}
-                        </button>
                         <div className="flex items-center opacity-0 group-hover:opacity-100 shrink-0">
                           <button
                             onClick={(e) => { e.stopPropagation(); startEdit(m); }}
@@ -979,14 +999,6 @@ export default function MappingsPage() {
       <div>
         <TestSuitesForMapping mapping={selectedMapping} />
       </div>
-
-      {columnMapMappingId && (
-        <ColumnMapModal
-          mapping={mappings.find((m) => m.id === columnMapMappingId)}
-          onClose={() => setColumnMapMappingId(null)}
-          onSaved={(updated) => setMappings((ms) => ms.map((m) => (m.id === updated.id ? updated : m)))}
-        />
-      )}
     </div>
   );
 }

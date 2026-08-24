@@ -536,17 +536,6 @@ def update_mapping_endpoint(mapping_id, side, connector_id, connector_name,
               json.dumps(tables), mapping_id))
 
 
-def set_column_map(mapping_id, column_map):
-    """
-    Full replace - the editor always submits the whole map, same as suite
-    membership. An empty map is stored as NULL so "opted out" has exactly one
-    representation in the DB.
-    """
-    payload = json.dumps(column_map) if column_map else None
-    with get_conn() as conn:
-        conn.execute("UPDATE s2d_mappings SET column_map = ? WHERE id = ?", (payload, mapping_id))
-
-
 def mappings_using_connector(connector_id):
     """
     Every test layer that reads from or writes to this connector, with how much

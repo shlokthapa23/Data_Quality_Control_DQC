@@ -313,17 +313,6 @@ export function deleteS2DMapping(id) {
   return request(`/api/s2d/mappings/${id}`, { method: 'DELETE' });
 }
 
-// Full replace - the editor always submits the whole map. Returns the updated
-// mapping, so callers can drop the response straight into their mapping state
-// instead of refetching. No GET counterpart: column_map already rides along on
-// fetchS2DMappings.
-export function saveS2DColumnMap(id, columnMap) {
-  return request(`/api/s2d/mappings/${id}/column-map`, {
-    method: 'PUT',
-    body: JSON.stringify({ column_map: columnMap }),
-  });
-}
-
 // Parses + binds the script on that side's real connector without executing it.
 // Resolves to { ok, error } for BOTH outcomes - a syntax error is a valid
 // result, not a request failure - so callers read `ok` rather than catching.
@@ -511,16 +500,13 @@ export function generateAITestCase({ tables, sourceTables, destinationTables, ch
   });
 }
 
-// mappingId is optional and only used server-side to load that validation's
-// column map, so a common name counts as a valid key when the two sides name
-// the field differently. Omitting it means literal-name matching only.
-export function generateKeyColumnSuggestion({ sourceTables, destinationTables, description, mappingId }) {
+export function generateKeyColumnSuggestion({ sourceTables, destinationTables, description }) {
   return request('/api/s2d/ai/generate-test-case', {
     method: 'POST',
     body: JSON.stringify({
       check_scope: 'cross_table_parity',
       source_tables: sourceTables, destination_tables: destinationTables,
-      description, mapping_id: mappingId,
+      description,
     }),
   });
 }

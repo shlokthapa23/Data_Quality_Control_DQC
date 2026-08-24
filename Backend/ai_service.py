@@ -78,7 +78,7 @@ Validation to implement: {description}
 Output only the SQL statement, nothing else."""
 
 
-def _build_key_column_prompt(source_tables, destination_tables, description, column_map_text=""):
+def _build_key_column_prompt(source_tables, destination_tables, description):
     return f"""You are a data pipeline validation expert. A source dataset is copied/transformed into a destination dataset, and you need to pick ONE column that can be used to match/join individual rows between the two sides (a primary key, natural key, or unique identifier present on both sides with the same meaning - possibly a different name).
 
 Source table(s):
@@ -87,10 +87,10 @@ Source table(s):
 Destination table(s):
 {_table_blocks(destination_tables)}
 
-What the user wants to verify: {description}{_column_map_section(column_map_text)}
+What the user wants to verify: {description}
 
 Output ONLY a JSON object (no markdown fences, no explanation before or after) with exactly these fields:
-- "key_column": the column name to use as the join/match key - it MUST be either a physical column that exists, spelled exactly the same, in every one of the tables listed above on BOTH sides, or one of the declared common names above if any cover every listed table
+- "key_column": the column name to use as the join/match key - it MUST be a physical column that exists, spelled exactly the same, in every one of the tables listed above on BOTH sides
 - "name": a short human-readable name for this check
 
 Output only the JSON object, nothing else."""
@@ -108,25 +108,6 @@ def _already_covered_section(already_covered_text):
 The following are ALREADY covered by existing checks on this mapping - do NOT repeat them, find genuinely DIFFERENT ones instead:
 {already_covered_text}
 If you cannot find anything genuinely new and different, return an empty JSON array [] rather than repeating an already-covered one."""
-
-
-def _column_map_section(column_map_text):
-    """Shared snippet telling the model about the validation's opt-in column
-    map. Without it the model can only ever propose a column spelled
-    identically on both sides, which is exactly the case a column map exists
-    to solve. Empty string when no map is defined, so callers interpolate it
-    unconditionally the same way _already_covered_section is used.
-
-    Deliberately NOT used by _build_sample_prompt: that prompt generates raw
-    SQL which the engine pushes down verbatim without resolving anything, so a
-    common name there would reference a column that doesn't physically exist."""
-    if not column_map_text:
-        return ""
-    return f"""
-
-The user has already declared that these differently-named physical columns are the SAME logical field, under a shared common name:
-{column_map_text}
-You may use one of those common names in place of a physical column name - the engine resolves it to each table's own physical column at run time. Prefer the common name whenever the two sides name the same field differently; that is the only way to check such a field at all. Physical column names that genuinely are spelled identically on both sides remain perfectly valid too."""
 
 
 def _build_sample_prompt(table_name, columns, sample_rows, max_rules, already_covered_text=""):
@@ -155,7 +136,7 @@ Output only the JSON array, nothing else."""
 
 def _build_parity_sample_prompt(source_table, source_columns, source_sample,
                                  destination_table, destination_columns, destination_sample, max_rules,
-                                 already_covered_text="", column_map_text=""):
+                                 already_covered_text=""):
     source_columns_desc = ", ".join(f"{c['name']} ({c['data_type']})" for c in source_columns)
     destination_columns_desc = ", ".join(f"{c['name']} ({c['data_type']})" for c in destination_columns)
     source_json = json.dumps(source_sample[:15], default=str)
@@ -175,10 +156,10 @@ Output ONLY a JSON array (no markdown fences, no explanation before or after), w
 - "validation_type": exactly one of [{types_list}] - see the metric guide above
 - "severity": exactly one of [{severities_list}]
 - "pattern": REQUIRED only when validation_type is "Regex Pattern Check" - a DuckDB-compatible regex; omit this field entirely for every other metric
-- "source_column": the exact column name from the source table's column list below, or a declared common name
-- "destination_column": the exact column name from the destination table's column list below, or a declared common name
+- "source_column": the exact column name from the source table's column list below
+- "destination_column": the exact column name from the destination table's column list below
 
-Do not invent column names that aren't in the lists below (or among the declared common names, if any). Only pair columns that genuinely represent the same real-world field - do not force a pairing if nothing corresponds.
+Do not invent column names that aren't in the lists below. Only pair columns that genuinely represent the same real-world field - do not force a pairing if nothing corresponds.
 
 Source table: {source_table}
 Source columns: {source_columns_desc}
@@ -188,14 +169,14 @@ Random sample of {min(len(source_sample), 15)} source rows:
 Destination table: {destination_table}
 Destination columns: {destination_columns_desc}
 Random sample of {min(len(destination_sample), 15)} destination rows:
-{destination_json}{_column_map_section(column_map_text)}{_already_covered_section(already_covered_text)}
+{destination_json}{_already_covered_section(already_covered_text)}
 
 Output only the JSON array, nothing else."""
 
 
 def _build_key_column_sample_prompt(source_table, source_columns, source_sample,
                                      destination_table, destination_columns, destination_sample, max_rules,
-                                     already_covered_text="", column_map_text=""):
+                                     already_covered_text=""):
     source_columns_desc = ", ".join(f"{c['name']} ({c['data_type']})" for c in source_columns)
     destination_columns_desc = ", ".join(f"{c['name']} ({c['data_type']})" for c in destination_columns)
     source_json = json.dumps(source_sample[:15], default=str)
@@ -208,10 +189,10 @@ You will be shown both tables' real schemas and a random sample of their actual 
 Output ONLY a JSON array (no markdown fences, no explanation before or after), where each element is an object with exactly these fields:
 - "name": short human-readable check name
 - "description": one sentence explaining why this key column proves the transfer is complete
-- "key_column": the column name to use as the join/match key - it MUST be either a physical column that exists, spelled exactly the same, in BOTH the source and destination column lists below, or one of the declared common names below
+- "key_column": the column name to use as the join/match key - it MUST be a physical column that exists, spelled exactly the same, in BOTH the source and destination column lists below
 - "severity": exactly one of [{severities_list}]
 
-Do not invent column names that aren't in the lists below (or among the declared common names, if any). Only suggest a key if it genuinely represents the same real-world identifier on both sides.
+Do not invent column names that aren't in the lists below. Only suggest a key if it genuinely represents the same real-world identifier on both sides.
 
 Source table: {source_table}
 Source columns: {source_columns_desc}
@@ -221,7 +202,7 @@ Random sample of {min(len(source_sample), 15)} source rows:
 Destination table: {destination_table}
 Destination columns: {destination_columns_desc}
 Random sample of {min(len(destination_sample), 15)} destination rows:
-{destination_json}{_column_map_section(column_map_text)}{_already_covered_section(already_covered_text)}
+{destination_json}{_already_covered_section(already_covered_text)}
 
 Output only the JSON array, nothing else."""
 
@@ -307,7 +288,7 @@ def generate_test_case_sql(tables, description):
     return _clean_sql(text)
 
 
-def generate_key_column_suggestion(source_tables, destination_tables, description, column_map_text=""):
+def generate_key_column_suggestion(source_tables, destination_tables, description):
     """
     source_tables/destination_tables: list of {"table_name","columns"} - real
     schemas on each side. cross_table_parity checks are engine-computed (no
@@ -316,12 +297,8 @@ def generate_key_column_suggestion(source_tables, destination_tables, descriptio
     Returns {"key_column": ..., "name": ...}. The caller is responsible for
     validating the returned key_column actually exists in every selected
     table on both sides before trusting/saving it.
-    column_map_text: optional listing of the validation's declared common
-    column names (s2d/column_map.py's describe()), letting the model pick one
-    when the two sides name the same key differently. "" means literal-name
-    matching only, exactly as before column maps existed.
     """
-    prompt = _build_key_column_prompt(source_tables, destination_tables, description, column_map_text)
+    prompt = _build_key_column_prompt(source_tables, destination_tables, description)
     text = _call_gemini(prompt, max_output_tokens=300)
     cleaned = _clean_json(text)
 
@@ -366,7 +343,7 @@ def generate_rules_from_sample(table_name, columns, sample_rows, max_rules=6, al
 
 def generate_parity_rules_from_samples(source_table, source_columns, source_sample,
                                         destination_table, destination_columns, destination_sample, max_rules=6,
-                                        already_covered_text="", column_map_text=""):
+                                        already_covered_text=""):
     """
     Reads BOTH tables' real schemas and random samples (no user-typed
     prompt) and asks the model to find corresponding column pairs to run
@@ -382,14 +359,11 @@ def generate_parity_rules_from_samples(source_table, source_columns, source_samp
     already_covered_text: optional human-readable listing of existing
     column-pair checks, nudging the model to propose different pairs on a
     repeat call - best-effort only, the caller still de-dupes on save.
-    column_map_text: optional listing of the validation's declared common
-    column names, letting the model pair columns the two sides named
-    differently. "" means literal-name matching only.
     """
     prompt = _build_parity_sample_prompt(
         source_table, source_columns, source_sample,
         destination_table, destination_columns, destination_sample, max_rules,
-        already_covered_text, column_map_text,
+        already_covered_text,
     )
     text = _call_gemini(prompt, max_output_tokens=2000)
     cleaned = _clean_json(text)
@@ -407,7 +381,7 @@ def generate_parity_rules_from_samples(source_table, source_columns, source_samp
 
 def generate_key_column_suggestions_from_samples(source_table, source_columns, source_sample,
                                                    destination_table, destination_columns, destination_sample,
-                                                   max_rules=3, already_covered_text="", column_map_text=""):
+                                                   max_rules=3, already_covered_text=""):
     """
     Sample-based counterpart to generate_key_column_suggestion - reads BOTH
     tables' real schemas and random samples (no user-typed description) and
@@ -420,15 +394,11 @@ def generate_key_column_suggestions_from_samples(source_table, source_columns, s
     already_covered_text: optional human-readable listing of existing key
     columns already used, nudging the model to propose a different one on a
     repeat call - best-effort only, the caller still de-dupes on save.
-    column_map_text: optional listing of the validation's declared common
-    column names, letting the model propose a key the two sides named
-    differently. "" means literal-name matching only - and without it, a
-    validation whose tables renamed their key has no suggestable key at all.
     """
     prompt = _build_key_column_sample_prompt(
         source_table, source_columns, source_sample,
         destination_table, destination_columns, destination_sample, max_rules,
-        already_covered_text, column_map_text,
+        already_covered_text,
     )
     text = _call_gemini(prompt, max_output_tokens=1000)
     cleaned = _clean_json(text)

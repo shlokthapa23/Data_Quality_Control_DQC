@@ -9,7 +9,6 @@ from connector_factory import build_connector
 from harvest import run_harvest
 from local_files import db as local_db
 import analytics_export
-from s2d import column_map as s2d_column_map
 from s2d import db as s2d_db
 from s2d import results_store
 from s2d.engine import run_pipeline
@@ -853,37 +852,6 @@ def rename_s2d_mapping(mapping_id):
     return jsonify(s2d_db.get_mapping(mapping_id))
 
 
-@app.route('/api/s2d/mappings/<mapping_id>/column-map', methods=['PUT'])
-def set_s2d_column_map(mapping_id):
-    """
-    Body: { "column_map": [ { "name": "order_id",
-                              "source": {"<table>": "<column>", ...},
-                              "destination": {"<table>": "<column>", ...} }, ... ] }
-
-    Full replace, same as suite membership - the editor always submits the
-    whole map. Entirely opt-in: an empty array clears it and puts every test
-    case in this validation back on plain literal column names.
-
-    Deliberately does NOT verify the columns still exist - that would mean a
-    live connector round-trip on every save, and the editor already builds its
-    dropdowns from live schema. A column renamed upstream afterwards surfaces
-    as a query error on the next run.
-    """
-    mapping = s2d_db.get_mapping(mapping_id)
-    if not mapping:
-        return jsonify({"error": "Mapping not found"}), 404
-
-    body = request.get_json(force=True) or {}
-    error, cleaned = s2d_column_map.prepare(
-        body.get("column_map") or [], mapping["source_tables"], mapping["destination_tables"]
-    )
-    if error:
-        return jsonify({"error": error}), 400
-
-    s2d_db.set_column_map(mapping_id, cleaned)
-    return jsonify(s2d_db.get_mapping(mapping_id))
-
-
 @app.route('/api/s2d/mappings/<mapping_id>/validate-sql', methods=['POST'])
 def validate_s2d_sql(mapping_id):
     """
@@ -1219,13 +1187,7 @@ def ai_generate_test_case():
 
     Body (cross_table_parity): { "check_scope": "cross_table_parity",
             "source_tables": [{"table_name":..., "columns":[...]}, ...],
-            "destination_tables": [{"table_name":..., "columns":[...]}, ...], "description": "...",
-            "mapping_id": "..." (optional) }
-
-    mapping_id is optional and only used to load that validation's column map,
-    so a common name covering every selected table counts as a valid key even
-    when no single physical column name is shared across them. Omitting it
-    just means literal-name matching, exactly as before.
+            "destination_tables": [{"table_name":..., "columns":[...]}, ...], "description": "..." }
 
     The real table name(s) and real column list(s) are supplied by the
     frontend (pulled from the same live schema the table dropdowns already
@@ -1251,27 +1213,17 @@ def ai_generate_test_case():
         if not source_tables or not destination_tables:
             return jsonify({"error": "source_tables and destination_tables are required for cross_table_parity"}), 400
 
-        mapping = s2d_db.get_mapping(body["mapping_id"]) if body.get("mapping_id") else None
-
         try:
-            suggestion = generate_key_column_suggestion(
-                source_tables, destination_tables, description,
-                column_map_text=s2d_column_map.describe(mapping),
-            )
+            suggestion = generate_key_column_suggestion(source_tables, destination_tables, description)
         except Exception as e:
             print(f"AI key column suggestion error: {e}")
             return jsonify({"error": "AI generation failed", "details": str(e)}), 502
 
         key_column = suggestion.get("key_column")
-        # A key is valid if it's a physical column present on every selected
-        # table (the original rule) OR a common name from the validation's
-        # column map that covers every selected table on that side.
+        # A key is valid only if it's a physical column present on every
+        # selected table on both sides.
         source_column_names = set.intersection(*({c["name"] for c in t["columns"]} for t in source_tables))
         destination_column_names = set.intersection(*({c["name"] for c in t["columns"]} for t in destination_tables))
-        source_column_names |= set(s2d_column_map.common_names(
-            mapping, "source", [t["table_name"] for t in source_tables]))
-        destination_column_names |= set(s2d_column_map.common_names(
-            mapping, "destination", [t["table_name"] for t in destination_tables]))
         if key_column not in source_column_names or key_column not in destination_column_names:
             return jsonify({
                 "error": f"AI suggested key_column '{key_column}', which isn't common to every selected table on both sides - pick one manually",
@@ -1472,7 +1424,6 @@ def ai_suggest_parity_rules(mapping_id):
             first_source_table, source_entries[first_source_table]["columns"], source_sample,
             first_destination_table, destination_entries[first_destination_table]["columns"], destination_sample,
             already_covered_text=already_covered_text,
-            column_map_text=s2d_column_map.describe(mapping),
         )
     except Exception as e:
         print(f"AI parity rule suggestion error: {e}")
@@ -1480,16 +1431,13 @@ def ai_suggest_parity_rules(mapping_id):
 
     # Column must exist on EVERY selected table per side, not just the one
     # the AI actually saw a sample of - otherwise the UNION ALL query the
-    # engine builds would fail against tables the AI never looked at. A common
-    # name from the validation's column map counts too, as long as the map
-    # covers every selected table on that side: the engine resolves it to each
-    # table's own physical column, so the UNION ALL is still valid.
+    # engine builds would fail against tables the AI never looked at.
     source_column_names = set.intersection(*(
         {c["name"] for c in entry["columns"]} for entry in source_entries.values()
-    )) | set(s2d_column_map.common_names(mapping, "source", source_tables))
+    ))
     destination_column_names = set.intersection(*(
         {c["name"] for c in entry["columns"]} for entry in destination_entries.values()
-    )) | set(s2d_column_map.common_names(mapping, "destination", destination_tables))
+    ))
 
     created = []
     skipped = []
@@ -1614,7 +1562,6 @@ def ai_suggest_cross_table_parity_rules(mapping_id):
             first_source_table, source_entries[first_source_table]["columns"], source_sample,
             first_destination_table, destination_entries[first_destination_table]["columns"], destination_sample,
             already_covered_text=already_covered_text,
-            column_map_text=s2d_column_map.describe(mapping),
         )
     except Exception as e:
         print(f"AI cross-table parity rule suggestion error: {e}")
@@ -1622,17 +1569,13 @@ def ai_suggest_cross_table_parity_rules(mapping_id):
 
     # Key column must exist on EVERY selected table per side, not just the
     # one the AI actually saw a sample of - otherwise the UNION ALL query
-    # the engine builds would fail against tables the AI never looked at. A
-    # common name from the validation's column map counts too when the map
-    # covers every selected table on that side, since the engine resolves it
-    # per table - that's the whole point of the map, and without this the AI
-    # can't propose anything at all for tables that renamed their key.
+    # the engine builds would fail against tables the AI never looked at.
     source_column_names = set.intersection(*(
         {c["name"] for c in entry["columns"]} for entry in source_entries.values()
-    )) | set(s2d_column_map.common_names(mapping, "source", source_tables))
+    ))
     destination_column_names = set.intersection(*(
         {c["name"] for c in entry["columns"]} for entry in destination_entries.values()
-    )) | set(s2d_column_map.common_names(mapping, "destination", destination_tables))
+    ))
 
     created = []
     skipped = []

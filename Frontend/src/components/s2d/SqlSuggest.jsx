@@ -47,7 +47,7 @@ function scoreMatch(candidate, token) {
 }
 
 export default function SqlSuggest({
-  value, onChange, tables = [], columnsByTable = {}, commonNames = [],
+  value, onChange, tables = [], columnsByTable = {},
   rows = 8, className = '', placeholder, disabled, onBlur,
 }) {
   const ref = useRef(null);
@@ -90,7 +90,6 @@ export default function SqlSuggest({
           detail: owners.length > 2 ? `column · ${owners.length} tables` : `column · ${owners.join(', ')}`,
         });
       });
-      commonNames.forEach((n) => pool.push({ kind: 'column', label: n, detail: 'column map' }));
     }
 
     return pool
@@ -98,7 +97,7 @@ export default function SqlSuggest({
       .filter((item) => item.score >= 0)
       .sort((a, b) => b.score - a.score)
       .slice(0, 8);
-  }, [open, token, caret, value, tables, columnIndex, commonNames]);
+  }, [open, token, caret, value, tables, columnIndex]);
 
   const accept = (item) => {
     const el = ref.current;

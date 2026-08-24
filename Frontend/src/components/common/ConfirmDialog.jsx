@@ -7,8 +7,8 @@ import { ConfirmContext } from './confirmContext';
  * the app with a themed card - the native dialogs are unstyled (show as
  * "localhost says"), block the JS thread, and can't be dismissed with Escape
  * consistently across browsers. This renders inline instead, matching every
- * other modal in the app (ColumnMapModal, AssetDetailModal, etc: fixed
- * inset-0 backdrop + centered white card).
+ * other modal in the app (AssetDetailModal, etc: fixed inset-0 backdrop +
+ * centered white card).
  *
  * Usage (hooks live in confirmContext.js, split out so this file can stay a
  * component-only export for Fast Refresh):

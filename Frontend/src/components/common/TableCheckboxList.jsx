@@ -9,9 +9,8 @@ import { formatRowCount, rowCountStyle, rowCountTitle } from '../../rowCount';
 // Note the ?? rather than ||: an empty table's count is 0, which is falsy, and
 // hiding "0" would suppress exactly the case a tester most wants to notice.
 //
-// Shared between TestCasePanel (every table picker in the test case editor)
-// and ColumnMapModal (picking which tables to show columns for) - one
-// picker, one behavior, rather than two that could drift apart.
+// Shared across every table picker in the test case editor - one picker,
+// one behavior, rather than several that could drift apart.
 export function TableCheckboxList({ tables, selected, onToggle, rowCounts = {} }) {
   const [query, setQuery] = useState('');
   const visible = filterByName(tables, query);

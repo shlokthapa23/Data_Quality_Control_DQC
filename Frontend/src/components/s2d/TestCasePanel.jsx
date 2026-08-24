@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import {
   Sparkles, Code2, Plus, Trash2, Loader2, AlertCircle, GitCompareArrows,
-  Pencil, Play, X, Wand2, User, ListChecks, CheckCircle2, Columns3,
+  Pencil, Play, X, Wand2, User, ListChecks, CheckCircle2,
   Search, ArrowRight, ArrowLeft, Info, ChevronDown,
 } from 'lucide-react';
 import {
@@ -11,10 +11,8 @@ import {
   generateAISuggestedCrossTableParityRules, setS2DTestCaseActive,
   fetchTestSuitesForMapping, fetchTestSuite, updateTestSuite,
 } from '../../api';
-import { commonNamesFor } from '../../columnMap';
 import { lintSql } from '../../sqlLint';
 import { TableCheckboxList } from '../common/TableCheckboxList';
-import ColumnMapModal from './ColumnMapModal';
 import SqlSuggest from './SqlSuggest';
 import { useConfirm } from '../common/confirmContext';
 
@@ -165,22 +163,6 @@ function commonColumns(schema, tableNames) {
   return first.filter((c) => rest.every((cols) => cols.some((c2) => c2.name === c.name)));
 }
 
-// Appends the validation's opt-in common names to a list of real columns as
-// pseudo-columns, so both drop into the same <select>. A common name is only
-// ever passed in here once it covers every selected table (see
-// columnMap.js's commonNamesFor), and one that collides with a real column
-// name is dropped - the physical column already resolves through the map, and
-// two options sharing a value would be indistinguishable to the tester.
-function withMappedColumns(literalColumns, mappedNames) {
-  const taken = new Set(literalColumns.map((c) => c.name));
-  return [
-    ...literalColumns,
-    ...mappedNames
-      .filter((name) => !taken.has(name))
-      .map((name) => ({ name, data_type: 'column map', mapped: true })),
-  ];
-}
-
 /**
  * Instant hints plus a Check syntax button, shared by all three SQL editors.
  *
@@ -306,12 +288,11 @@ function ThemedSelect({ value, onChange, options, placeholder = 'Select…', cla
   );
 }
 
-export default function TestCasePanel({ mapping, onRunComplete, focus, onMappingUpdated }) {
+export default function TestCasePanel({ mapping, onRunComplete, focus }) {
 const confirmDialog = useConfirm();
 // Manual is the primary workflow - testers write their own test cases here
 // first; AI generation is an assist tool, not the default landing tab.
 const [tab, setTab] = useState('manual'); // 'ai' | 'manual'
-  const [showColumnMap, setShowColumnMap] = useState(false);
 
   const [testCases, setTestCases] = useState([]);
   const [isLoading, setIsLoading] = useState(false);
@@ -445,24 +426,13 @@ const [tab, setTab] = useState('manual'); // 'ai' | 'manual'
   const aiTables = (aiTarget === 'source' ? sourceSchema : destinationSchema)
     .filter((t) => (aiTarget === 'source' ? mapping.source_tables : mapping.destination_tables).includes(t.name));
   const selectedAiTables = aiTables.filter((t) => aiTableNames.includes(t.name));
-  const sourceParityColumns = withMappedColumns(
-    commonColumns(sourceSchema, form.sourceTables),
-    commonNamesFor(mapping, 'source', form.sourceTables),
-  );
-  const destinationParityColumns = withMappedColumns(
-    commonColumns(destinationSchema, form.destinationTables),
-    commonNamesFor(mapping, 'destination', form.destinationTables),
-  );
-  // A common name qualifies as a cross-table key when the map covers every
-  // selected table on BOTH sides - the engine resolves it per table, so the
-  // two sides never have to spell the key the same way. That's the case that
-  // was previously unselectable no matter what the tester did.
-  const crossParityKeyColumns = withMappedColumns(
-    commonColumns(sourceSchema, form.sourceTargetTables)
-      .filter((c) => commonColumns(destinationSchema, form.destinationTargetTables).some((c2) => c2.name === c.name)),
-    commonNamesFor(mapping, 'source', form.sourceTargetTables)
-      .filter((name) => commonNamesFor(mapping, 'destination', form.destinationTargetTables).includes(name)),
-  );
+  const sourceParityColumns = commonColumns(sourceSchema, form.sourceTables);
+  const destinationParityColumns = commonColumns(destinationSchema, form.destinationTables);
+  // A key column must be a literal name shared by every selected table on
+  // BOTH sides now that there's no column map to resolve a differently-spelled
+  // name per table.
+  const crossParityKeyColumns = commonColumns(sourceSchema, form.sourceTargetTables)
+    .filter((c) => commonColumns(destinationSchema, form.destinationTargetTables).some((c2) => c2.name === c.name));
 
   const toggleAiTableName = (table) => {
     setAiTableNames((prev) => (prev.includes(table) ? prev.filter((t) => t !== table) : [...prev, table]));
@@ -559,7 +529,6 @@ const [tab, setTab] = useState('manual'); // 'ai' | 'manual'
         sourceTables: aiCrossSourceTables.map((n) => toContext(sourceSchema, n)),
         destinationTables: aiCrossDestinationTables.map((n) => toContext(destinationSchema, n)),
         description: aiCrossDescription,
-        mappingId: mapping.id,
       });
       // Hand off to the Manual tab, pre-filled and ready to review/save -
       // same landing spot the 'single' mode's Generate Test Case uses.
@@ -1039,9 +1008,6 @@ const [tab, setTab] = useState('manual'); // 'ai' | 'manual'
     return {
       tables: [...new Set(schema.map((t) => t.name))],
       columnsByTable,
-      // A common name resolves to a different physical column per table, so
-      // someone writing free SQL needs to see them beside the real ones.
-      commonNames: (mapping.column_map || []).map((c) => c.name).filter(Boolean),
     };
   };
 
@@ -1115,14 +1081,6 @@ const [tab, setTab] = useState('manual'); // 'ai' | 'manual'
           </button>
         </div>
       </div>
-
-      {showColumnMap && (
-        <ColumnMapModal
-          mapping={mapping}
-          onClose={() => setShowColumnMap(false)}
-          onSaved={(updated) => onMappingUpdated?.(updated)}
-        />
-      )}
 
       {tab === 'ai' && (
         <div className="bg-white border border-slate-200 rounded-xl p-5 space-y-4 shadow-sm">
@@ -1520,23 +1478,6 @@ const [tab, setTab] = useState('manual'); // 'ai' | 'manual'
                 />
               </div>
             )}
-
-            {/* Below the check type / validation type pickers, not up in the
-                header - it's most useful right where a tester is about to
-                pick tables and columns, not competing for space with the
-                tab switcher above. */}
-            <button
-              onClick={() => setShowColumnMap(true)}
-              title="Map columns - give differently-named columns one common name"
-              className="flex items-center gap-2 px-4 py-2 text-sm font-medium text-mastek-primary border border-mastek-primary/40 rounded-lg hover:bg-mastek-primary/10"
-            >
-              <Columns3 className="w-4 h-4" /> Map Columns
-              {(mapping.column_map?.length || 0) > 0 && (
-                <span className="text-[10px] font-medium px-1.5 py-0.5 rounded-full bg-mastek-primary/10">
-                  {mapping.column_map.length}
-                </span>
-              )}
-            </button>
           </div>
 
           {form.checkType === 'row_count_match' && (
@@ -1594,7 +1535,7 @@ const [tab, setTab] = useState('manual'); // 'ai' | 'manual'
                       {form.sourceTables.length === 0
                         ? 'Select table(s) first'
                         : sourceParityColumns.length === 0
-                        ? 'No shared column - try Map Columns'
+                        ? 'No shared column across selected tables'
                         : 'Select column'}
                     </option>
                     {sourceParityColumns.map((c) => (
@@ -1620,7 +1561,7 @@ const [tab, setTab] = useState('manual'); // 'ai' | 'manual'
                       {form.destinationTables.length === 0
                         ? 'Select table(s) first'
                         : destinationParityColumns.length === 0
-                        ? 'No shared column - try Map Columns'
+                        ? 'No shared column across selected tables'
                         : 'Select column'}
                     </option>
                     {destinationParityColumns.map((c) => (
@@ -1704,7 +1645,7 @@ const [tab, setTab] = useState('manual'); // 'ai' | 'manual'
                   {form.sourceTargetTables.length === 0 || form.destinationTargetTables.length === 0
                     ? 'Select table(s) on both sides first'
                     : crossParityKeyColumns.length === 0
-                    ? 'No shared key column - try Map Columns'
+                    ? 'No shared key column across selected tables'
                     : 'Select key column'}
                 </option>
                 {/* Whole-row mode needs no shared key, only shared columns, so
