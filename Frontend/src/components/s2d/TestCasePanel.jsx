@@ -630,6 +630,14 @@ const [tab, setTab] = useState('manual'); // 'ai' | 'manual'
       keyColumn: tc.key_column || '',
       parityPattern: tc.parity_config?.pattern || '',
       destinationScriptText: tc.destination_script_text || '',
+      // dual_script's "Target tables" checklist is frontend-only (never
+      // persisted - see toggleDualScriptTable's comment), so there's
+      // nothing on `tc` to restore it from; these just have to start
+      // blank on every edit, same as a fresh dual_script check would.
+      // Missing this left them `undefined` instead of `[]`, which crashed
+      // TableCheckboxList's `selected.includes(...)` the moment a dual_script
+      // check was edited.
+      dualScriptSourceTables: [], dualScriptDestinationTables: [],
     });
   };
 
@@ -674,15 +682,23 @@ const [tab, setTab] = useState('manual'); // 'ai' | 'manual'
     return tc.target_tables && tc.target_tables.length ? tc.target_tables : (tc.target_table ? [tc.target_table] : []);
   };
 
-  // "Still valid" means both selected for this test layer AND still really
-  // there in Fabric right now - a table can drop out of either independently
-  // (someone unchecks it in the mapping, or it gets dropped/renamed upstream
-  // without anyone touching this app at all).
+  // "Still valid" means selected for this test layer, and - when we can
+  // actually confirm it - still really there in Fabric right now. An EMPTY
+  // live-schema list is treated as "couldn't confirm right now" rather than
+  // "nothing exists": that fetch can be slow, still in flight, or fail
+  // outright, and a stricter version that always required live confirmation
+  // mistook that for every table on that side having vanished - which
+  // wrongly flagged an entire mapping's worth of perfectly healthy test
+  // cases as orphaned the moment the live fetch had a bad moment. Only
+  // treat a table as gone when the live list actually loaded and it's
+  // genuinely not in it.
   const liveSourceTableNames = new Set(sourceSchema.map((t) => t.table));
   const liveDestinationTableNames = new Set(destinationSchema.map((t) => t.table));
+  const sourceLiveConfirmed = sourceSchema.length > 0;
+  const destinationLiveConfirmed = destinationSchema.length > 0;
   const validTestLayerTables = new Set([
-    ...(mapping?.source_tables || []).filter((t) => liveSourceTableNames.has(t)),
-    ...(mapping?.destination_tables || []).filter((t) => liveDestinationTableNames.has(t)),
+    ...(mapping?.source_tables || []).filter((t) => !sourceLiveConfirmed || liveSourceTableNames.has(t)),
+    ...(mapping?.destination_tables || []).filter((t) => !destinationLiveConfirmed || liveDestinationTableNames.has(t)),
   ]);
 
   const isOrphanedTestCase = (tc) => {
@@ -920,18 +936,32 @@ const [tab, setTab] = useState('manual'); // 'ai' | 'manual'
   // Declared after startEdit/enterSuiteSelection/loadSuiteMembers so it can
   // reference them (ESLint's no-use-before-define check is static and
   // doesn't know the callback only runs after the full render completes).
+  // handledFocusRef remembers which exact focus handoff has already been
+  // acted on, keyed by its mappingId+testCaseId+suiteId - NOT the same thing
+  // as clearing `focus` itself (still deliberately left set in the parent,
+  // per the StrictMode-remount reasoning above). Without this, saving an
+  // edit refreshes `testCases`, which re-fires this effect, which finds the
+  // SAME focused test case again and calls startEdit() on it a second time -
+  // silently reopening the form the tester just closed, over and over, on
+  // every subsequent save. Only re-acts when the focus itself changes to a
+  // genuinely different target (a fresh Edit click elsewhere), or when the
+  // target test case hadn't loaded yet on an earlier attempt.
+  const handledFocusRef = useRef(null);
   useEffect(() => {
     if (!focus || !mapping || focus.mappingId !== mapping.id || isLoading) return;
+    const focusKey = `${focus.mappingId}:${focus.testCaseId || ''}:${focus.suiteId || ''}`;
+    if (handledFocusRef.current === focusKey) return;
     let cancelled = false;
     Promise.resolve().then(() => {
       if (cancelled) return;
       if (focus.testCaseId) {
         const tc = testCases.find((t) => t.id === focus.testCaseId);
-        if (tc) startEdit(tc);
+        if (tc) { startEdit(tc); handledFocusRef.current = focusKey; }
       } else if (focus.suiteId) {
         enterSuiteSelection();
         setTargetSuiteId(focus.suiteId);
         loadSuiteMembers(focus.suiteId);
+        handledFocusRef.current = focusKey;
       }
     });
     return () => { cancelled = true; };
