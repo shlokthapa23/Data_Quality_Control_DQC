@@ -1,5 +1,6 @@
 import re
 import time
+import json
 from datetime import datetime, timezone
 
 from s2d import column_map
@@ -7,6 +8,15 @@ from collections import Counter
 
 from s2d import db as s2d_db
 from s2d import results_store
+from notifications import db as notifications_db
+
+# Cap on how long a PySpark test-case run is allowed to sit "InProgress"
+# before this is treated as a failure - Spark cold-starts commonly take a
+# couple of minutes, so this is generous, but a suite run (this executes
+# synchronously, blocking whatever called it - see _run_pyspark_check) can't
+# wait forever on one check.
+_PYSPARK_POLL_INTERVAL_SECONDS = 5
+_PYSPARK_POLL_MAX_ATTEMPTS = 96  # 96 * 5s = 8 minutes
 
 
 def _interpret_row(row):
@@ -126,6 +136,77 @@ def _build_summed_count_query(tables):
     return f"SELECT SUM(cnt) AS cnt FROM ({union_sql}) agg"
 
 
+def _run_pyspark_check(tc, connector, container_id, rule_target):
+    """
+    Runs a tester-authored PySpark script as a Fabric notebook job and
+    blocks (synchronously, like every other check here) until it reaches a
+    terminal state. See fabric_pyspark_test_notebook_template.py for the
+    'result' dict contract the script is expected to follow - it's read
+    back through the exact same _interpret_row/_describe_extra_columns
+    logic a SQL script's returned row already goes through, so a PySpark
+    check's Result-table entry looks identical to a SQL one.
+
+    Fabric's Notebook Jobs API is only implemented on FabricConnector - a
+    PySpark check against a Local connector has nowhere to run, so that's
+    reported plainly rather than attempted.
+    """
+    if not hasattr(connector, "run_pyspark_test_case"):
+        return "ERROR", tc["script_text"], None, \
+            "PySpark checks require a Fabric connector - Local connectors have no Spark to run this on.", \
+            rule_target, None, None
+
+    try:
+        notebook_id, job_id, result_path = connector.run_pyspark_test_case(container_id, tc["script_text"])
+    except Exception as e:
+        return "ERROR", tc["script_text"], None, f"Could not start the PySpark job: {e}", rule_target, None, None
+    if not job_id:
+        return "ERROR", tc["script_text"], None, \
+            "The PySpark job started but its job id could not be resolved.", rule_target, None, None
+
+    run = None
+    for _ in range(_PYSPARK_POLL_MAX_ATTEMPTS):
+        try:
+            run = connector.get_notebook_job(notebook_id, job_id)
+        except Exception as e:
+            return "ERROR", tc["script_text"], None, f"Could not read the PySpark job's status: {e}", rule_target, None, None
+        if not run["is_running"]:
+            break
+        time.sleep(_PYSPARK_POLL_INTERVAL_SECONDS)
+    else:
+        return "ERROR", tc["script_text"], None, \
+            "Timed out waiting for the PySpark job to finish (over 8 minutes) - check the Fabric portal directly.", \
+            rule_target, None, None
+
+    if run["status"] != "Completed":
+        return "ERROR", tc["script_text"], None, \
+            run["failure_reason"] or f'PySpark job ended with status "{run["status"]}"', rule_target, None, None
+
+    try:
+        raw = connector.read_onelake_file(container_id, result_path)
+        row = json.loads(raw)
+    except Exception as e:
+        return "ERROR", tc["script_text"], None, f"PySpark job finished but its result couldn't be read: {e}", rule_target, None, None
+    finally:
+        try:
+            connector.cleanup_staging_file(container_id, result_path)
+        except Exception:
+            pass  # best-effort, same as every other staging cleanup in this app
+
+    if not isinstance(row, dict):
+        return "ERROR", tc["script_text"], None, f"PySpark result was not a JSON object: {row!r}", rule_target, None, None
+
+    passed, details, asserted = _interpret_row(row)
+    violations = row.get("violations")
+    total_rows = row.get("total_rows")
+    extras = _describe_extra_columns(row, _SQL_CHECK_RESERVED)
+    if extras:
+        details = f"{details} | {extras}" if details else extras
+    if not asserted:
+        note = 'Measured only - the script set no "passed" key, so nothing was asserted'
+        details = f"{note}: {details}" if details else note
+    return ("PASS" if passed else "FAIL"), tc["script_text"], details, None, rule_target, violations, total_rows
+
+
 def _run_sql_check(tc, mapping, source_connector, destination_connector):
     # target_tables (plural) supersedes the legacy singular target_table;
     # fall back to it for any not-yet-backfilled row, then to the mapping's
@@ -135,14 +216,13 @@ def _run_sql_check(tc, mapping, source_connector, destination_connector):
         mapping["source_tables"] if tc["target"] == "source" else mapping["destination_tables"]
     )
 
-    if tc["script_type"] != "sql":
-        return "ERROR", tc["script_text"], None, \
-            "PySpark execution isn't wired up yet - use a SQL script for live runs.", rule_target, None, None
-
     if tc["target"] == "source":
         connector, container_id = source_connector, mapping["source_container_id"]
     else:
         connector, container_id = destination_connector, mapping["destination_container_id"]
+
+    if tc["script_type"] != "sql":
+        return _run_pyspark_check(tc, connector, container_id, rule_target)
 
     try:
         row = connector.run_query(container_id, tc["script_text"])
@@ -170,6 +250,132 @@ def _run_sql_check(tc, mapping, source_connector, destination_connector):
         return "ERROR", tc["script_text"], None, str(e), rule_target, None, None
 
 
+def _compare_dual_rows(source_row, destination_row, evaluated_query, rule_target):
+    """
+    Shared by both dual_script paths (SQL and PySpark) - takes each side's
+    already-fetched row (a dict either way: a DuckDB row via run_query, or a
+    PySpark job's JSON result file) and does the actual value comparison.
+    Splitting this out means neither execution mechanism needs to know
+    anything about how the OTHER one runs.
+    """
+    source_value, error, source_column = _interpret_value_row(source_row, "source")
+    if error:
+        return "ERROR", evaluated_query, None, error, rule_target, None, None
+    destination_value, error, destination_column = _interpret_value_row(destination_row, "destination")
+    if error:
+        return "ERROR", evaluated_query, None, error, rule_target, None, None
+
+    passed = source_value == destination_value
+    details = f"source value = {source_value} | destination value = {destination_value}"
+    # Each side may also return a 'details' entry to explain its own number,
+    # and anything else it returned is surfaced too - same reasoning as the
+    # single-side path, so every dual_script mode behaves identically here.
+    extra = []
+    for side, r, used in (("source", source_row, source_column),
+                          ("destination", destination_row, destination_column)):
+        # The column that supplied the value is already reported above, so leave
+        # it out here rather than printing the same number twice.
+        reserved = _DUAL_SCRIPT_RESERVED + ((used,) if used else ())
+        parts = [p for p in (r.get("details"), _describe_extra_columns(r, reserved)) if p]
+        if parts:
+            extra.append(f"{side}: " + ", ".join(str(p) for p in parts))
+    if extra:
+        details += " (" + "; ".join(extra) + ")"
+
+    # A numeric gap is a meaningful violation count; anything else (strings,
+    # dates, NULLs) can only be a 0/1 flag.
+    if isinstance(source_value, (int, float)) and isinstance(destination_value, (int, float)) \
+            and not isinstance(source_value, bool) and not isinstance(destination_value, bool):
+        violations = abs(source_value - destination_value)
+    else:
+        violations = 0 if passed else 1
+
+    return ("PASS" if passed else "FAIL"), evaluated_query, details, None, rule_target, violations, None
+
+
+def _run_dual_pyspark_check(tc, mapping, source_connector, destination_connector, evaluated_query, rule_target):
+    """
+    PySpark counterpart to the SQL dual_script path above: one script per
+    side, each ending by setting a `result` dict with either a 'value' key
+    or exactly one key (same _interpret_value_row contract SQL dual_script
+    already uses - see fabric_pyspark_test_notebook_template.py's contract,
+    unchanged from the single_side case). Genuinely separate Fabric
+    connectors need genuinely separate Spark jobs - a single notebook run
+    can't span two workspaces/service principals.
+
+    Both jobs are SUBMITTED first, then polled together (not one full
+    submit-wait-submit-wait sequence) so the wall-clock cost is roughly
+    max(source, destination) rather than their sum - each side's Spark
+    cold-start already costs a couple of minutes on its own.
+    """
+    for side, connector in (("source", source_connector), ("destination", destination_connector)):
+        if not hasattr(connector, "run_pyspark_test_case"):
+            return "ERROR", evaluated_query, None, \
+                f"PySpark checks require a Fabric connector - the {side} connector has no Spark to run this on.", \
+                rule_target, None, None
+
+    try:
+        source_job = source_connector.run_pyspark_test_case(mapping["source_container_id"], tc["script_text"])
+    except Exception as e:
+        return "ERROR", evaluated_query, None, f"Could not start the source PySpark job: {e}", rule_target, None, None
+    try:
+        destination_job = destination_connector.run_pyspark_test_case(
+            mapping["destination_container_id"], tc["destination_script_text"])
+    except Exception as e:
+        return "ERROR", evaluated_query, None, f"Could not start the destination PySpark job: {e}", rule_target, None, None
+
+    jobs = {
+        "source": {"connector": source_connector, "container_id": mapping["source_container_id"],
+                   "notebook_id": source_job[0], "job_id": source_job[1], "result_path": source_job[2], "run": None},
+        "destination": {"connector": destination_connector, "container_id": mapping["destination_container_id"],
+                         "notebook_id": destination_job[0], "job_id": destination_job[1], "result_path": destination_job[2], "run": None},
+    }
+    for side, j in jobs.items():
+        if not j["job_id"]:
+            return "ERROR", evaluated_query, None, \
+                f"The {side} PySpark job started but its job id could not be resolved.", rule_target, None, None
+
+    for _ in range(_PYSPARK_POLL_MAX_ATTEMPTS):
+        still_running = False
+        for side, j in jobs.items():
+            if j["run"] and not j["run"]["is_running"]:
+                continue
+            try:
+                j["run"] = j["connector"].get_notebook_job(j["notebook_id"], j["job_id"])
+            except Exception as e:
+                return "ERROR", evaluated_query, None, f"Could not read the {side} PySpark job's status: {e}", rule_target, None, None
+            if j["run"]["is_running"]:
+                still_running = True
+        if not still_running:
+            break
+        time.sleep(_PYSPARK_POLL_INTERVAL_SECONDS)
+    else:
+        return "ERROR", evaluated_query, None, \
+            "Timed out waiting for the PySpark jobs to finish (over 8 minutes) - check the Fabric portal directly.", \
+            rule_target, None, None
+
+    rows = {}
+    for side, j in jobs.items():
+        if j["run"]["status"] != "Completed":
+            return "ERROR", evaluated_query, None, \
+                j["run"]["failure_reason"] or f'{side} PySpark job ended with status "{j["run"]["status"]}"', \
+                rule_target, None, None
+        try:
+            raw = j["connector"].read_onelake_file(j["container_id"], j["result_path"])
+            rows[side] = json.loads(raw)
+        except Exception as e:
+            return "ERROR", evaluated_query, None, f"{side} PySpark job finished but its result couldn't be read: {e}", rule_target, None, None
+        finally:
+            try:
+                j["connector"].cleanup_staging_file(j["container_id"], j["result_path"])
+            except Exception:
+                pass
+        if not isinstance(rows[side], dict):
+            return "ERROR", evaluated_query, None, f"{side} PySpark result was not a JSON object: {rows[side]!r}", rule_target, None, None
+
+    return _compare_dual_rows(rows["source"], rows["destination"], evaluated_query, rule_target)
+
+
 def _run_dual_script_check(tc, mapping, source_connector, destination_connector):
     """
     One script per side, each returning a single row with a 'value' column;
@@ -193,12 +399,12 @@ def _run_dual_script_check(tc, mapping, source_connector, destination_connector)
     )
     evaluated_query = f"[source] {source_sql}  |  [destination] {destination_sql}"
 
-    if tc.get("script_type") != "sql":
-        return "ERROR", evaluated_query, None, \
-            "PySpark execution isn't wired up yet - use a SQL script for live runs.", rule_target, None, None
     if not source_sql or not destination_sql:
         return "ERROR", evaluated_query, None, \
             "Both a source and a destination script are required for this check.", rule_target, None, None
+
+    if tc.get("script_type") != "sql":
+        return _run_dual_pyspark_check(tc, mapping, source_connector, destination_connector, evaluated_query, rule_target)
 
     try:
         source_row = source_connector.run_query(mapping["source_container_id"], source_sql)
@@ -210,39 +416,7 @@ def _run_dual_script_check(tc, mapping, source_connector, destination_connector)
     except Exception as e:
         return "ERROR", evaluated_query, None, f"Destination script failed: {e}", rule_target, None, None
 
-    source_value, error, source_column = _interpret_value_row(source_row, "source")
-    if error:
-        return "ERROR", evaluated_query, None, error, rule_target, None, None
-    destination_value, error, destination_column = _interpret_value_row(destination_row, "destination")
-    if error:
-        return "ERROR", evaluated_query, None, error, rule_target, None, None
-
-    passed = source_value == destination_value
-    details = f"source value = {source_value} | destination value = {destination_value}"
-    # Each side may also return a 'details' column to explain its own number, and
-    # anything else it selected is surfaced too - same reasoning as the
-    # single-side path, so the two Custom SQL modes don't behave differently.
-    extra = []
-    for side, r, used in (("source", source_row, source_column),
-                          ("destination", destination_row, destination_column)):
-        # The column that supplied the value is already reported above, so leave
-        # it out here rather than printing the same number twice.
-        reserved = _DUAL_SCRIPT_RESERVED + ((used,) if used else ())
-        parts = [p for p in (r.get("details"), _describe_extra_columns(r, reserved)) if p]
-        if parts:
-            extra.append(f"{side}: " + ", ".join(str(p) for p in parts))
-    if extra:
-        details += " (" + "; ".join(extra) + ")"
-
-    # A numeric gap is a meaningful violation count; anything else (strings,
-    # dates, NULLs) can only be a 0/1 flag.
-    if isinstance(source_value, (int, float)) and isinstance(destination_value, (int, float)) \
-            and not isinstance(source_value, bool) and not isinstance(destination_value, bool):
-        violations = abs(source_value - destination_value)
-    else:
-        violations = 0 if passed else 1
-
-    return ("PASS" if passed else "FAIL"), evaluated_query, details, None, rule_target, violations, None
+    return _compare_dual_rows(source_row, destination_row, evaluated_query, rule_target)
 
 
 def _run_row_count_match(tc, mapping, source_connector, destination_connector):
@@ -971,7 +1145,17 @@ def run_suite(source_connector, destination_connector, mapping, suite_id, test_c
     results, compute_time_seconds = _execute_test_cases(
         source_connector, destination_connector, mapping, test_cases
     )
-    return _persist_run(mapping["id"], results, compute_time_seconds, suite_id=suite_id)
+    run_id = _persist_run(mapping["id"], results, compute_time_seconds, suite_id=suite_id)
+
+    # Covers both a manual "Run" click and a scheduled fire - run_suite is
+    # the one function both paths call, so this is the single point of
+    # truth for "a test suite ran" regardless of what triggered it.
+    passed = sum(1 for r in results if r["status"] == "PASS")
+    notifications_db.record_notification(
+        "suite_run",
+        f'Test suite on "{mapping["name"]}" finished: {passed} of {len(results)} checks passed.',
+    )
+    return run_id
 
 
 def run_one(source_connector, destination_connector, mapping, test_case):

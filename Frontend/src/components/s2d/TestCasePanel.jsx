@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import {
-  Sparkles, Code2, Plus, Trash2, Loader2, AlertCircle, GitCompareArrows,
+  Sparkles, Code2, Plus, Trash2, Loader2, AlertCircle, AlertTriangle, GitCompareArrows,
   Pencil, Play, X, Wand2, User, ListChecks, CheckCircle2,
   Search, ArrowRight, ArrowLeft, Info, ChevronDown,
 } from 'lucide-react';
@@ -103,7 +103,7 @@ const CHECK_TYPE_OPTIONS = [
   },
   {
     value: 'cross_table_parity',
-    label: 'Compare rows',
+    label: 'Missing Rows Check',
     description: 'Checks that every key value on source also exists on destination (and vice versa). Slower but tells you which specific rows are missing.',
   },
 ];
@@ -134,6 +134,36 @@ const DUAL_SCRIPT_PLACEHOLDER_DESTINATION = `-- Runs on the DESTINATION connecti
 SELECT COUNT(DISTINCT "CustomerKey")
 FROM "dbo"."dim_customer"
 WHERE "Status" = 'ACTIVE'`;
+
+// PySpark checks only run against a Fabric connector (a Spark job, not the
+// SQL endpoint) - read_table() and spark are already in scope, same idea as
+// the SQL editor's implicit connection. Set "result" at the end; "passed" is
+// optional, same as SQL's "passed" column - anything else in the dict is
+// surfaced as extra output.
+const PYSPARK_PLACEHOLDER = `# read_table() takes the same quoted "schema"."table" name the SQL editor uses.
+df = read_table('"dbo"."students_info"')
+null_count = df.filter(df.student_id.isNull()).count()
+
+result = {
+    "passed": null_count == 0,
+    "violations": null_count,
+    "total_rows": df.count(),
+    "details": f"{null_count} null student_id rows found",
+}`;
+
+// dual_script PySpark follows the same "value" contract as dual_script SQL -
+// set result["value"] (or exactly one key) instead of "passed", since the
+// verdict comes from comparing the two sides' values, not from either
+// script asserting anything on its own. Each side runs as its own
+// notebook job against its own Fabric connector.
+const DUAL_SCRIPT_PYSPARK_PLACEHOLDER_SOURCE = `# Runs as a Fabric notebook job on the SOURCE connector.
+df = read_table('"dbo"."alumni"')
+result = {"value": df.filter(df.employment_status == "Employed").count()}`;
+
+const DUAL_SCRIPT_PYSPARK_PLACEHOLDER_DESTINATION = `# Runs as a Fabric notebook job on the DESTINATION connector.
+# Write it in the destination's own column names - they don't have to match.
+df = read_table('"dbo"."alumni"')
+result = {"value": df.filter(df.employment_status == "Employed").count()}`;
 
 const EMPTY_FORM = {
   name: '', validationType: VALIDATION_TYPES[0], checkType: 'sql', checkScope: 'single_side',
@@ -620,6 +650,47 @@ const [tab, setTab] = useState('manual'); // 'ai' | 'manual'
   const orderedTestCases = [...testCases].sort(
     (a, b) => String(b.created_at || '').localeCompare(String(a.created_at || '')),
   );
+
+  // Which real tables a test case is checking, by check type - used below to
+  // spot a test case whose table(s) are gone (removed from this test layer,
+  // or deleted upstream in Fabric) while the test case itself still exists.
+  // dual_script has no stored table reference at all (its "Target tables"
+  // checklist is frontend-only, never persisted - see setScript/
+  // toggleDualScriptTable's comments), so there's nothing reliable to check
+  // it against; it's never flagged.
+  const referencedTables = (tc) => {
+    if (tc.check_type === 'row_count_match') {
+      return [...(tc.row_count_source_tables || []), ...(tc.row_count_destination_tables || [])];
+    }
+    if (tc.check_type === 'column_parity') {
+      return [...(tc.source_tables || []), ...(tc.destination_tables || [])];
+    }
+    if (tc.check_scope === 'cross_table_parity') {
+      return [...(tc.source_target_tables || []), ...(tc.destination_target_tables || [])];
+    }
+    if (tc.check_scope === 'dual_script') {
+      return null;
+    }
+    return tc.target_tables && tc.target_tables.length ? tc.target_tables : (tc.target_table ? [tc.target_table] : []);
+  };
+
+  // "Still valid" means both selected for this test layer AND still really
+  // there in Fabric right now - a table can drop out of either independently
+  // (someone unchecks it in the mapping, or it gets dropped/renamed upstream
+  // without anyone touching this app at all).
+  const liveSourceTableNames = new Set(sourceSchema.map((t) => t.table));
+  const liveDestinationTableNames = new Set(destinationSchema.map((t) => t.table));
+  const validTestLayerTables = new Set([
+    ...(mapping?.source_tables || []).filter((t) => liveSourceTableNames.has(t)),
+    ...(mapping?.destination_tables || []).filter((t) => liveDestinationTableNames.has(t)),
+  ]);
+
+  const isOrphanedTestCase = (tc) => {
+    const tables = referencedTables(tc);
+    if (tables === null) return false;
+    if (tables.length === 0) return true;  // literally "has no tables"
+    return !tables.some((t) => validTestLayerTables.has(t));
+  };
   const isDualScript = form.checkType === 'sql' && form.checkScope === 'dual_script';
   // Both scopes live under the one "Custom SQL script" check type - the
   // "Runs against" row picks between them.
@@ -1069,7 +1140,7 @@ const [tab, setTab] = useState('manual'); // 'ai' | 'manual'
               tab === 'manual' ? 'bg-mastek-primary text-white shadow' : 'text-slate-500 hover:text-slate-700'
             }`}
           >
-            <Code2 className="w-3.5 h-3.5" /> Manual Notebook IDE
+            <Code2 className="w-3.5 h-3.5" /> Manual Script Editor
           </button>
           <button
             onClick={() => setTab('ai')}
@@ -1077,7 +1148,7 @@ const [tab, setTab] = useState('manual'); // 'ai' | 'manual'
               tab === 'ai' ? 'bg-mastek-primary text-white shadow' : 'text-slate-500 hover:text-slate-700'
             }`}
           >
-            <Sparkles className="w-3.5 h-3.5" /> AI Prompt Generator
+            <Sparkles className="w-3.5 h-3.5" /> AI Assistant
           </button>
         </div>
       </div>
@@ -1107,7 +1178,7 @@ const [tab, setTab] = useState('manual'); // 'ai' | 'manual'
                 aiMode === 'cross_parity' ? 'bg-white text-mastek-primary shadow' : 'text-slate-500 hover:text-slate-700'
               }`}
             >
-              <GitCompareArrows className="w-3.5 h-3.5" /> Compare rows
+              <GitCompareArrows className="w-3.5 h-3.5" /> Missing Rows Check
             </button>
           </div>
           <div className="text-xs text-slate-500 -mt-2">
@@ -1227,7 +1298,7 @@ const [tab, setTab] = useState('manual'); // 'ai' | 'manual'
               )}
 
               <p className="text-xs text-slate-400">
-                "Generate Test Case" turns your description into SQL for review in the Manual Notebook IDE tab.
+                "Generate Test Case" turns your description into SQL for review in the Manual Script Editor tab.
                 "AI Suggest Rules" instead samples random rows straight from the table and saves several rules
                 automatically - no description, no manual save step. Both are checked against the same safety
                 guard every other test case's SQL passes through.
@@ -1360,7 +1431,7 @@ const [tab, setTab] = useState('manual'); // 'ai' | 'manual'
               </button>
 
               <p className="text-xs text-slate-400">
-                Hands off to the Manual Notebook IDE tab with the tables and suggested key column
+                Hands off to the Manual Script Editor tab with the tables and suggested key column
                 pre-filled - review and save there, same as the Single Table generator.
               </p>
 
@@ -1681,7 +1752,7 @@ const [tab, setTab] = useState('manual'); // 'ai' | 'manual'
                 </label>
                 <label className="flex items-center gap-2 cursor-pointer">
                   <input type="radio" checked={isDualScript}
-                    onChange={() => setForm((f) => ({ ...f, checkScope: 'dual_script', scriptType: 'sql' }))}
+                    onChange={() => setForm((f) => ({ ...f, checkScope: 'dual_script' }))}
                     className="text-mastek-primary focus:ring-mastek-accent" />
                   Both sides <span className="text-xs text-slate-400">(compare two scripts)</span>
                 </label>
@@ -1699,6 +1770,27 @@ const [tab, setTab] = useState('manual'); // 'ai' | 'manual'
                     scripts rather than one &mdash; a single SQL statement can&rsquo;t reach both.</>
                   )}
                 </p>
+
+                <div className="flex flex-wrap items-center gap-x-4 gap-y-2 text-sm">
+                  <label className="flex items-center gap-2 cursor-pointer">
+                    <input type="radio" checked={form.scriptType === 'sql'} onChange={() => setForm((f) => ({ ...f, scriptType: 'sql' }))}
+                      className="text-mastek-primary focus:ring-mastek-accent" />
+                    SQL <span className="text-slate-400">(runs now)</span>
+                  </label>
+                  <label className="flex items-center gap-2 cursor-pointer" title="Runs as TWO separate Fabric notebook jobs, one per side - can take a few minutes">
+                    <input type="radio" checked={form.scriptType === 'pyspark'} onChange={() => setForm((f) => ({ ...f, scriptType: 'pyspark' }))}
+                      className="text-mastek-primary focus:ring-mastek-accent" />
+                    PySpark <span className="text-slate-400">(two notebook jobs - can take a few minutes)</span>
+                  </label>
+                </div>
+                {form.scriptType === 'pyspark' && (
+                  <p className="text-xs text-slate-400">
+                    Each side runs as its own Fabric notebook job - both need to be Fabric connectors. End each
+                    script by setting <code className="font-mono">result = {'{'}&quot;value&quot;: ...{'}'}</code> (or
+                    exactly one key) instead of &quot;passed&quot;, same as the SQL version above.
+                  </p>
+                )}
+
                 <div className="grid grid-cols-1 lg:grid-cols-2 gap-3">
                   <div>
                     <div className="flex items-center gap-2 mb-1">
@@ -1727,19 +1819,32 @@ const [tab, setTab] = useState('manual'); // 'ai' | 'manual'
                       onToggle={(t) => toggleDualScriptTable('source', t)}
                       rowCounts={sourceRowCounts}
                     />
-                    <SqlSuggest
-                      value={form.scriptText}
-                      onChange={(v) => setScript('source', v)}
-                      rows={9}
-                      placeholder={DUAL_SCRIPT_PLACEHOLDER_SOURCE}
-                      className="w-full mt-2 px-3 py-2 text-xs font-mono bg-slate-950 text-slate-100 border border-slate-800 rounded-lg placeholder-slate-600 focus:outline-none focus:ring-2 focus:ring-mastek-accent"
-                      {...suggestFor('source')}
-                    />
-                    <SqlEditorFooter
-                      hints={[...sourceHints, ...missingTableHints(form.scriptText, form.dualScriptSourceTables)]}
-                      onCheck={() => runSyntaxCheck('source')}
-                      checkState={sqlCheck.source}
-                    />
+                    {form.scriptType === 'pyspark' ? (
+                      <textarea
+                        value={form.scriptText}
+                        onChange={(e) => setScript('source', e.target.value)}
+                        rows={9}
+                        placeholder={DUAL_SCRIPT_PYSPARK_PLACEHOLDER_SOURCE}
+                        spellCheck={false}
+                        className="w-full mt-2 px-3 py-2 text-xs font-mono bg-slate-950 text-slate-100 border border-slate-800 rounded-lg placeholder-slate-600 focus:outline-none focus:ring-2 focus:ring-mastek-accent"
+                      />
+                    ) : (
+                      <>
+                        <SqlSuggest
+                          value={form.scriptText}
+                          onChange={(v) => setScript('source', v)}
+                          rows={9}
+                          placeholder={DUAL_SCRIPT_PLACEHOLDER_SOURCE}
+                          className="w-full mt-2 px-3 py-2 text-xs font-mono bg-slate-950 text-slate-100 border border-slate-800 rounded-lg placeholder-slate-600 focus:outline-none focus:ring-2 focus:ring-mastek-accent"
+                          {...suggestFor('source')}
+                        />
+                        <SqlEditorFooter
+                          hints={[...sourceHints, ...missingTableHints(form.scriptText, form.dualScriptSourceTables)]}
+                          onCheck={() => runSyntaxCheck('source')}
+                          checkState={sqlCheck.source}
+                        />
+                      </>
+                    )}
                   </div>
                   <div>
                     <div className="flex items-center gap-2 mb-1">
@@ -1763,19 +1868,32 @@ const [tab, setTab] = useState('manual'); // 'ai' | 'manual'
                       onToggle={(t) => toggleDualScriptTable('destination', t)}
                       rowCounts={destinationRowCounts}
                     />
-                    <SqlSuggest
-                      value={form.destinationScriptText}
-                      onChange={(v) => setScript('destination', v)}
-                      rows={9}
-                      placeholder={DUAL_SCRIPT_PLACEHOLDER_DESTINATION}
-                      className="w-full mt-2 px-3 py-2 text-xs font-mono bg-slate-950 text-slate-100 border border-slate-800 rounded-lg placeholder-slate-600 focus:outline-none focus:ring-2 focus:ring-mastek-accent"
-                      {...suggestFor('destination')}
-                    />
-                    <SqlEditorFooter
-                      hints={[...destinationHints, ...missingTableHints(form.destinationScriptText, form.dualScriptDestinationTables)]}
-                      onCheck={() => runSyntaxCheck('destination')}
-                      checkState={sqlCheck.destination}
-                    />
+                    {form.scriptType === 'pyspark' ? (
+                      <textarea
+                        value={form.destinationScriptText}
+                        onChange={(e) => setScript('destination', e.target.value)}
+                        rows={9}
+                        placeholder={DUAL_SCRIPT_PYSPARK_PLACEHOLDER_DESTINATION}
+                        spellCheck={false}
+                        className="w-full mt-2 px-3 py-2 text-xs font-mono bg-slate-950 text-slate-100 border border-slate-800 rounded-lg placeholder-slate-600 focus:outline-none focus:ring-2 focus:ring-mastek-accent"
+                      />
+                    ) : (
+                      <>
+                        <SqlSuggest
+                          value={form.destinationScriptText}
+                          onChange={(v) => setScript('destination', v)}
+                          rows={9}
+                          placeholder={DUAL_SCRIPT_PLACEHOLDER_DESTINATION}
+                          className="w-full mt-2 px-3 py-2 text-xs font-mono bg-slate-950 text-slate-100 border border-slate-800 rounded-lg placeholder-slate-600 focus:outline-none focus:ring-2 focus:ring-mastek-accent"
+                          {...suggestFor('destination')}
+                        />
+                        <SqlEditorFooter
+                          hints={[...destinationHints, ...missingTableHints(form.destinationScriptText, form.dualScriptDestinationTables)]}
+                          onCheck={() => runSyntaxCheck('destination')}
+                          checkState={sqlCheck.destination}
+                        />
+                      </>
+                    )}
                   </div>
                 </div>
               </div>
@@ -1808,26 +1926,47 @@ const [tab, setTab] = useState('manual'); // 'ai' | 'manual'
                       className="text-mastek-primary focus:ring-mastek-accent" />
                     SQL <span className="text-slate-400">(runs now)</span>
                   </label>
-                  {/* Greyed out - PySpark execution isn't wired up yet, planned for later. */}
-                  <label className="flex items-center gap-2 cursor-not-allowed opacity-50" title="Coming soon - PySpark execution isn't wired up yet">
-                    <input type="radio" disabled checked={form.scriptType === 'pyspark'}
+                  <label className="flex items-center gap-2 cursor-pointer" title="Runs as a Fabric notebook job (Spark) - only available against a Fabric connector, and can take a few minutes per run">
+                    <input type="radio" checked={form.scriptType === 'pyspark'} onChange={() => setForm((f) => ({ ...f, scriptType: 'pyspark' }))}
                       className="text-mastek-primary focus:ring-mastek-accent" />
-                    PySpark <span className="text-slate-400">(Coming soon)</span>
+                    PySpark <span className="text-slate-400">(runs as a Fabric notebook job - can take a few minutes)</span>
                   </label>
                 </div>
 
-                <SqlSuggest
-                  value={form.scriptText}
-                  onChange={(v) => setScript('single', v)}
-                  placeholder={SQL_PLACEHOLDER}
-                  className="w-full h-40 bg-slate-950 text-slate-100 border border-slate-800 rounded-lg p-4 text-sm font-mono placeholder-slate-600 focus:outline-none focus:ring-2 focus:ring-mastek-accent"
-                  {...suggestFor(form.target)}
-                />
-                <SqlEditorFooter
-                  hints={sourceHints}
-                  onCheck={() => runSyntaxCheck('single')}
-                  checkState={sqlCheck.single}
-                />
+                {form.scriptType === 'pyspark' ? (
+                  <>
+                    <textarea
+                      value={form.scriptText}
+                      onChange={(e) => setScript('single', e.target.value)}
+                      placeholder={PYSPARK_PLACEHOLDER}
+                      spellCheck={false}
+                      className="w-full h-56 bg-slate-950 text-slate-100 border border-slate-800 rounded-lg p-4 text-sm font-mono placeholder-slate-600 focus:outline-none focus:ring-2 focus:ring-mastek-accent"
+                    />
+                    <p className="text-xs text-slate-400">
+                      <code className="font-mono">spark</code> and <code className="font-mono">read_table(&apos;&quot;schema&quot;.&quot;table&quot;&apos;)</code> are
+                      already in scope - end by setting a <code className="font-mono">result</code> dict
+                      (<code className="font-mono">passed</code>/<code className="font-mono">violations</code>/<code className="font-mono">total_rows</code>/<code className="font-mono">details</code>,
+                      same contract a SQL script&rsquo;s returned row already follows). Runs against{' '}
+                      <span className="font-mono text-slate-300">{form.target}</span>, on a real Fabric Spark job -
+                      not the instant SQL-endpoint path, so expect it to take a couple of minutes.
+                    </p>
+                  </>
+                ) : (
+                  <>
+                    <SqlSuggest
+                      value={form.scriptText}
+                      onChange={(v) => setScript('single', v)}
+                      placeholder={SQL_PLACEHOLDER}
+                      className="w-full h-40 bg-slate-950 text-slate-100 border border-slate-800 rounded-lg p-4 text-sm font-mono placeholder-slate-600 focus:outline-none focus:ring-2 focus:ring-mastek-accent"
+                      {...suggestFor(form.target)}
+                    />
+                    <SqlEditorFooter
+                      hints={sourceHints}
+                      onCheck={() => runSyntaxCheck('single')}
+                      checkState={sqlCheck.single}
+                    />
+                  </>
+                )}
               </>
               )}
             </>
@@ -1906,7 +2045,7 @@ const [tab, setTab] = useState('manual'); // 'ai' | 'manual'
           )}
           {!isLoading && testCases.length === 0 && (
             <p className="p-5 text-sm text-slate-400 italic">
-              No test cases yet - add one using the Manual Notebook IDE above, or click "AI Suggest Rules" on the AI tab.
+              No test cases yet - add one using the Manual Script Editor above, or click "AI Suggest Rules" on the AI tab.
             </p>
           )}
           {!isLoading && testCases.length > 0 && (
@@ -1936,8 +2075,10 @@ const [tab, setTab] = useState('manual'); // 'ai' | 'manual'
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-100">
-                {orderedTestCases.map((tc) => (
-                  <tr key={tc.id} className={tc.active === false ? 'opacity-50' : ''}>
+                {orderedTestCases.map((tc) => {
+                  const orphaned = isOrphanedTestCase(tc);
+                  return (
+                  <tr key={tc.id} className={tc.active === false || orphaned ? 'opacity-50' : ''}>
                     {isSelectingSuite && (
                       <td className="px-3 py-3 w-8">
                         <input
@@ -1945,6 +2086,7 @@ const [tab, setTab] = useState('manual'); // 'ai' | 'manual'
                           aria-label={`Select ${tc.name}`}
                           checked={selectedTestCaseIds.has(tc.id)}
                           onChange={() => toggleSuiteSelect(tc.id)}
+                          disabled={orphaned}
                           className="accent-mastek-primary"
                         />
                       </td>
@@ -1956,7 +2098,15 @@ const [tab, setTab] = useState('manual'); // 'ai' | 'manual'
                       )}
                     </td>
                     <td className="px-3 py-3 font-mono text-xs text-slate-500 whitespace-nowrap">
-                      {tc.check_type === 'row_count_match'
+                      {orphaned ? (
+                        <span
+                          className="flex items-center gap-1.5 text-amber-600 font-sans not-italic"
+                          title="This test case's table(s) are no longer selected in this test layer, or no longer exist in Fabric. It's kept as a record, but can't be run - delete it, or re-add the table to the test layer if it should still be checked."
+                        >
+                          <AlertTriangle className="w-3.5 h-3.5 shrink-0" />
+                          No tables - removed or deleted
+                        </span>
+                      ) : tc.check_type === 'row_count_match'
                         ? `${tc.row_count_source_tables.length} src / ${tc.row_count_destination_tables.length} dest`
                         : tc.check_type === 'column_parity'
                         ? `${(tc.source_tables || []).join(', ')}.${tc.source_column} ↔ ${(tc.destination_tables || []).join(', ')}.${tc.destination_column}`
@@ -1981,10 +2131,13 @@ const [tab, setTab] = useState('manual'); // 'ai' | 'manual'
                     <td className="px-3 py-3">
                       <button
                         onClick={() => handleToggleActive(tc)}
-                        disabled={togglingId === tc.id}
+                        disabled={togglingId === tc.id || orphaned}
                         role="switch"
                         aria-checked={tc.active !== false}
-                        title={tc.active !== false ? 'Active - click to disable' : 'Disabled - click to enable'}
+                        title={
+                          orphaned ? "Can't be run either way - its table(s) are gone, see the warning in the Table column"
+                            : tc.active !== false ? 'Active - click to disable' : 'Disabled - click to enable'
+                        }
                         className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors disabled:opacity-50 ${
                           tc.active !== false ? 'bg-mastek-primary' : 'bg-slate-300'
                         }`}
@@ -1996,32 +2149,37 @@ const [tab, setTab] = useState('manual'); // 'ai' | 'manual'
                     </td>
                     <td className="px-3 py-3">
                       <div className="flex items-center justify-end gap-1">
-                        <button
-                          onClick={() => handleRunOne(tc.id)}
-                          disabled={runningId === tc.id}
-                          className="p-1.5 text-slate-400 hover:text-mastek-success hover:bg-mastek-success/10 rounded-lg shrink-0"
-                          title="Run just this test case"
-                        >
-                          {runningId === tc.id ? <Loader2 className="w-4 h-4 animate-spin" /> : <Play className="w-4 h-4" />}
-                        </button>
-                        <button
-                          onClick={() => startEdit(tc)}
-                          className="p-1.5 text-slate-400 hover:text-mastek-primary hover:bg-mastek-primary/10 rounded-lg shrink-0"
-                          title="Edit"
-                        >
-                          <Pencil className="w-4 h-4" />
-                        </button>
+                        {!orphaned && (
+                          <>
+                            <button
+                              onClick={() => handleRunOne(tc.id)}
+                              disabled={runningId === tc.id}
+                              className="p-1.5 text-slate-400 hover:text-mastek-success hover:bg-mastek-success/10 rounded-lg shrink-0"
+                              title="Run just this test case"
+                            >
+                              {runningId === tc.id ? <Loader2 className="w-4 h-4 animate-spin" /> : <Play className="w-4 h-4" />}
+                            </button>
+                            <button
+                              onClick={() => startEdit(tc)}
+                              className="p-1.5 text-slate-400 hover:text-mastek-primary hover:bg-mastek-primary/10 rounded-lg shrink-0"
+                              title="Edit"
+                            >
+                              <Pencil className="w-4 h-4" />
+                            </button>
+                          </>
+                        )}
                         <button
                           onClick={() => handleDelete(tc.id)}
                           className="p-1.5 text-slate-400 hover:text-red-600 hover:bg-red-50 rounded-lg shrink-0"
-                          title="Delete"
+                          title={orphaned ? "Delete - this test case's table(s) no longer exist in this test layer" : 'Delete'}
                         >
                           <Trash2 className="w-4 h-4" />
                         </button>
                       </div>
                     </td>
                   </tr>
-                ))}
+                  );
+                })}
               </tbody>
             </table>
           )}

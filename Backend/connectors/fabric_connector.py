@@ -1,3 +1,10 @@
+import base64
+import csv
+import io
+import re
+import time
+import uuid
+
 import requests
 import duckdb
 import urllib3
@@ -7,10 +14,26 @@ from azure.identity import ClientSecretCredential
 
 from .base import BaseConnector, AssetItem, ColumnInfo, build_row_count_query
 from .sql_guard import clean_explain_error, validate_select_only
+from .fabric_notebook_template import NOTEBOOK_SOURCE
+from .fabric_pyspark_test_notebook_template import NOTEBOOK_SOURCE as PYSPARK_TEST_NOTEBOOK_SOURCE
 
 FABRIC_API_BASE = "https://api.fabric.microsoft.com/v1"
 FABRIC_TOKEN_SCOPE = "https://api.fabric.microsoft.com/.default"
 SQL_TOKEN_SCOPE = "https://database.windows.net/.default"
+# OneLake's DFS surface is ADLS Gen2-compatible and documented as accepting a
+# storage-scoped AAD token. NOT yet verified against a live tenant - if the
+# service principal's token for this scope is rejected, this is the one line
+# to change (e.g. to "https://onelake.dfs.fabric.microsoft.com/.default").
+ONELAKE_TOKEN_SCOPE = "https://storage.azure.com/.default"
+ONELAKE_DFS_BASE = "https://onelake.dfs.fabric.microsoft.com"
+
+# Fixed names so ensure_test_data_notebook()/ensure_test_case_notebook() can
+# find and reuse the same notebook item across calls/restarts instead of
+# creating a new one every time.
+TEST_DATA_NOTEBOOK_NAME = "DQC Test Data Inserter"
+TEST_CASE_NOTEBOOK_NAME = "DQC PySpark Test Case Runner"
+# Fabric job type for a notebook run, analogous to jobType=Pipeline above.
+NOTEBOOK_JOB_TYPE = "RunNotebook"
 
 # Fixed alias used for every ATTACH - each run_query()/get_schema() call
 # opens its own short-lived DuckDB connection (mirroring how the old
@@ -71,6 +94,20 @@ def _translate_failure_reason(message):
     return message
 
 
+def table_name_to_onelake_path(table_name):
+    """
+    '"dbo"."orders"' (this app's fully-qualified table naming, see
+    _build_table_entry) -> 'dbo/orders' (OneLake's Tables/<schema>/<table>
+    folder convention). Strips one layer of doubled-quote escaping per part,
+    matching how _build_table_entry originally quoted the identifiers.
+    """
+    parts = re.findall(r'"((?:[^"]|"")*)"', table_name)
+    if len(parts) != 2:
+        raise ValueError(f"Expected a quoted \"schema\".\"table\" name, got: {table_name!r}")
+    schema, table = (p.replace('""', '"') for p in parts)
+    return f"{schema}/{table}"
+
+
 def _pipeline_run_to_dict(payload):
     """
     One Fabric job instance, flattened to what the Pipelines tab needs.
@@ -125,6 +162,9 @@ class FabricConnector(BaseConnector):
         # back to showing every Lakehouse in the workspace in that case.
         self.allowed_containers = allowed_containers
         self._lakehouse_conn_cache = {}
+        # Resolved once per process, then reused - see ensure_test_data_notebook / ensure_test_case_notebook.
+        self._test_data_notebook_id = None
+        self._test_case_notebook_id = None
 
     # --- auth -----------------------------------------------------------
 
@@ -139,6 +179,10 @@ class FabricConnector(BaseConnector):
     def _get_sql_token(self):
         """Separate scope from the Fabric REST API token - this one authenticates to the SQL endpoint itself."""
         return self._get_credential().get_token(SQL_TOKEN_SCOPE).token
+
+    def _get_onelake_token(self):
+        """Third scope, for OneLake's ADLS Gen2-compatible DFS API - see ONELAKE_TOKEN_SCOPE's comment."""
+        return self._get_credential().get_token(ONELAKE_TOKEN_SCOPE).token
 
     def _api_get(self, path):
         token = self._get_fabric_token()
@@ -172,18 +216,22 @@ class FabricConnector(BaseConnector):
 
         return all_items
 
-    def _api_post(self, path):
+    def _api_post(self, path, json=None):
         """
         Same auth/timeout/proxy handling as _api_get, but returns the raw
         response rather than a parsed payload: the job-trigger endpoint answers
         202 Accepted with an EMPTY body and puts the new job-instance id in the
         Location header, so callers need the status and headers too.
+
+        json: optional request body (e.g. a notebook run's executionData
+        parameters, or an item-create payload) - None (the original
+        behavior, used by run_pipeline) sends no body at all.
         """
         token = self._get_fabric_token()
         headers = {"Authorization": f"Bearer {token}"}
         # verify=False for the same corporate-proxy SSL reason as _api_get.
         return requests.post(
-            f"{FABRIC_API_BASE}{path}", headers=headers, timeout=60, verify=False,
+            f"{FABRIC_API_BASE}{path}", headers=headers, json=json, timeout=60, verify=False,
         )
 
     
@@ -200,9 +248,41 @@ class FabricConnector(BaseConnector):
         if not server or not database:
             raise RuntimeError("Lakehouse SQL analytics endpoint isn't provisioned yet")
 
-        conn_info = {"server": server, "database": database}
+        # sqlEndpointProperties carries the SQL endpoint's OWN item id
+        # (distinct from the Lakehouse's id) - needed to target the
+        # refresh-metadata call below. May be absent on older API responses;
+        # refresh_sql_endpoint_metadata() just no-ops if so.
+        conn_info = {"server": server, "database": database, "sql_endpoint_id": sql_endpoint.get("id")}
         self._lakehouse_conn_cache[lakehouse_id] = conn_info
         return conn_info
+
+    def refresh_sql_endpoint_metadata(self, lakehouse_id):
+        """
+        Forces Fabric to sync the Lakehouse's SQL analytics endpoint against
+        its real Delta tables right now, instead of waiting for Fabric's own
+        (sometimes multi-minute) background sync. That endpoint is what
+        run_query/list_tables_in_container/row counts all read through - it
+        is NOT a live view of the Lakehouse, it's a separately-synced replica,
+        which is why a table can look unchanged for a while right after a
+        real write (e.g. this app's own PySpark insert) until Fabric catches
+        up on its own.
+
+        Best-effort and NOT yet verified against a live tenant (this exact
+        endpoint path/shape is my best documented answer, not confirmed
+        live) - swallows any failure rather than blocking whatever called
+        it, since the caller's own query will still work, just possibly
+        against slightly stale metadata.
+        """
+        try:
+            conn_info = self._resolve_lakehouse_connection(lakehouse_id)
+            sql_endpoint_id = conn_info.get("sql_endpoint_id")
+            if not sql_endpoint_id:
+                return False
+            resp = self._api_post(f"/workspaces/{self.workspace_id}/sqlEndpoints/{sql_endpoint_id}/refreshMetadata")
+            return resp.status_code in (200, 202)
+        except Exception as e:
+            print(f"Could not refresh SQL endpoint metadata for lakehouse {lakehouse_id}: {e}")
+            return False
 
     def _duckdb_attach(self, lakehouse_id):
         """
@@ -410,6 +490,259 @@ class FabricConnector(BaseConnector):
             return [dict(zip(columns, row)) for row in result]
         finally:
             con.close()
+
+    # --- Real writes: staged file + Spark notebook job --------------------
+    #
+    # Fabric's SQL analytics endpoint - what run_query/run_query_all/
+    # sample_rows all use - is READ-ONLY for every Lakehouse table by
+    # Microsoft's own design (error 24559 on any INSERT/UPDATE/DELETE,
+    # regardless of permissions). That is not a bug this connector can code
+    # around: a prior version of this method tried a plain SQL-endpoint
+    # INSERT and it failed against every real Lakehouse table it was tried
+    # against. The only ways Fabric allows writing into a Lakehouse Delta
+    # table are a Spark notebook, a Data Pipeline/Dataflow, or a direct
+    # OneLake file write - this uses the first: stage the rows as a CSV in
+    # the target Lakehouse's OneLake Files area, then run a small fixed
+    # notebook that reads that file and appends it to the target table via
+    # Spark. Never reachable from generic test-case SQL; only an explicit,
+    # tester-confirmed "Insert into Fabric table" action (app.py's
+    # insert-rows route) calls this, gated by a confirm flag on top of the
+    # frontend's own confirmation dialog.
+
+    def _onelake_dfs_url(self, lakehouse_id, rel_path):
+        return f"{ONELAKE_DFS_BASE}/{self.workspace_id}/{lakehouse_id}/{rel_path}"
+
+    def write_staging_file(self, lakehouse_id, columns, rows):
+        """
+        Writes `rows` as a CSV into this Lakehouse's OneLake Files area
+        under _test_data_staging/<uuid>.csv, via the ADLS Gen2 DFS
+        protocol's three calls (create, append, flush) - the same protocol
+        every OneLake-compatible client uses. Returns the relative path
+        (e.g. "_test_data_staging/<uuid>.csv") for the notebook job to read
+        and for cleanup_staging_file to delete afterward.
+        """
+        buf = io.StringIO()
+        writer = csv.DictWriter(buf, fieldnames=[c["name"] for c in columns])
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({c["name"]: row.get(c["name"], "") for c in columns})
+        body = buf.getvalue().encode("utf-8")
+
+        rel_path = f"_test_data_staging/{uuid.uuid4()}.csv"
+        token = self._get_onelake_token()
+        headers = {"Authorization": f"Bearer {token}"}
+        base = self._onelake_dfs_url(lakehouse_id, f"Files/{rel_path}")
+
+        # OneLake's DFS API is a new endpoint for this app - every other
+        # Fabric call here (REST API, SQL endpoint) already goes through
+        # whatever corporate proxy this network sits behind, but this is
+        # the first time THIS specific path has been exercised, and its
+        # first live attempt read-timed-out at 30s with no other error -
+        # the connection reached OneLake fine, it just didn't answer in
+        # time. Generous timeouts here rather than a short one that assumes
+        # OneLake responds as fast as the already-proven endpoints do.
+        create_resp = requests.put(base, headers=headers, params={"resource": "file"}, timeout=90, verify=False)
+        create_resp.raise_for_status()
+        append_resp = requests.patch(
+            base, headers={**headers, "Content-Type": "application/octet-stream"},
+            params={"action": "append", "position": 0}, data=body, timeout=180, verify=False,
+        )
+        append_resp.raise_for_status()
+        flush_resp = requests.patch(
+            base, headers=headers, params={"action": "flush", "position": len(body)}, timeout=90, verify=False,
+        )
+        flush_resp.raise_for_status()
+        return rel_path
+
+    def cleanup_staging_file(self, lakehouse_id, staging_path):
+        """Best-effort delete once a notebook job reaches a terminal state - never raises."""
+        try:
+            token = self._get_onelake_token()
+            requests.delete(
+                self._onelake_dfs_url(lakehouse_id, f"Files/{staging_path}"),
+                headers={"Authorization": f"Bearer {token}"}, timeout=90, verify=False,
+            )
+        except Exception as e:
+            print(f"Could not clean up staging file {staging_path}: {e}")
+
+    def read_onelake_file(self, lakehouse_id, rel_path):
+        """Reads a small file back from this Lakehouse's OneLake Files area - used to read a notebook job's result file."""
+        token = self._get_onelake_token()
+        resp = requests.get(
+            self._onelake_dfs_url(lakehouse_id, f"Files/{rel_path}"),
+            headers={"Authorization": f"Bearer {token}"}, timeout=90, verify=False,
+        )
+        resp.raise_for_status()
+        return resp.content
+
+    def _notebook_definition_payload(self, source):
+        return {
+            "definition": {
+                "parts": [{
+                    "path": "notebook-content.py",
+                    "payload": base64.b64encode(source.encode("utf-8")).decode("ascii"),
+                    "payloadType": "InlineBase64",
+                }],
+            },
+        }
+
+    def _ensure_notebook(self, name, source, cache_attr):
+        """
+        Shared by ensure_test_data_notebook and ensure_test_case_notebook:
+        finds a fixed-named notebook item, creating it if this workspace
+        doesn't have one yet.
+
+        Also pushes the CURRENT template content to an already-existing
+        notebook every time (via updateDefinition), rather than trusting
+        whatever was there from the first time it was created - these
+        templates are still being fixed (see tasks/lessons.md), and without
+        this an already-provisioned workspace would keep silently running a
+        stale, possibly-broken version of the notebook after every code fix
+        here, with no way to notice short of manually deleting it in the
+        Fabric portal. The item id itself is still cached in memory per
+        connector instance/process - only the definition sync runs fresh
+        each time, which is cheap next to the job it's about to run.
+        """
+        cached = getattr(self, cache_attr)
+        if cached:
+            self._sync_notebook_definition(cached, name, source)
+            return cached
+
+        for item in self.list_items():
+            if item.type == "Notebook" and item.name == name:
+                setattr(self, cache_attr, item.id)
+                self._sync_notebook_definition(item.id, name, source)
+                return item.id
+
+        resp = self._api_post(
+            f"/workspaces/{self.workspace_id}/items",
+            json={"displayName": name, "type": "Notebook", **self._notebook_definition_payload(source)},
+        )
+        if resp.status_code not in (200, 201, 202):
+            detail = (resp.text or "").strip()
+            raise RuntimeError(f"Could not create the \"{name}\" notebook (HTTP {resp.status_code}): {detail[:400]}")
+
+        body = (resp.json() if resp.content else None) or {}
+        notebook_id = body.get("id")
+        if not notebook_id:
+            # A 202 with no id in the body means item creation is itself an
+            # async Fabric operation - the item can take a few seconds to
+            # actually show up in list_items() after the POST returns, so a
+            # single immediate re-list can race that propagation delay and
+            # find nothing (this failed live on a real workspace with
+            # exactly one attempt - see tasks/lessons.md). Retrying a few
+            # times with a short wait is far more robust than assuming the
+            # first check is authoritative.
+            for attempt in range(5):
+                if attempt > 0:
+                    time.sleep(3)
+                for item in self.list_items():
+                    if item.type == "Notebook" and item.name == name:
+                        notebook_id = item.id
+                        break
+                if notebook_id:
+                    break
+        if not notebook_id:
+            raise RuntimeError(f"\"{name}\" notebook was created but its item id could not be resolved")
+
+        setattr(self, cache_attr, notebook_id)
+        return notebook_id
+
+    def _sync_notebook_definition(self, notebook_id, name, source):
+        """Best-effort push of the current template onto an existing notebook item - never blocks a run over it."""
+        try:
+            resp = self._api_post(
+                f"/workspaces/{self.workspace_id}/items/{notebook_id}/updateDefinition",
+                json=self._notebook_definition_payload(source),
+            )
+            if resp.status_code not in (200, 202):
+                print(f"Could not sync \"{name}\" notebook's definition (HTTP {resp.status_code}): {(resp.text or '').strip()[:400]}")
+        except Exception as e:
+            print(f"Could not sync \"{name}\" notebook's definition: {e}")
+
+    def ensure_test_data_notebook(self):
+        return self._ensure_notebook(TEST_DATA_NOTEBOOK_NAME, NOTEBOOK_SOURCE, "_test_data_notebook_id")
+
+    def ensure_test_case_notebook(self):
+        return self._ensure_notebook(TEST_CASE_NOTEBOOK_NAME, PYSPARK_TEST_NOTEBOOK_SOURCE, "_test_case_notebook_id")
+
+    def run_notebook_insert(self, lakehouse_id, table_name, staging_path):
+        """
+        Submits the notebook job that appends `staging_path`'s rows into
+        `table_name`. Returns the new job-instance id, same shape as
+        run_pipeline (202 + Location header, list-runs fallback).
+        """
+        notebook_id = self.ensure_test_data_notebook()
+        table_path = table_name_to_onelake_path(table_name)
+        params = {
+            "workspace_id": {"value": self.workspace_id, "type": "string"},
+            "lakehouse_id": {"value": lakehouse_id, "type": "string"},
+            "table_path": {"value": table_path, "type": "string"},
+            "staging_path": {"value": staging_path, "type": "string"},
+        }
+        resp = self._api_post(
+            f"/workspaces/{self.workspace_id}/items/{notebook_id}/jobs/instances?jobType={NOTEBOOK_JOB_TYPE}",
+            json={"executionData": {"parameters": params}},
+        )
+        if resp.status_code not in (200, 202):
+            detail = (resp.text or "").strip()
+            raise RuntimeError(f"HTTP {resp.status_code}: {detail[:400]}")
+
+        location = resp.headers.get("Location") or ""
+        job_instance_id = location.rstrip("/").rsplit("/", 1)[-1] if location else None
+        if not job_instance_id:
+            runs = self.get_notebook_job_history(notebook_id)
+            job_instance_id = runs[0]["id"] if runs else None
+        return notebook_id, job_instance_id
+
+    def run_pyspark_test_case(self, lakehouse_id, script_text):
+        """
+        Submits a tester-authored PySpark script as an S2D test case run,
+        via the fixed test-case notebook (see fabric_pyspark_test_notebook_
+        template.py for the contract the script is expected to follow - a
+        'result' dict, read_table() helper already in scope).
+
+        script_text travels as a base64 job parameter (not staged as a
+        file - it's normally small, unlike a bulk row insert) so no
+        quoting/escaping concerns reach Fabric's parameter JSON. Returns
+        (notebook_id, job_instance_id, result_path) - result_path is where
+        the notebook will write its JSON result once done; the caller polls
+        get_notebook_job then reads it back with read_onelake_file.
+        """
+        notebook_id = self.ensure_test_case_notebook()
+        result_path = f"_test_case_results/{uuid.uuid4()}.json"
+        params = {
+            "workspace_id": {"value": self.workspace_id, "type": "string"},
+            "lakehouse_id": {"value": lakehouse_id, "type": "string"},
+            "script_b64": {"value": base64.b64encode(script_text.encode("utf-8")).decode("ascii"), "type": "string"},
+            "result_path": {"value": result_path, "type": "string"},
+        }
+        resp = self._api_post(
+            f"/workspaces/{self.workspace_id}/items/{notebook_id}/jobs/instances?jobType={NOTEBOOK_JOB_TYPE}",
+            json={"executionData": {"parameters": params}},
+        )
+        if resp.status_code not in (200, 202):
+            detail = (resp.text or "").strip()
+            raise RuntimeError(f"HTTP {resp.status_code}: {detail[:400]}")
+
+        location = resp.headers.get("Location") or ""
+        job_instance_id = location.rstrip("/").rsplit("/", 1)[-1] if location else None
+        if not job_instance_id:
+            runs = self.get_notebook_job_history(notebook_id)
+            job_instance_id = runs[0]["id"] if runs else None
+        return notebook_id, job_instance_id, result_path
+
+    def get_notebook_job(self, notebook_id, job_instance_id):
+        """One notebook job instance's current state - same shape as get_pipeline_run."""
+        payload = self._api_get(
+            f"/workspaces/{self.workspace_id}/items/{notebook_id}/jobs/instances/{job_instance_id}"
+        )
+        return _pipeline_run_to_dict(payload)
+
+    def get_notebook_job_history(self, notebook_id):
+        payload = self._api_get(f"/workspaces/{self.workspace_id}/items/{notebook_id}/jobs/instances")
+        runs = [_pipeline_run_to_dict(r) for r in (payload or [])]
+        return sorted(runs, key=lambda r: r.get("started_at") or "", reverse=True)
 
     # --- Data pipelines ---------------------------------------------------
 

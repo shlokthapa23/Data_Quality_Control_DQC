@@ -16,3 +16,7 @@ python-docx==1.2.0
 python-pptx==1.0.2
 reportlab==5.0.0
 openpyxl==3.1.5
+
+# Production metadata DB. Only used when DATABASE_URL points at Postgres -
+# local/dev/test keeps using the stdlib sqlite3 module (no install needed).
+psycopg[binary,pool]==3.3.4

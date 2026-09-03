@@ -2,7 +2,7 @@ import json
 import uuid
 from datetime import datetime, timezone
 
-from catalog.db import get_conn  # reuse the same catalog.db connection helper
+from catalog.db import get_conn, table_exists, table_columns  # reuse the same catalog.db connection helper
 
 
 def _migrate_stale_schema_if_needed():
@@ -16,13 +16,10 @@ def _migrate_stale_schema_if_needed():
     are untouched.
     """
     with get_conn() as conn:
-        row = conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name='s2d_mappings'"
-        ).fetchone()
-        if not row:
+        if not table_exists(conn, "s2d_mappings"):
             return  # nothing to migrate, fresh install
 
-        columns = {r[1] for r in conn.execute("PRAGMA table_info(s2d_mappings)").fetchall()}
+        columns = table_columns(conn, "s2d_mappings")
         if "source_tables" in columns:
             return  # already on the new schema
 
@@ -38,13 +35,10 @@ def _add_missing_test_case_columns():
     they render correctly in the new rule-list UI without needing backfill.
     """
     with get_conn() as conn:
-        row = conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name='s2d_test_cases'"
-        ).fetchone()
-        if not row:
+        if not table_exists(conn, "s2d_test_cases"):
             return  # fresh install - CREATE TABLE below already includes the columns
 
-        existing = {r[1] for r in conn.execute("PRAGMA table_info(s2d_test_cases)").fetchall()}
+        existing = table_columns(conn, "s2d_test_cases")
         if "origin" not in existing:
             conn.execute("ALTER TABLE s2d_test_cases ADD COLUMN origin TEXT NOT NULL DEFAULT 'manual'")
         if "severity" not in existing:
@@ -356,13 +350,10 @@ def _add_missing_mapping_columns():
     against, which is the whole point of testing a file before loading it.
     """
     with get_conn() as conn:
-        row = conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name='s2d_mappings'"
-        ).fetchone()
-        if not row:
+        if not table_exists(conn, "s2d_mappings"):
             return  # fresh install - CREATE TABLE above already includes the column
 
-        existing = {r[1] for r in conn.execute("PRAGMA table_info(s2d_mappings)").fetchall()}
+        existing = table_columns(conn, "s2d_mappings")
         if "column_map" not in existing:
             conn.execute("ALTER TABLE s2d_mappings ADD COLUMN column_map TEXT")
         if "validation_kind" not in existing:
@@ -377,23 +368,17 @@ def _add_missing_test_run_columns():
     remember which test suite triggered it (NULL for legacy "Run all" runs).
     """
     with get_conn() as conn:
-        row = conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name='s2d_test_runs'"
-        ).fetchone()
-        if not row:
+        if not table_exists(conn, "s2d_test_runs"):
             return  # fresh install - CREATE TABLE above already includes the column
 
-        existing = {r[1] for r in conn.execute("PRAGMA table_info(s2d_test_runs)").fetchall()}
+        existing = table_columns(conn, "s2d_test_runs")
         if "suite_id" not in existing:
             conn.execute("ALTER TABLE s2d_test_runs ADD COLUMN suite_id TEXT")
 
         # harvest_schedules gained selected_items so scheduled harvests only
         # pull the user-chosen assets, not everything the connector sees.
-        hs_row = conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name='harvest_schedules'"
-        ).fetchone()
-        if hs_row:
-            hs_existing = {r[1] for r in conn.execute("PRAGMA table_info(harvest_schedules)").fetchall()}
+        if table_exists(conn, "harvest_schedules"):
+            hs_existing = table_columns(conn, "harvest_schedules")
             if "selected_items" not in hs_existing:
                 conn.execute("ALTER TABLE harvest_schedules ADD COLUMN selected_items TEXT")
 
@@ -407,13 +392,10 @@ def _add_missing_test_result_columns():
     data was never captured.
     """
     with get_conn() as conn:
-        row = conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name='s2d_test_results'"
-        ).fetchone()
-        if not row:
+        if not table_exists(conn, "s2d_test_results"):
             return  # fresh install - CREATE TABLE above already includes the columns
 
-        existing = {r[1] for r in conn.execute("PRAGMA table_info(s2d_test_results)").fetchall()}
+        existing = table_columns(conn, "s2d_test_results")
         if "violations" not in existing:
             conn.execute("ALTER TABLE s2d_test_results ADD COLUMN violations INTEGER")
         if "total_rows" not in existing:

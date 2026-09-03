@@ -34,6 +34,7 @@ from s2d.engine import run_suite
 from catalog import db as catalog_db
 from connector_factory import build_connector
 from harvest import run_harvest
+from notifications import db as notifications_db
 
 
 log = logging.getLogger(__name__)
@@ -42,6 +43,26 @@ _scheduler = None
 _scheduler_lock = threading.Lock()
 
 DEFAULT_MISFIRE_GRACE_SECONDS = 30 * 60
+
+_SCHEDULE_KIND_LABEL = {"suite": "Test suite", "harvest": "Harvest", "pipeline": "Pipeline"}
+
+
+def _record_schedule_event(schedule_kind, schedule_id, event_type, run_id=None, message=None):
+    """
+    Same call as s2d_db.record_schedule_event, plus a notification-feed entry
+    for every fire - one wrapper instead of touching each of the dozen call
+    sites below individually (the same "one dispatch point instead of N
+    places that can silently drift" lesson this codebase already applies to
+    SCHEDULE_TABLES). Suite fires are deliberately skipped here: run_suite()
+    already records its own "suite_run" notification with a pass/fail count,
+    which is more useful than this generic one and shouldn't be doubled.
+    """
+    s2d_db.record_schedule_event(schedule_kind, schedule_id, event_type, run_id=run_id, message=message)
+    if schedule_kind == "suite":
+        return
+    label = _SCHEDULE_KIND_LABEL.get(schedule_kind, schedule_kind.title())
+    detail = message or (f"run {run_id}" if run_id else event_type)
+    notifications_db.record_notification("schedule_fired", f"{label} schedule {event_type}: {detail}")
 
 
 def get_scheduler():
@@ -184,14 +205,14 @@ def _run_suite_job(schedule_id):
     if not suite or not suite.get("mapping"):
         msg = "Suite or its mapping no longer exists"
         s2d_db.touch_suite_schedule(schedule_id, "errored")
-        s2d_db.record_schedule_event("suite", schedule_id, "errored", message=msg)
+        _record_schedule_event("suite", schedule_id, "errored", message=msg)
         return
 
     active_test_cases = [tc for tc in suite["test_cases"] if tc.get("active")]
     if not active_test_cases:
         msg = "Suite has no active test cases"
         s2d_db.touch_suite_schedule(schedule_id, "errored")
-        s2d_db.record_schedule_event("suite", schedule_id, "errored", message=msg)
+        _record_schedule_event("suite", schedule_id, "errored", message=msg)
         return
 
     mapping = suite["mapping"]
@@ -204,11 +225,11 @@ def _run_suite_job(schedule_id):
         destination_connector = build_connector(destination_config)
         run_id = run_suite(source_connector, destination_connector, mapping, schedule["suite_id"], active_test_cases)
         s2d_db.touch_suite_schedule(schedule_id, "ran", last_run_id=run_id)
-        s2d_db.record_schedule_event("suite", schedule_id, "ran", run_id=run_id)
+        _record_schedule_event("suite", schedule_id, "ran", run_id=run_id)
     except Exception as e:
         log.exception("Suite schedule %s errored", schedule_id)
         s2d_db.touch_suite_schedule(schedule_id, "errored")
-        s2d_db.record_schedule_event("suite", schedule_id, "errored", message=str(e))
+        _record_schedule_event("suite", schedule_id, "errored", message=str(e))
 
 
 # --- Harvest jobs -----------------------------------------------------------
@@ -281,7 +302,7 @@ def _run_harvest_job(schedule_id):
         if not selected:
             msg = "Nothing to harvest — the schedule's selection is empty"
             s2d_db.touch_harvest_schedule(schedule_id, "ran")
-            s2d_db.record_schedule_event("harvest", schedule_id, "ran", message=msg)
+            _record_schedule_event("harvest", schedule_id, "ran", message=msg)
             return
 
         result = run_harvest(connector, schedule["connector_id"], config["name"], selected, mode=schedule.get("mode") or "incremental")
@@ -289,11 +310,11 @@ def _run_harvest_job(schedule_id):
         n_errors = len(result.get("errors", []))
         message = f"harvested {n_harvested}/{len(selected)} items ({n_errors} errors)"
         s2d_db.touch_harvest_schedule(schedule_id, "ran")
-        s2d_db.record_schedule_event("harvest", schedule_id, "ran", message=message)
+        _record_schedule_event("harvest", schedule_id, "ran", message=message)
     except Exception as e:
         log.exception("Harvest schedule %s errored", schedule_id)
         s2d_db.touch_harvest_schedule(schedule_id, "errored")
-        s2d_db.record_schedule_event("harvest", schedule_id, "errored", message=str(e))
+        _record_schedule_event("harvest", schedule_id, "errored", message=str(e))
 
 
 # --- Pipeline jobs ----------------------------------------------------------
@@ -357,13 +378,13 @@ def _run_pipeline_job(schedule_id):
             # to follow. Say that rather than claiming a clean run.
             msg = "Pipeline started but Fabric returned no run id, so its outcome is unknown"
             s2d_db.touch_pipeline_schedule(schedule_id, "errored")
-            s2d_db.record_schedule_event("pipeline", schedule_id, "errored", message=msg)
+            _record_schedule_event("pipeline", schedule_id, "errored", message=msg)
             return
 
         status, failure = _await_pipeline_run(connector, item_id, run_id)
         if status == "Completed":
             s2d_db.touch_pipeline_schedule(schedule_id, "ran", last_run_id=run_id)
-            s2d_db.record_schedule_event("pipeline", schedule_id, "ran", run_id=run_id,
+            _record_schedule_event("pipeline", schedule_id, "ran", run_id=run_id,
                                          message=f"{schedule.get('pipeline_name') or item_id}: Completed")
             return
 
@@ -374,11 +395,11 @@ def _run_pipeline_job(schedule_id):
         if failure:
             message += f": {failure}"
         s2d_db.touch_pipeline_schedule(schedule_id, "errored", last_run_id=run_id)
-        s2d_db.record_schedule_event("pipeline", schedule_id, "errored", run_id=run_id, message=message)
+        _record_schedule_event("pipeline", schedule_id, "errored", run_id=run_id, message=message)
     except Exception as e:
         log.exception("Pipeline schedule %s errored", schedule_id)
         s2d_db.touch_pipeline_schedule(schedule_id, "errored")
-        s2d_db.record_schedule_event("pipeline", schedule_id, "errored", message=str(e))
+        _record_schedule_event("pipeline", schedule_id, "errored", message=str(e))
 
 
 def _await_pipeline_run(connector, item_id, run_id):
@@ -417,7 +438,7 @@ def _on_job_missed(event):
         return
     try:
         s2d_db.bump_schedule_misfire(kind, schedule_id)
-        s2d_db.record_schedule_event(kind, schedule_id, "missed",
+        _record_schedule_event(kind, schedule_id, "missed",
                                      message="APScheduler dropped a fire (grace time exceeded)")
     except Exception:
         log.exception("Failed to log misfire for %s", job_id)

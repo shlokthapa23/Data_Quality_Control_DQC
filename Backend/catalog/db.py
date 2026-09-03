@@ -1,3 +1,4 @@
+import os
 import sqlite3
 import json
 from datetime import datetime, timezone
@@ -5,16 +6,143 @@ from contextlib import contextmanager
 
 DB_PATH = "catalog.db"
 
+# --- SQLite (local/dev/test) vs PostgreSQL (production) ---------------------
+#
+# Every table in this app - not just this file's - goes through get_conn()
+# here (auth/db.py, local_files/db.py, notifications/db.py, s2d/db.py all
+# import it rather than touching sqlite3 directly), so this one module is
+# the entire blast radius for the dialect decision. DATABASE_URL unset (or
+# not a postgres:// URL) keeps today's exact SQLite behavior - nothing
+# changes for local dev unless this env var is deliberately set.
+_DATABASE_URL = os.environ.get("DATABASE_URL", "")
+DIALECT = "postgres" if _DATABASE_URL.startswith(("postgres://", "postgresql://")) else "sqlite"
 
-@contextmanager
-def get_conn():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
+if DIALECT == "postgres":
+    # Imported only in this branch, not at module top-level, so sqlite-only
+    # dev/test never needs psycopg installed at all.
+    import psycopg
+    from psycopg.rows import dict_row
+    from psycopg_pool import ConnectionPool
+
+    OperationalError = psycopg.errors.OperationalError
+
+    # One pool per process, reused by every get_conn() call. Production
+    # needs pooling - opening a fresh TCP connection per call (what the
+    # sqlite branch does, cheaply, since it's a local file) would not scale
+    # against a real Postgres server.
+    #
+    # open=False + an explicit non-blocking .open() (rather than the
+    # deprecated open=True at construction) so a Postgres server that isn't
+    # reachable yet at process startup (e.g. still starting up, or a
+    # misconfigured URL during initial setup) doesn't crash the app at
+    # import time - connections are attempted in the background instead,
+    # and only surface as a normal per-request error if they never succeed.
+    _pool = ConnectionPool(_DATABASE_URL, kwargs={"row_factory": dict_row}, open=False)
+    _pool.open(wait=False)
+
+    class _PgConn:
+        """
+        Thin adapter so a Postgres connection supports the exact same
+        `.execute(sql, params)` -> rows-indexable-by-column-name shape
+        sqlite3.Connection already gives every module in this app - the
+        only difference any caller ever sees is that '?' placeholders get
+        translated to '%s' before reaching psycopg. Safe here because every
+        SQL string in this codebase is a static literal (never built from
+        untrusted input), so this translation can never corrupt a literal
+        value or identifier that happened to contain a '?'.
+        """
+
+        def __init__(self, pg_conn):
+            self._conn = pg_conn
+
+        def execute(self, sql, params=()):
+            return self._conn.execute(sql.replace("?", "%s"), params)
+
+    @contextmanager
+    def get_conn():
+        # pool.connection() itself commits on a clean exit and rolls back on
+        # an exception, then returns the connection to the pool - the same
+        # commit-after-yield contract the sqlite branch below implements by
+        # hand.
+        with _pool.connection() as pg_conn:
+            yield _PgConn(pg_conn)
+
+else:
+    OperationalError = sqlite3.OperationalError
+
+    @contextmanager
+    def get_conn():
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        try:
+            yield conn
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def autoincrement_pk():
+    """DDL fragment for an auto-incrementing integer primary key, per dialect."""
+    if DIALECT == "postgres":
+        return "INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY"
+    return "INTEGER PRIMARY KEY AUTOINCREMENT"
+
+
+def table_columns(conn, table):
+    """
+    Every column name on `table` as a set - replaces raw
+    `{r[1] for r in conn.execute("PRAGMA table_info(...)").fetchall()}`,
+    the pattern several modules' additive migrations already used to decide
+    which ALTER TABLE ADD COLUMN statements still need to run. sqlite keeps
+    using PRAGMA; postgres queries information_schema.
+    """
+    if DIALECT == "postgres":
+        rows = conn.execute(
+            "SELECT column_name FROM information_schema.columns WHERE table_name = ?", (table,),
+        ).fetchall()
+        return {r["column_name"] for r in rows}
+    return {r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+
+
+def column_exists(conn, table, column):
+    return column in table_columns(conn, table)
+
+
+def table_exists(conn, table):
+    """Replaces raw `SELECT name FROM sqlite_master WHERE type='table' AND name=?` reads."""
+    if DIALECT == "postgres":
+        row = conn.execute(
+            "SELECT 1 FROM information_schema.tables WHERE table_name = ?", (table,),
+        ).fetchone()
+        return row is not None
+    row = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name = ?", (table,),
+    ).fetchone()
+    return row is not None
+
+
+def add_column_if_missing(conn, table, column, coltype):
+    """
+    Additive-only migration helper - adds `column` to `table` if it isn't
+    already there, never drops/recreates anything (see tasks/lessons.md's
+    "schema migrations are additive-only" rule).
+
+    On Postgres this deliberately does NOT use sqlite's
+    try/ALTER/except-and-ignore shape: Postgres aborts the WHOLE
+    surrounding transaction the moment any statement inside it errors, so a
+    harmless "column already exists" error there would silently kill every
+    later statement in the same get_conn() block (every migration and
+    CREATE TABLE after it in init_db()) - not just this one. `ADD COLUMN IF
+    NOT EXISTS` (Postgres 9.6+) sidesteps that failure mode entirely rather
+    than trying to replicate sqlite's per-statement error tolerance.
+    """
+    if DIALECT == "postgres":
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} {coltype}")
+        return
     try:
-        yield conn
-        conn.commit()
-    finally:
-        conn.close()
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {coltype}")
+    except OperationalError:
+        pass  # column already exists
 
 
 def init_db():
@@ -33,9 +161,9 @@ def init_db():
                 harvested_at TEXT NOT NULL
             )
         """)
-        conn.execute("""
+        conn.execute(f"""
             CREATE TABLE IF NOT EXISTS harvest_jobs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id {autoincrement_pk()},
                 connector_type TEXT NOT NULL,
                 connector_name TEXT NOT NULL,
                 mode TEXT NOT NULL,            -- 'incremental' | 'full_refresh'
@@ -60,10 +188,7 @@ def init_db():
             )
         """)
         # Defensive migration for databases created before this column existed.
-        try:
-            conn.execute("ALTER TABLE connector_configs ADD COLUMN allowed_containers_json TEXT")
-        except sqlite3.OperationalError:
-            pass  # column already exists
+        add_column_if_missing(conn, "connector_configs", "allowed_containers_json", "TEXT")
 
         # Additive migration: personal "test data" connectors. owner_user_id
         # is NULL for every ordinary org-shared connector (unchanged
@@ -72,14 +197,8 @@ def init_db():
         # get_or_create_test_data_connector below). The partial unique index
         # guarantees one tester can never end up with two of these even if
         # two "create test data" requests race.
-        try:
-            conn.execute("ALTER TABLE connector_configs ADD COLUMN owner_user_id TEXT")
-        except sqlite3.OperationalError:
-            pass  # column already exists
-        try:
-            conn.execute("ALTER TABLE connector_configs ADD COLUMN purpose TEXT")
-        except sqlite3.OperationalError:
-            pass  # column already exists
+        add_column_if_missing(conn, "connector_configs", "owner_user_id", "TEXT")
+        add_column_if_missing(conn, "connector_configs", "purpose", "TEXT")
         conn.execute("""
             CREATE UNIQUE INDEX IF NOT EXISTS ux_connector_owner_test_data
             ON connector_configs(owner_user_id) WHERE purpose = 'test_data'
@@ -95,11 +214,9 @@ def init_db():
         # in URLs and AssetDetailModal's fetch-by-id) for a collision risk
         # that's negligible in practice (Fabric item ids are workspace-scoped
         # GUIDs).
-        try:
-            conn.execute("ALTER TABLE harvested_assets ADD COLUMN connector_id TEXT")
-        except sqlite3.OperationalError:
-            pass  # column already exists
-        else:
+        had_connector_id = column_exists(conn, "harvested_assets", "connector_id")
+        add_column_if_missing(conn, "harvested_assets", "connector_id", "TEXT")
+        if not had_connector_id:
             # One-time backfill for pre-existing rows: only safe when exactly
             # one connector of that type exists (true for this app today -
             # one Fabric + one Local connector). Ambiguous cases are left
@@ -363,60 +480,8 @@ def list_connector_configs(user_id=None):
         return results
 
 
-def get_or_create_test_data_connector(user_id, display_name):
-    """
-    Every tester gets exactly one personal Local connector for their
-    hand-built synthetic test tables, created lazily on their first "Generate
-    Test Data" action - never eagerly, never shared. type='local' so it needs
-    zero changes anywhere else in the app (connector_factory, LocalConnector,
-    every table picker) to behave like any other Local connector; only
-    owner_user_id/purpose distinguish it for ownership checks and UI labeling.
-
-    The unique index on (owner_user_id) WHERE purpose='test_data' is the real
-    guarantee here: if two requests from the same tester race past the SELECT
-    at once, the loser's INSERT hits that index and raises
-    sqlite3.IntegrityError - caught below, re-SELECT picks up the winner's
-    row instead of erroring the request.
-    """
-    import uuid
-
-    with get_conn() as conn:
-        row = conn.execute(
-            "SELECT id FROM connector_configs WHERE purpose = 'test_data' AND owner_user_id = ?",
-            (user_id,),
-        ).fetchone()
-        if row:
-            return row["id"]
-
-        config_id = str(uuid.uuid4())
-        now = datetime.now(timezone.utc).isoformat()
-        try:
-            conn.execute("""
-                INSERT INTO connector_configs (id, name, type, owner_user_id, purpose, created_at)
-                VALUES (?, ?, 'local', ?, 'test_data', ?)
-            """, (config_id, display_name, user_id, now))
-        except sqlite3.IntegrityError:
-            row = conn.execute(
-                "SELECT id FROM connector_configs WHERE purpose = 'test_data' AND owner_user_id = ?",
-                (user_id,),
-            ).fetchone()
-            return row["id"]
-        return config_id
 
 
-def is_test_data_connector_owned_by(connector_id, user_id):
-    """
-    True only if connector_id exists, is a personal test-data connector, AND
-    belongs to this user - the check every new test-data route runs before
-    touching anything, so one tester's synthetic tables are never reachable
-    through another tester's session even if they learn the connector_id.
-    """
-    with get_conn() as conn:
-        row = conn.execute(
-            "SELECT 1 FROM connector_configs WHERE id = ? AND purpose = 'test_data' AND owner_user_id = ?",
-            (connector_id, user_id),
-        ).fetchone()
-        return row is not None
 
 
 def get_connector_config(config_id):

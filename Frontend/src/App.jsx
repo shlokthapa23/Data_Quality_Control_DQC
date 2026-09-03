@@ -14,6 +14,7 @@ import AnalyticsPage from './pages/AnalyticsPage';
 import HistoryPage from './pages/HistoryPage';
 import DashboardPage from './pages/DashboardPage';
 import ProfilePage from './pages/ProfilePage';
+import NotificationBell from './components/common/NotificationBell';
 import DQClogo from './images/DQC.png';
 const NAV_PAGES = [
   { id: 'dashboard', label: 'Data Quality Dashboard', icon: BarChart3 },
@@ -312,9 +313,20 @@ function App() {
         </div>
       </aside>
 
-      <main className="flex-1 overflow-y-auto p-6 sm:p-8">
-        {content}
-      </main>
+      {/* A separate slim bar, not floated over the page content: several pages
+          (Test Data Preparation, Test Suite Execution, Data Quality Dashboard)
+          already put their own controls flush top-right, and a bell floating
+          on top of `content` collided with them. Giving the bell its own row
+          above `content` fixes that for every page at once, not just these
+          three - the same "page area" scrolls below it, undisturbed. */}
+      <div className="flex-1 flex flex-col overflow-hidden">
+        <div className="flex items-center justify-end h-12 px-6 sm:px-8 border-b border-slate-200 bg-white shrink-0">
+          <NotificationBell />
+        </div>
+        <main className="flex-1 overflow-y-auto p-6 sm:p-8">
+          {content}
+        </main>
+      </div>
     </div>
   );
 }

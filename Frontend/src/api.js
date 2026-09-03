@@ -125,10 +125,16 @@ export function pinConnectorContainers(connectorId, containers) {
 // this connector+container, and the response gains a `harvested` flag - only
 // Test Data Preparation's picker uses this; everything else keeps seeing every
 // live table.
-export function fetchContainerTables(connectorId, containerId, { includeRowCounts = false, harvestedOnly = false } = {}) {
+// forceRefresh: makes Fabric sync its SQL analytics endpoint against the
+// real Lakehouse before reading, since that endpoint is a separately-synced
+// replica (not a live view) and can otherwise still show pre-write numbers
+// for a while - pass it from an explicit "Refresh" click, not on every
+// silent/background load, since it costs an extra Fabric API round trip.
+export function fetchContainerTables(connectorId, containerId, { includeRowCounts = false, harvestedOnly = false, forceRefresh = false } = {}) {
   const params = new URLSearchParams();
   if (includeRowCounts) params.set('include_row_counts', '1');
   if (harvestedOnly) params.set('harvested_only', '1');
+  if (forceRefresh) params.set('force_refresh', '1');
   const query = params.toString() ? `?${params}` : '';
   return request(`/api/connectors/${connectorId}/containers/${containerId}/tables${query}`);
 }
@@ -178,64 +184,38 @@ export function reingestLocalTable(connectorId, tableId, xmlRecordElement) {
   });
 }
 
-// --- Personal synthetic test data --------------------------------------------
-// Nothing is created until finalizeSyntheticTable is called - the draft grid
-// up to that point is pure frontend state. The tester's personal test-data
-// connector is created lazily on the server, first call only.
-
-// source: { connectorId, containerId, tableName } - the real table whose
-// SCHEMA is being cloned (never its rows). rows: [{col: value, ...}, ...] -
-// the tester's finalized draft.
-export function finalizeSyntheticTable({ displayName, source, rows }) {
-  return request('/api/test-data/connectors/finalize', {
+// --- Generated test data: insert into a real Fabric table --------------------
+// Generated test data itself is client-side only (a CSV the tester downloads
+// or hand-builds) - no connector/table is created server-side for it. This is
+// the one deliberate exception: writing those rows directly into a REAL
+// Fabric table, on explicit request. confirm must be true, on top of
+// whatever confirmation dialog the caller already showed - see the route's
+// own docstring for why.
+//
+// Fabric's SQL analytics endpoint can't run DML against a Lakehouse table at
+// all (a hard platform limit, not a permissions issue), so this starts a
+// Spark notebook job instead of writing synchronously - it returns a job to
+// poll, not a row count. Callers must poll fetchFabricInsertJob until
+// is_running is false, same pattern as fetchPipelineRun/runPipeline above.
+export function insertRowsIntoFabricTable(connectorId, { containerId, tableName, rows }) {
+  return request(`/api/connectors/${connectorId}/fabric/insert-rows`, {
     method: 'POST',
-    body: JSON.stringify({
-      display_name: displayName,
-      source: {
-        connector_id: source.connectorId,
-        container_id: source.containerId,
-        table_name: source.tableName,
-      },
-      rows,
-    }),
+    body: JSON.stringify({ container_id: containerId, table_name: tableName, rows, confirm: true }),
   });
 }
 
-export function fetchSyntheticTableRows(connectorId, tableId) {
-  return request(`/api/connectors/${connectorId}/synthetic-tables/${tableId}/rows`);
+export function fetchFabricInsertJob(connectorId, notebookItemId, jobId, { containerId, stagingPath, tableName, rowCount }) {
+  const params = new URLSearchParams({
+    container_id: containerId, staging_path: stagingPath, table_name: tableName, row_count: rowCount,
+  });
+  return request(`/api/connectors/${connectorId}/fabric/insert-jobs/${notebookItemId}/${jobId}?${params}`);
 }
 
-// Full-replace save - same one-shot semantics as ColumnMapModal/suite
-// membership elsewhere in this app.
-export function saveSyntheticTableRows(connectorId, tableId, rows) {
-  return request(`/api/connectors/${connectorId}/synthetic-tables/${tableId}/rows`, {
-    method: 'PUT',
-    body: JSON.stringify({ rows }),
-  });
-}
-
-// Additive-only: dryRun=true (default) previews what would change without
-// applying it; dryRun=false commits the additive part of the diff.
-export function resyncSyntheticTableSchema(connectorId, tableId, dryRun = true) {
-  return request(`/api/connectors/${connectorId}/synthetic-tables/${tableId}/resync?dry_run=${dryRun ? '1' : '0'}`, {
-    method: 'POST',
-  });
-}
-
-// Mirrors exportS2DAnalytics's exact {blob, filename} + Content-Disposition
-// parsing pattern below - same download mechanism, different source route.
-export async function downloadSyntheticTable(connectorId, tableId) {
-  const res = await fetch(`${API_BASE}/api/connectors/${connectorId}/synthetic-tables/${tableId}/download`, {
-    headers: authHeaders(),
-  });
-  if (handleUnauthorized(res)) throw new Error('Session expired');
-  if (!res.ok) {
-    const body = await res.json().catch(() => ({}));
-    throw new Error(body.details ? `${body.error}: ${body.details}` : (body.error || `Download failed: ${res.status}`));
-  }
-  const disposition = res.headers.get('Content-Disposition') || '';
-  const match = disposition.match(/filename="?([^"]+)"?/);
-  return { blob: await res.blob(), filename: match ? match[1] : 'test-data.csv' };
+// --- Notifications ------------------------------------------------------------
+// Not scoped per-user - see Backend/notifications/db.py's module docstring.
+// "Read" state is tracked client-side.
+export function fetchNotifications(limit = 50) {
+  return request(`/api/notifications?limit=${limit}`);
 }
 
 // --- Data pipelines (fabric connectors only) ---

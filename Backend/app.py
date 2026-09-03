@@ -25,6 +25,7 @@ import scheduler as _scheduler
 from auth import db as auth_db
 from auth.routes import auth_bp
 from auth.security import decode_token
+from notifications import db as notifications_db
 
 
 
@@ -33,6 +34,7 @@ catalog_db.init_db()
 s2d_db.init_s2d_tables()
 local_db.init_local_tables_table()
 auth_db.init_auth_tables()
+notifications_db.init_notifications_table()
 
 app = Flask(__name__)
 CORS(app)
@@ -105,6 +107,18 @@ def get_connector_instance(connector_id):
 @app.route('/api/health', methods=['GET'])
 def health_check():
     return jsonify({"status": "healthy"})
+
+
+@app.route('/api/notifications', methods=['GET'])
+def list_notifications_route():
+    """
+    Recent activity feed - schedule fires, test suite run completions, and
+    generated-test-data events. Not scoped per-user/org (see
+    notifications/db.py's module docstring for why) - every logged-in user
+    sees the same feed. "Read" state is tracked client-side.
+    """
+    limit = min(int(request.args.get("limit", 50)), 200)
+    return jsonify({"notifications": notifications_db.list_notifications(limit)})
 
 
 # --- Connect: manage connector instances -----------------------------------
@@ -489,9 +503,18 @@ def get_container_tables_live(connector_id, container_id):
     harvested at all" - those need different empty-state messaging. Every
     other caller of this route (MappingsPage, TestCasePanel, ...) omits the
     flag and keeps seeing every live table, unchanged.
+
+    ?force_refresh=1 forces Fabric to sync its SQL analytics endpoint against
+    the real Lakehouse before reading - opt-in (not the default) since it
+    costs an extra Fabric API round trip every normal listing call would
+    otherwise pay for nothing. This is what the tester-facing "Refresh"
+    button passes, since the SQL endpoint is a separately-synced replica of
+    the real Delta tables and can otherwise lag behind a just-completed
+    write (this app's own PySpark insert included) for a while.
     """
     include_row_counts = request.args.get("include_row_counts") in ("1", "true", "yes")
     harvested_only = request.args.get("harvested_only") in ("1", "true", "yes")
+    force_refresh = request.args.get("force_refresh") in ("1", "true", "yes")
 
     try:
         _, connector = get_connector_instance(connector_id)
@@ -499,6 +522,9 @@ def get_container_tables_live(connector_id, container_id):
         return jsonify({"error": str(e)}), 404
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
+
+    if force_refresh and hasattr(connector, "refresh_sql_endpoint_metadata"):
+        connector.refresh_sql_endpoint_metadata(container_id)
 
     try:
         schema = connector.list_tables_in_container(container_id, include_row_counts=include_row_counts)
@@ -638,20 +664,21 @@ def delete_local_file(connector_id, table_id):
     return jsonify({"deleted": table_id})
 
 
-# --- Personal synthetic test data --------------------------------------------
-# Lets a tester clone a real table's SCHEMA (never real rows - see the source
-# fetch below, which reads only column metadata) into a table they build and
-# populate by hand, in their own personal, lazily-created Local connector.
-# Surfaced from the Test Data Preparation page, per-table.
+# --- Generated test data: insert into a real Fabric table -------------------
+# The tester builds/downloads their generated test data as a plain CSV (see
+# the frontend) - no server-side table or connector is created for it. This
+# route is the one deliberate exception: writing those rows directly into a
+# REAL Fabric table, on explicit request. Every other route in this file
+# that touches a connector is read-only against Fabric; this one is not, so
+# it carries extra guardrails a normal route doesn't need.
 
 def _live_columns_for(connector_id, container_id, table_name):
     """
     Fetch one table's live column list straight from its real connector -
-    never trust a client-submitted column list for this, since that list
-    becomes a CREATE TABLE's column definitions. Returns None if the
-    connector/container/table can't be resolved right now (deleted, renamed,
-    unreachable) rather than raising, so callers can degrade to a clean
-    "source unavailable" response.
+    never trust a client-submitted column list for this, since it becomes
+    the column order an INSERT writes against. Returns None if the
+    connector/container/table can't be resolved right now (deleted,
+    renamed, unreachable) rather than raising.
     """
     try:
         _, connector = get_connector_instance(connector_id)
@@ -664,152 +691,141 @@ def _live_columns_for(connector_id, container_id, table_name):
     return [{"name": c["name"], "data_type": c.get("data_type")} for c in entry["columns"]]
 
 
-@app.route('/api/test-data/connectors/finalize', methods=['POST'])
-def finalize_synthetic_table():
+@app.route('/api/connectors/<connector_id>/fabric/insert-rows', methods=['POST'])
+def insert_rows_into_fabric_table(connector_id):
     """
-    The one call the "Finalize"/"Generate Test Data" button makes. Body:
-    { "display_name": "...",
-      "source": {"connector_id","container_id","table_name"},
-      "rows": [{col: value, ...}, ...] }
+    Body: { "container_id": "...", "table_name": "...", "rows": [...],
+             "confirm": true }
 
-    Nothing is created until this call - the draft grid up to this point is
-    pure frontend state. Get-or-creates the tester's personal test-data
-    connector (first time only), re-fetches the source table's columns live
-    (never the client's draft schema), and creates the table + finalized
-    rows in one transaction.
+    Starts (does not wait for) a real write into a REAL Fabric table.
+    "confirm" must be explicitly true - a defense-in-depth check on top of
+    the frontend's own confirmation dialog. Column names are re-resolved
+    from the table's OWN live schema (never the client's rows' keys), so a
+    stray or malicious column name in the request body never reaches the
+    staged file at all.
+
+    Fabric's SQL analytics endpoint cannot run DML against a Lakehouse table
+    (error 24559, every time, regardless of permissions) - this stages the
+    rows as a CSV in the target Lakehouse's OneLake Files area and starts a
+    Spark notebook job that appends them, the same async job-submit shape
+    the pipeline-run routes below already use. Returns 202 with a job id to
+    poll, not a row count - the job can take a couple of minutes (Spark
+    session start-up) before it even begins the insert itself.
     """
+    config = catalog_db.get_connector_config(connector_id)
+    if not config:
+        return jsonify({"error": "Unknown connector"}), 404
+    if config["type"] != "fabric":
+        return jsonify({"error": "Inserting rows is only available on Fabric connectors"}), 400
+    _assert_connector_access(config)
+
     body = request.get_json(force=True) or {}
-    display_name = (body.get("display_name") or "").strip()
-    source = body.get("source") or {}
+    if body.get("confirm") is not True:
+        return jsonify({"error": "confirm must be true - this writes directly into a real Fabric table"}), 400
+    container_id = body.get("container_id")
+    table_name = body.get("table_name")
     rows = body.get("rows") or []
-    if not display_name:
-        return jsonify({"error": "display_name is required"}), 400
-    src_connector_id = source.get("connector_id")
-    src_container_id = source.get("container_id")
-    src_table_name = source.get("table_name")
-    if not (src_connector_id and src_container_id and src_table_name):
-        return jsonify({"error": "source.connector_id, source.container_id and source.table_name are required"}), 400
+    if not (container_id and table_name):
+        return jsonify({"error": "container_id and table_name are required"}), 400
+    if not rows:
+        return jsonify({"error": "rows is required and must be non-empty"}), 400
 
-    columns = _live_columns_for(src_connector_id, src_container_id, src_table_name)
+    columns = _live_columns_for(connector_id, container_id, table_name)
     if columns is None:
-        return jsonify({"error": f"Couldn't read the live schema of {src_table_name} - it may have been deleted or renamed"}), 404
+        return jsonify({"error": f"Couldn't read the live schema of {table_name} - it may have been deleted or renamed"}), 404
 
-    user = request.current_user
-    test_data_connector_id = catalog_db.get_or_create_test_data_connector(
-        user["id"], f"Test Data — {user['full_name']}"
-    )
+    # Split into per-step try/excepts (rather than one around the whole
+    # sequence) so a failure names exactly which Fabric call broke -
+    # staging file vs notebook lookup/creation vs job submit are three very
+    # different failure causes (OneLake permissions vs workspace item
+    # permissions vs job-trigger payload), and a single generic "Could not
+    # start the Fabric insert job" message was useless for telling them apart.
+    _, connector = get_connector_instance(connector_id)
+
     try:
-        result = local_db.create_synthetic_table(
-            test_data_connector_id, display_name, columns, rows,
-            provenance={
-                "connector_id": src_connector_id, "container_id": src_container_id,
-                "table_name": src_table_name,
-            },
-        )
-        return jsonify({**result, "connector_id": test_data_connector_id}), 201
-    except ValueError as e:
-        return jsonify({"error": str(e)}), 400
-
-
-@app.route('/api/connectors/<connector_id>/synthetic-tables/<table_id>/rows', methods=['GET'])
-def get_synthetic_table_rows_route(connector_id, table_id):
-    config = catalog_db.get_connector_config(connector_id)
-    if not config:
-        return jsonify({"error": "Unknown connector"}), 404
-    _assert_connector_access(config)
-    try:
-        return jsonify({"rows": local_db.get_synthetic_table_rows(connector_id, table_id)})
-    except KeyError:
-        return jsonify({"error": "Unknown table"}), 404
-
-
-@app.route('/api/connectors/<connector_id>/synthetic-tables/<table_id>/rows', methods=['PUT'])
-def save_synthetic_table_rows_route(connector_id, table_id):
-    """Full-replace save - body: { "rows": [{col: value, ...}, ...] }.
-    An empty array is accepted (a tester may genuinely want to clear a
-    table), but the frontend should confirm that explicitly before sending
-    it - this route does exactly what it's told."""
-    config = catalog_db.get_connector_config(connector_id)
-    if not config:
-        return jsonify({"error": "Unknown connector"}), 404
-    _assert_connector_access(config)
-    body = request.get_json(force=True) or {}
-    rows = body.get("rows")
-    if rows is None:
-        return jsonify({"error": "rows is required"}), 400
-    try:
-        return jsonify(local_db.replace_table_rows(connector_id, table_id, rows))
-    except KeyError:
-        return jsonify({"error": "Unknown table"}), 404
+        staging_path = connector.write_staging_file(container_id, columns, rows)
     except Exception as e:
-        return jsonify({"error": "Couldn't save those rows", "details": str(e)}), 400
+        app.logger.exception("write_staging_file failed")
+        return jsonify({"error": "Could not write the staging file to OneLake", "details": str(e)}), 502
 
-
-@app.route('/api/connectors/<connector_id>/synthetic-tables/<table_id>/download', methods=['GET'])
-def download_synthetic_table_route(connector_id, table_id):
-    config = catalog_db.get_connector_config(connector_id)
-    if not config:
-        return jsonify({"error": "Unknown connector"}), 404
-    _assert_connector_access(config)
     try:
-        rows = local_db.get_synthetic_table_rows(connector_id, table_id, limit=100000)
-    except KeyError:
-        return jsonify({"error": "Unknown table"}), 404
+        notebook_id = connector.ensure_test_data_notebook()
+    except Exception as e:
+        app.logger.exception("ensure_test_data_notebook failed")
+        connector.cleanup_staging_file(container_id, staging_path)
+        return jsonify({"error": "Could not find or create the test-data notebook", "details": str(e)}), 502
 
-    import csv as _csv
-    import io as _io
-    buf = _io.StringIO()
-    fieldnames = list(rows[0].keys()) if rows else []
-    writer = _csv.DictWriter(buf, fieldnames=fieldnames)
-    writer.writeheader()
-    writer.writerows(rows)
-    blob = buf.getvalue().encode("utf-8")
+    try:
+        _, job_id = connector.run_notebook_insert(container_id, table_name, staging_path)
+    except Exception as e:
+        app.logger.exception("run_notebook_insert failed")
+        connector.cleanup_staging_file(container_id, staging_path)
+        return jsonify({"error": "Could not start the notebook job", "details": str(e)}), 502
 
-    filename = f"{table_id}.csv"
-    return Response(blob, mimetype="text/csv", headers={
-        "Content-Disposition": f'attachment; filename="{filename}"',
-        "Access-Control-Expose-Headers": "Content-Disposition",
-    })
+    if not job_id:
+        connector.cleanup_staging_file(container_id, staging_path)
+        return jsonify({"error": "The notebook job started but its job id could not be resolved"}), 502
 
-
-@app.route('/api/connectors/<connector_id>/synthetic-tables/<table_id>/resync', methods=['POST'])
-def resync_synthetic_table_route(connector_id, table_id):
-    """
-    ?dry_run=1 (default) previews the additive diff without applying it;
-    dry_run=0 applies it. Never drops/renames/retypes a column the tester
-    already has rows against - see local_db.resync_schema's docstring.
-    """
-    config = catalog_db.get_connector_config(connector_id)
-    if not config:
-        return jsonify({"error": "Unknown connector"}), 404
-    _assert_connector_access(config)
-
-    rows = local_db.list_local_tables(connector_id)
-    table_row = next((r for r in rows if r["id"] == table_id), None)
-    if not table_row:
-        return jsonify({"error": "Unknown table"}), 404
-    provenance = None
-    if table_row.get("provenance_json"):
-        provenance = json.loads(table_row["provenance_json"])
-    if not provenance:
-        return jsonify({"error": "This table has no recorded source to resync against"}), 400
-
-    live_columns = _live_columns_for(
-        provenance["connector_id"], provenance["container_id"], provenance["table_name"]
+    notifications_db.record_notification(
+        "test_data_insert_started",
+        f'Started inserting {len(rows)} row(s) of generated test data into {table_name}.',
     )
-    if live_columns is None:
-        return jsonify({
-            "source_available": False,
-            "message": "The original source table couldn't be read - it may have been deleted, "
-                        "renamed, or its connector removed. This test table is untouched.",
-        }), 200
+    return jsonify({
+        "job_id": job_id, "notebook_item_id": notebook_id,
+        "container_id": container_id, "staging_path": staging_path, "row_count": len(rows),
+    }), 202
 
-    dry_run = request.args.get("dry_run", "1") not in ("0", "false", "no")
+
+@app.route(
+    '/api/connectors/<connector_id>/fabric/insert-jobs/<notebook_item_id>/<job_id>',
+    methods=['GET'],
+)
+def get_fabric_insert_job(connector_id, notebook_item_id, job_id):
+    """
+    Poll one insert job's status. Mirrors GET .../pipelines/<item_id>/runs/<run_id>
+    exactly - same job-instance shape, since a notebook run and a pipeline
+    run are both just Fabric job instances.
+
+    On a terminal state, cleans up the staging file (success or failure -
+    either way the notebook is done reading it) and records the real
+    outcome as a notification. container_id/staging_path/row_count are
+    passed back by the caller from the insert-rows response since a job
+    instance itself doesn't carry them.
+    """
+    config = catalog_db.get_connector_config(connector_id)
+    if not config:
+        return jsonify({"error": "Unknown connector"}), 404
+    _assert_connector_access(config)
+
+    container_id = request.args.get("container_id")
+    staging_path = request.args.get("staging_path")
+    table_name = request.args.get("table_name") or ""
+    row_count = request.args.get("row_count", type=int) or 0
+
     try:
-        result = local_db.resync_schema(connector_id, table_id, live_columns, dry_run=dry_run)
-    except KeyError:
-        return jsonify({"error": "Unknown table"}), 404
-    return jsonify({"source_available": True, **result})
+        _, connector = get_connector_instance(connector_id)
+        run = connector.get_notebook_job(notebook_item_id, job_id)
+    except Exception as e:
+        return jsonify({"error": "Could not read the insert job's status", "details": str(e)}), 502
+
+    if not run["is_running"] and container_id and staging_path:
+        connector.cleanup_staging_file(container_id, staging_path)
+        if run["status"] == "Completed":
+            notifications_db.record_notification(
+                "test_data_inserted",
+                f'Inserted {row_count} row(s) of generated test data into {table_name}.',
+            )
+            # The SQL analytics endpoint is a separately-synced replica of
+            # the real Delta table, not a live view - without this, the
+            # tester who just watched this insert finish would still see
+            # the OLD row count until Fabric's own background sync catches
+            # up (which is what made row counts look stuck needing repeated
+            # manual refreshes). We know a write just landed, so force the
+            # sync now instead of leaving the tester to click Refresh
+            # several times to get the same effect.
+            if hasattr(connector, "refresh_sql_endpoint_metadata"):
+                connector.refresh_sql_endpoint_metadata(container_id)
+    return jsonify(run)
 
 
 # --- Harvest -----------------------------------------------------------

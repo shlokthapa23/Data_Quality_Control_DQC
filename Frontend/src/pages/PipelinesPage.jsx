@@ -1,19 +1,22 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   PlayCircle, Loader2, AlertCircle, CheckCircle2, XCircle, RefreshCw,
-  ArrowRight, Workflow, CalendarClock, Table2, FlaskConical,
+  ArrowRight, Workflow, CalendarClock, Table2, FlaskConical, Upload, DatabaseZap,
 } from 'lucide-react';
 import {
   fetchConnectors, fetchConnectorContainers, fetchContainerTables, fetchHarvestedTableNames,
   fetchPipelines, runPipeline, fetchPipelineRun, fetchPipelineRuns,
   fetchPipelineSchedules, createPipelineSchedule, updatePipelineSchedule,
-  deletePipelineSchedule, fetchPipelineScheduleEvents,
+  deletePipelineSchedule, fetchPipelineScheduleEvents, insertRowsIntoFabricTable, fetchFabricInsertJob,
 } from '../api';
 import { formatRowCount, rowCountStyle, rowCountTitle } from '../rowCount';
 import { ListFilter } from '../components/common/ListFilter';
 import { filterByName, noMatchNote } from '../listFilter';
 import SchedulesSection from '../components/schedules/SchedulesSection';
 import TestDataDraftModal from '../components/testdata/TestDataDraftModal';
+import UploadTestDataModal from '../components/testdata/UploadTestDataModal';
+import { useConfirm, useAlert } from '../components/common/confirmContext';
+import { pollJob } from '../pollJob';
 
 // Fabric reports NotStarted/InProgress while a job is live; everything else
 // (Completed, Failed, Cancelled, Deduped) is terminal. The backend already
@@ -121,9 +124,14 @@ function snapshotOf(tables) {
  * empty table reads the same red everywhere. That matters here more than
  * anywhere else: this is the page where a tester is about to load data into it.
  */
+// Not just the table name - two different Lakehouses (or two different
+// Fabric connectors) can share a table name, and generated data for one must
+// never be offered to push into the other.
+const genKey = (connectorId, containerId, tableName) => `${connectorId}::${containerId}::${tableName}`;
+
 function LakehouseTables({
   containerName, tables, status, onRefresh, harvestedNames, harvestedStatus, onGoToHarvest,
-  onCreateTestData,
+  onCreateTestData, onUploadTestData, generatedFor, onPushToFabric, isPushing,
 }) {
   const [query, setQuery] = useState('');
   // Only tables that came back the last time this Lakehouse was harvested -
@@ -198,9 +206,20 @@ function LakehouseTables({
       )}
 
       {rows.length > 0 && (
-        <ListFilter
-          value={query} onChange={setQuery} total={rows.length} shown={visible.length}
-        />
+        <div className="flex items-center gap-2">
+          <ListFilter
+            value={query} onChange={setQuery} total={rows.length} shown={visible.length}
+          />
+          {onUploadTestData && (
+            <button
+              onClick={onUploadTestData}
+              title="Upload a generated test-data CSV and insert it directly into a real Fabric table"
+              className="shrink-0 flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium text-mastek-primary border border-mastek-primary/40 rounded-md hover:bg-mastek-primary/10"
+            >
+              <Upload className="w-3.5 h-3.5" /> Upload Test Data
+            </button>
+          )}
+        </div>
       )}
 
       {rows.length > 0 && (
@@ -226,6 +245,21 @@ function LakehouseTables({
                   <FlaskConical className="w-3.5 h-3.5" />
                 </button>
               )}
+              {onPushToFabric && (() => {
+                const generated = generatedFor?.[t.name];
+                return (
+                  <button
+                    onClick={() => onPushToFabric(t, generated)}
+                    disabled={!generated || isPushing}
+                    title={generated
+                      ? `Push the ${generated.rows.length} generated row${generated.rows.length === 1 ? '' : 's'} into the real Fabric table "${t.name}"`
+                      : 'Generate test data for this table first'}
+                    className="shrink-0 p-1 text-slate-400 hover:text-red-600 hover:bg-red-50 rounded disabled:opacity-30 disabled:hover:bg-transparent disabled:hover:text-slate-400"
+                  >
+                    <DatabaseZap className="w-3.5 h-3.5" />
+                  </button>
+                );
+              })()}
             </div>
           ))}
         </div>
@@ -246,6 +280,21 @@ export default function PipelinesPage({ onGoToHarvest }) {
   // on close/finalize - nothing is created until the tester actually
   // finalizes inside the modal.
   const [testDataSource, setTestDataSource] = useState(null);
+  // Set only while the "Upload Test Data" modal is open - separate from
+  // testDataSource above since this is a whole-container action (upload +
+  // pick any of its tables), not tied to one specific row's button.
+  const [uploadTarget, setUploadTarget] = useState(null);
+  // Cache of the most recently generated test data per table, keyed by
+  // `${connectorId}::${containerId}::${tableName}` (not just table name -
+  // two different Lakehouses can share a table name). Populated by
+  // TestDataDraftModal's onCreated once a tester finalizes a draft; read by
+  // each row's "Push to Fabric" button to decide enabled/disabled and what
+  // to push, without needing the modal open. Session-only - a page reload
+  // clears it, same as the modal's own draft state always has.
+  const [generatedTestData, setGeneratedTestData] = useState({});
+  const [isPushing, setIsPushing] = useState(false);
+  const confirm = useConfirm();
+  const notify = useAlert();
   const [connectors, setConnectors] = useState([]);
   const [connectorId, setConnectorId] = useState('');
   const [pipelines, setPipelines] = useState([]);
@@ -306,7 +355,7 @@ export default function PipelinesPage({ onGoToHarvest }) {
    * Counts are deliberately never cached: pipeline runs change them constantly,
    * so a remembered number would actively mislead.
    */
-  const loadTables = useCallback(async (cid, containerId) => {
+  const loadTables = useCallback(async (cid, containerId, { forceRefresh = false } = {}) => {
     if (!cid || !containerId) {
       tablesRequestRef.current += 1;  // cancel anything in flight
       setTables(null);
@@ -316,7 +365,7 @@ export default function PipelinesPage({ onGoToHarvest }) {
     const seq = ++tablesRequestRef.current;
     setTablesStatus('loading');
     try {
-      const data = await fetchContainerTables(cid, containerId, { includeRowCounts: true });
+      const data = await fetchContainerTables(cid, containerId, { includeRowCounts: true, forceRefresh });
       const list = data.tables || [];
       // A stale response still answers the caller's question about the moment it
       // was taken, so it's returned - it just doesn't get to redraw the screen.
@@ -548,6 +597,41 @@ export default function PipelinesPage({ onGoToHarvest }) {
   const succeeded = activeRun && !activeRun.is_running && activeRun.status === 'Completed';
   const failed = activeRun && !activeRun.is_running && activeRun.status !== 'Completed';
 
+  // The row-list "Push to Fabric" button's handler - only enabled once a
+  // table has cached generated data (see generatedTestData above). Same
+  // write path and same danger-confirm gating as TestDataDraftModal's own
+  // "Insert into Fabric table" button; this is just the other entry point,
+  // for pushing again later without reopening the modal.
+  const handlePushToFabric = async (table, generated) => {
+    if (!generated) return;
+    const ok = await confirm(
+      `Insert ${generated.rows.length} generated row${generated.rows.length === 1 ? '' : 's'} directly into the ` +
+        `real Fabric table "${table.name}"? This runs a Fabric notebook job and can take a few minutes - ` +
+        `Fabric's SQL endpoint can't write to a Lakehouse table directly. This cannot be undone from here.`,
+      { confirmLabel: 'Insert rows', tone: 'danger' },
+    );
+    if (!ok) return;
+    setIsPushing(true);
+    try {
+      const started = await insertRowsIntoFabricTable(connectorId, {
+        containerId: watchContainerId,
+        tableName: table.name,
+        rows: generated.rows,
+      });
+      const run = await pollJob(() => fetchFabricInsertJob(connectorId, started.notebook_item_id, started.job_id, {
+        containerId: started.container_id, stagingPath: started.staging_path,
+        tableName: table.name, rowCount: started.row_count,
+      }));
+      if (run.status !== 'Completed') throw new Error(run.failure_reason || `Fabric job ended with status "${run.status}"`);
+      await notify(`Inserted ${started.row_count} row${started.row_count === 1 ? '' : 's'} into "${table.name}".`);
+      loadTables(connectorId, watchContainerId); // row count just changed
+    } catch (err) {
+      await notify(`Insert failed: ${err.message}`, { tone: 'danger' });
+    } finally {
+      setIsPushing(false);
+    }
+  };
+
   return (
     <div className="max-w-7xl mx-auto space-y-6">
       {/* Title left, the two selectors top-right. They drive BOTH panels below,
@@ -616,13 +700,21 @@ export default function PipelinesPage({ onGoToHarvest }) {
             containerName={containers.find((c) => c.id === watchContainerId)?.name || 'this Lakehouse'}
             tables={tables}
             status={tablesStatus}
-            onRefresh={() => loadTables(connectorId, watchContainerId)}
+            onRefresh={() => loadTables(connectorId, watchContainerId, { forceRefresh: true })}
             harvestedNames={harvestedNames}
             harvestedStatus={harvestedStatus}
             onGoToHarvest={onGoToHarvest}
             onCreateTestData={(t) => setTestDataSource({
               connectorId, containerId: watchContainerId, tableName: t.name, columns: t.columns || [],
             })}
+            onUploadTestData={() => setUploadTarget({ connectorId, containerId: watchContainerId, tables })}
+            generatedFor={Object.fromEntries(
+              (tables || [])
+                .map((t) => [t.name, generatedTestData[genKey(connectorId, watchContainerId, t.name)]])
+                .filter(([, v]) => v),
+            )}
+            isPushing={isPushing}
+            onPushToFabric={handlePushToFabric}
           />
         )}
 
@@ -881,6 +973,19 @@ export default function PipelinesPage({ onGoToHarvest }) {
         <TestDataDraftModal
           source={testDataSource}
           onClose={() => setTestDataSource(null)}
+          onCreated={({ tableName, columns, rows }) => setGeneratedTestData((g) => ({
+            ...g,
+            [genKey(testDataSource.connectorId, testDataSource.containerId, tableName)]: { columns, rows },
+          }))}
+        />
+      )}
+
+      {uploadTarget && (
+        <UploadTestDataModal
+          connectorId={uploadTarget.connectorId}
+          containerId={uploadTarget.containerId}
+          tables={uploadTarget.tables}
+          onClose={() => setUploadTarget(null)}
         />
       )}
     </div>
